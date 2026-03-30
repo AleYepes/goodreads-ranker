@@ -1,4 +1,4 @@
-# Goodreads Crawler & Ranker
+# Goodreads Crawler & Ranker WIP
 
 Async crawler and ML recommendation pipeline to find good books to read.
 
@@ -49,7 +49,7 @@ Async crawler and ML recommendation pipeline to find good books to read.
     ```
     *Optional Flag*: `--fd` prompts a fresh download of your Goodreads library.
 
-2. **Train & Get Recommendations**
+2. **Train & Get Recommendations** WIP
     ```bash
     python3 recommend.py
     ```

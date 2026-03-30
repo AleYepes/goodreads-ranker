@@ -426,9 +426,29 @@ async def fetch_book(page, book_id, bad_book_ids):
     
     async def close_modal(page):
         try:
-            close_btn = page.locator(".Overlay .Overlay__close button").first
-            if await close_btn.is_visible():
-                await close_btn.evaluate("node => node.click()")
+            overlay = page.locator(".Overlay, .LoginInterstitial").first
+            if await overlay.count() == 0:
+                return
+
+            close_selectors = [
+                '.Overlay button[aria-label="Close"]',
+                ".Overlay .Overlay__close button",
+            ]
+
+            for selector in close_selectors:
+                close_btn = page.locator(selector).first
+                if await close_btn.count() == 0:
+                    continue
+                if await close_btn.is_visible():
+                    await close_btn.click(force=True)
+                    break
+            else:
+                await page.keyboard.press("Escape")
+
+            try:
+                await page.locator(".Overlay").first.wait_for(state="hidden", timeout=3000)
+            except Exception:
+                pass
         except Exception as e:
             tqdm.write(f"Failed to close modal: {e}")
             pass
@@ -443,7 +463,20 @@ async def fetch_book(page, book_id, bad_book_ids):
     page.on("response", handle_response)
     try:
         url = f"https://www.goodreads.com/book/show/{book_id}"
-        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        response = None
+        for attempt in range(MAX_RATE_LIMIT_RETRIES):
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+            status = response.status if response else None
+            if status not in RATE_LIMIT_STATUSES:
+                break
+
+            wait_seconds = RATE_LIMIT_BACKOFF_SECONDS * (attempt + 1)
+            tqdm.write(f"Rate limited on {book_id} ({status}). Sleeping {wait_seconds}s before retry.")
+            await asyncio.sleep(wait_seconds)
+
+        if response and response.status in RATE_LIMIT_STATUSES:
+            raise ValueError(f"Book {book_id} blocked by rate limit ({response.status})")
+
         await page.evaluate(f"window.scrollBy(0, {random.randint(100,200)})")
 
         if await check_if_404(page):
@@ -589,11 +622,11 @@ async def run_crawler(library_df, friends_df):
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-fd", action="store_true", help="Force download of my library")
-    parser.add_argument("-fs", action="store_true", help="Force scrape of friend lists")
+    parser.add_argument("-fd", "--fd", action="store_true", help="Force download of my library")
+    parser.add_argument("-fs", "--fs", action="store_true", help="Force scrape of friend lists")
     args = parser.parse_args()
 
-    if args.fd or not glob.glob(str(MY_LIBRARY_PATH)):
+    if args.fd or not MY_LIBRARY_PATH.exists():
         load_dotenv()
         library_df = await download_library(os.getenv("GOODREADS_EMAIL"), os.getenv("GOODREADS_PASSWORD"))
     else:
@@ -615,11 +648,14 @@ OUTPUT_PATH = DATA_DIR / "books.csv"
 FRIENDS_LIBRARIES_PATH = DATA_DIR / "friend_ratings.csv"
 FRIEND_LISTS_PATH = DATA_DIR / "friend_lists.csv"
 
-CONCURRENCY = 3
+CONCURRENCY = 2
 PAYLOAD_WAIT_ATTEMPTS = 20
 PAGE_TIMEOUT_MS = 20000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-RESTART_THRESHOLD = 200
+RESTART_THRESHOLD = 100
+RATE_LIMIT_STATUSES = {403, 429}
+MAX_RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_BACKOFF_SECONDS = 15
 
 SCORING_FUNCTIONS = {
     "Rating": lambda avg_rating, rating_count: avg_rating - avg_rating / np.log10(rating_count + 10),
