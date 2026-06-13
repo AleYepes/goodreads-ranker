@@ -7,7 +7,7 @@ beautifulsoup4
 tqdm
 networkx
 scikit-learn
-pandas==2.3.3
+pandas
 numpy
 torch
 nbstripout
