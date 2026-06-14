@@ -14,3 +14,4 @@ nbstripout
 nbdime
 nevergrad
 matplotlib
+plotly
