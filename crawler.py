@@ -424,39 +424,63 @@ async def fetch_book(page, book_id, bad_book_ids):
         book_data["similar_books"] = "|".join(similar_books)
         return book_data
     
-    async def close_modal(page):
-        try:
-            overlay = page.locator(".Overlay, .LoginInterstitial").first
-            if await overlay.count() == 0:
-                return
+    async def close_modal(page, book_id):
+        global MODAL_DISMISSED
 
-            close_selectors = [
-                '.Overlay button[aria-label="Close"]',
-                ".Overlay .Overlay__close button",
-            ]
+        watch_seconds = MODAL_DISMISSED_WATCH_SECONDS if MODAL_DISMISSED else MODAL_WATCH_SECONDS
+        deadline = datetime.now().timestamp() + watch_seconds
+        overlay = page.locator(".Overlay").first
+        close_btn = page.locator('.Overlay button[aria-label="Close"], .Overlay .Overlay__close button').first
 
-            for selector in close_selectors:
-                close_btn = page.locator(selector).first
-                if await close_btn.count() == 0:
-                    continue
-                if await close_btn.is_visible():
-                    await close_btn.click(force=True)
-                    break
-            else:
-                await page.keyboard.press("Escape")
-
+        while datetime.now().timestamp() < deadline:
             try:
-                await page.locator(".Overlay").first.wait_for(state="hidden", timeout=3000)
-            except Exception:
-                pass
-        except Exception as e:
-            tqdm.write(f"Failed to close modal: {e}")
-            pass
+                if await overlay.count() == 0 or not await overlay.is_visible():
+                    await page.wait_for_timeout(MODAL_POLL_MS)
+                    continue
+
+                for attempt in range(MODAL_CLOSE_ATTEMPTS):
+                    try:
+                        await close_btn.wait_for(state="visible", timeout=1000)
+                        await close_btn.click(timeout=1000)
+                    except Exception:
+                        try:
+                            await close_btn.evaluate("button => button.click()")
+                        except Exception:
+                            await page.keyboard.press("Escape")
+
+                    try:
+                        await overlay.wait_for(state="hidden", timeout=1000)
+                        MODAL_DISMISSED = True
+                        return True
+                    except Exception:
+                        if attempt == MODAL_CLOSE_ATTEMPTS - 1:
+                            break
+
+                await page.evaluate("""
+                    document.querySelectorAll('.Overlay').forEach((overlay) => overlay.remove());
+                    document.body.style.overflow = '';
+                    document.documentElement.style.overflow = '';
+                """)
+                MODAL_DISMISSED = True
+                tqdm.write(f"Removed stuck modal on {book_id}")
+                return True
+
+            except Exception as e:
+                tqdm.write(f"Failed to close modal on {book_id}: {e}")
+                return False
+
+        return False
 
     async def check_if_404(page):
         if await page.locator(".ErrorPage__title").count() > 0:
             return True
         return False
+
+    async def check_if_unavailable(page):
+        return await page.evaluate("""
+            () => document.body?.id === 'home' &&
+                document.querySelector('h1')?.textContent?.trim().toLowerCase() === 'page unavailable'
+        """)
 
     captured_payloads = []
     collecting = True
@@ -477,12 +501,17 @@ async def fetch_book(page, book_id, bad_book_ids):
         if response and response.status in RATE_LIMIT_STATUSES:
             raise ValueError(f"Book {book_id} blocked by rate limit ({response.status})")
 
-        await page.evaluate(f"window.scrollBy(0, {random.randint(100,200)})")
-
         if await check_if_404(page):
             bad_book_ids.add(book_id)
             raise ValueError(f"Book {book_id} not found (404)")
-        await close_modal(page)
+
+        if await check_if_unavailable(page):
+            bad_book_ids.add(book_id)
+            raise ValueError(f"Book {book_id} unavailable")
+
+        await close_modal(page, book_id)
+        await page.evaluate(f"window.scrollBy(0, {random.randint(100,200)})")
+        await close_modal(page, book_id)
 
         book_data = await extract_linked_data_basics(page, book_id)
         book_data = await extract_dom_data(page, book_data)
@@ -491,7 +520,7 @@ async def fetch_book(page, book_id, bad_book_ids):
         return book_data
 
     except Exception as e:
-        if "not found (404)" not in str(e):
+        if "not found (404)" not in str(e) and "unavailable" not in str(e):
             tqdm.write(f"Failed {book_id} -- {e}")
         return None
     finally:
@@ -656,6 +685,11 @@ RESTART_THRESHOLD = 100
 RATE_LIMIT_STATUSES = {403, 429}
 MAX_RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF_SECONDS = 15
+MODAL_WATCH_SECONDS = 4
+MODAL_DISMISSED_WATCH_SECONDS = 1
+MODAL_POLL_MS = 250
+MODAL_CLOSE_ATTEMPTS = 3
+MODAL_DISMISSED = False
 
 SCORING_FUNCTIONS = {
     "Rating": lambda avg_rating, rating_count: avg_rating - avg_rating / np.log10(rating_count + 10),
