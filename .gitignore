@@ -3,3 +3,4 @@ data*
 metadata
 .env
 .vscode
+__pycache__
