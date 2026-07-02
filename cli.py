@@ -1,8 +1,11 @@
-import os
 import asyncio
+import os
 from pathlib import Path
+
 import fire
+
 import db
+
 
 class GoodreadsRankerCLI:
     """CLI orchestrator for the Goodreads Ranker pipeline."""
@@ -10,7 +13,7 @@ class GoodreadsRankerCLI:
     def seed(self, user=False, friends=False, force=False):
         """
         Download user library and/or scrape friend list reviews.
-        
+
         Parameters:
         -----------
         user : bool
@@ -20,26 +23,28 @@ class GoodreadsRankerCLI:
         force : bool
             Force re-downloading/re-scraping.
         """
-        import seeder
         from dotenv import load_dotenv
+
+        import seeder
+
         load_dotenv()
-        
+
         if not user and not friends:
             user = True
             friends = True
-            
+
         if user:
             email = os.getenv("GOODREADS_EMAIL")
             password = os.getenv("GOODREADS_PASSWORD")
             asyncio.run(seeder.download_user_library(email, password, force=force))
-            
+
         if friends:
             asyncio.run(seeder.scrape_friend_ratings(force_all=force))
 
     def crawl(self, limit=None, concurrency=2):
         """
         Run the Goodreads book detail crawler.
-        
+
         Parameters:
         -----------
         limit : int, optional
@@ -48,6 +53,7 @@ class GoodreadsRankerCLI:
             Number of concurrent Playwright pages.
         """
         import crawler
+
         # Parse limit to int if it's a string
         if limit is not None:
             limit = int(limit)
@@ -56,7 +62,7 @@ class GoodreadsRankerCLI:
     def embed(self, batch_size=128, model=None):
         """
         Generate Ollama embeddings for crawled books.
-        
+
         Parameters:
         -----------
         batch_size : int
@@ -65,12 +71,13 @@ class GoodreadsRankerCLI:
             Ollama embedding model name.
         """
         import embedder
+
         embedder.generate_embeddings(batch_size=int(batch_size), model=model)
 
     def rank(self, interactive=False, optimize=False):
         """
         Run ELO ratings refinement and ML recommendation model.
-        
+
         Parameters:
         -----------
         interactive : bool
@@ -79,35 +86,37 @@ class GoodreadsRankerCLI:
             Tune model hyperparameters using Nevergrad.
         """
         import ranker
+
         ranker.run_ranking(interactive=bool(interactive), optimize=bool(optimize))
 
     def run_pipeline(self, crawl_limit=100):
         """
         Run the entire seeding, crawling, embedding, and ranking pipeline end-to-end.
-        
+
         Parameters:
         -----------
         crawl_limit : int
             Cap on crawled books for the pipeline run.
         """
-        print("=== STEP 1: Seeding database ===")
+        print("STEP 1: Seeding database")
         self.seed(user=True, friends=True, force=False)
-        
-        print("\n=== STEP 2: Crawling book details ===")
+
+        print("\nSTEP 2: Crawling book details")
         self.crawl(limit=int(crawl_limit))
-        
-        print("\n=== STEP 3: Generating embeddings ===")
+
+        print("\nSTEP 3: Generating embeddings")
         self.embed()
-        
-        print("\n=== STEP 4: Running models and predictions ===")
+
+        print("\nSTEP 4: Running models and predictions")
         self.rank(interactive=False, optimize=False)
-        
+
         print("\nPipeline run finished successfully!")
 
     def migrate_csv(self):
         """Migrate all existing CSV files in the data/ directory into the SQLite database."""
-        import pandas as pd
         import numpy as np
+        import pandas as pd
+
         db.init_db()
         conn = db.get_connection()
 
@@ -117,22 +126,41 @@ class GoodreadsRankerCLI:
             print("Migrating user library...")
             df = pd.read_csv(user_lib_path)
             df = db.normalise_library_columns(df)
-            
+
             # Clean Excel formulas from ISBNs
             from seeder import clean_isbn
-            if 'isbn' in df.columns:
-                df['isbn'] = df['isbn'].apply(clean_isbn)
-            if 'isbn13' in df.columns:
-                df['isbn13'] = df['isbn13'].apply(clean_isbn)
-                
+
+            if "isbn" in df.columns:
+                df["isbn"] = df["isbn"].apply(clean_isbn)
+            if "isbn13" in df.columns:
+                df["isbn13"] = df["isbn13"].apply(clean_isbn)
+
             df = df.replace({np.nan: None})
-            
+
             columns = [
-                "book_id", "title", "author", "author_lf", "additional_authors", "isbn", "isbn13",
-                "my_rating", "publisher", "binding", "number_of_pages", "year_published",
-                "original_publication_year", "date_read", "date_added", "bookshelves",
-                "bookshelves_with_positions", "exclusive_shelf", "my_review", "spoiler",
-                "private_notes", "read_count", "owned_copies"
+                "book_id",
+                "title",
+                "author",
+                "author_lf",
+                "additional_authors",
+                "isbn",
+                "isbn13",
+                "my_rating",
+                "publisher",
+                "binding",
+                "number_of_pages",
+                "year_published",
+                "original_publication_year",
+                "date_read",
+                "date_added",
+                "bookshelves",
+                "bookshelves_with_positions",
+                "exclusive_shelf",
+                "my_review",
+                "spoiler",
+                "private_notes",
+                "read_count",
+                "owned_copies",
             ]
             rows = [tuple(row.get(col) for col in columns) for _, row in df.iterrows()]
             db.upsert_rows(conn, "user_library", rows, columns)
@@ -172,19 +200,37 @@ class GoodreadsRankerCLI:
             print("Migrating crawled books...")
             df = pd.read_csv(books_path)
             df.columns = [
-                col.replace('1_star', 'star_1')
-                   .replace('2_star', 'star_2')
-                   .replace('3_star', 'star_3')
-                   .replace('4_star', 'star_4')
-                   .replace('5_star', 'star_5')
+                col.replace("1_star", "star_1")
+                .replace("2_star", "star_2")
+                .replace("3_star", "star_3")
+                .replace("4_star", "star_4")
+                .replace("5_star", "star_5")
                 for col in df.columns
             ]
             df = df.replace({np.nan: None})
             columns = [
-                "book_id", "title", "authors", "avg_rating", "review_count", "num_pages", "lang",
-                "star_1", "star_2", "star_3", "star_4", "star_5", "genres", "series", "year",
-                "description", "similar_books", "primary_author", "author_followers", "want_to_read",
-                "author_num_books", "currently_reading"
+                "book_id",
+                "title",
+                "authors",
+                "avg_rating",
+                "review_count",
+                "num_pages",
+                "lang",
+                "star_1",
+                "star_2",
+                "star_3",
+                "star_4",
+                "star_5",
+                "genres",
+                "series",
+                "year",
+                "description",
+                "similar_books",
+                "primary_author",
+                "author_followers",
+                "want_to_read",
+                "author_num_books",
+                "currently_reading",
             ]
             rows = [tuple(row.get(col) for col in columns) for _, row in df.iterrows()]
             db.upsert_rows(conn, "books", rows, columns)
@@ -210,7 +256,9 @@ class GoodreadsRankerCLI:
         if embeddings_path.exists():
             print("Migrating book embeddings (chunked, memory-safe)...")
             chunk_size = 5000
-            for chunk in pd.read_csv(embeddings_path, chunksize=chunk_size, index_col='book_id'):
+            for chunk in pd.read_csv(
+                embeddings_path, chunksize=chunk_size, index_col="book_id"
+            ):
                 book_ids = chunk.index.values
                 vectors = chunk.values.astype(np.float32)
                 db.save_embeddings(conn, book_ids, vectors)
@@ -221,6 +269,7 @@ class GoodreadsRankerCLI:
 
         conn.close()
         print("CSV data migration complete!")
+
 
 if __name__ == "__main__":
     fire.Fire(GoodreadsRankerCLI)

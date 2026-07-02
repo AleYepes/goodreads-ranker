@@ -1,18 +1,20 @@
 import argparse
 import asyncio
-import json
-import os
-import re
+import contextlib
 import heapq
 import html
+import json
 import random
+import re
 import traceback
-import numpy as np
 from datetime import datetime
+
+import numpy as np
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from tqdm.asyncio import tqdm
 from playwright.async_api import async_playwright
+from tqdm.asyncio import tqdm
+
 import db
 
 # ---------------------------------------------------------------------------
@@ -35,19 +37,29 @@ MODAL_CLOSE_ATTEMPTS = 3
 MODAL_DISMISSED = False
 
 SCORING_FUNCTIONS = {
-    "Rating": lambda avg_rating, rating_count: avg_rating - avg_rating / np.log10(rating_count + 10),
+    "Rating": lambda avg_rating, rating_count: (
+        avg_rating - avg_rating / np.log10(rating_count + 10)
+    ),
     "Count": lambda avg_rating, rating_count: rating_count,
 }
 
-RATING_MAP = {"it was amazing": 5, "really liked it": 4, "liked it": 3, "it was ok": 2, "did not like it": 1}
+RATING_MAP = {
+    "it was amazing": 5,
+    "really liked it": 4,
+    "liked it": 3,
+    "it was ok": 2,
+    "did not like it": 1,
+}
+
 
 def clean_text(text):
     return text.strip().replace("\n", "") if text else ""
 
+
 def parse_and_score_similar_books(encoded_str, scoring_func):
     if not isinstance(encoded_str, str) or not encoded_str:
         return []
-    
+
     similar_books = []
     for item in encoded_str.split("|"):
         try:
@@ -58,46 +70,58 @@ def parse_and_score_similar_books(encoded_str, scoring_func):
             continue
     return similar_books
 
+
 def prep_crawl_heapq(scoring_func, db_path=None):
     conn = db.get_connection(db_path)
-    
+
     # Read seeds from user_library
     cursor = conn.execute("SELECT book_id FROM user_library WHERE book_id IS NOT NULL")
     seed_ids = {int(row["book_id"]) for row in cursor.fetchall()}
-    
+
     # Read seeds from friend_ratings
-    cursor = conn.execute("SELECT book_id FROM friend_ratings WHERE book_id IS NOT NULL")
+    cursor = conn.execute(
+        "SELECT book_id FROM friend_ratings WHERE book_id IS NOT NULL"
+    )
     seed_ids.update(int(row["book_id"]) for row in cursor.fetchall())
-    
+
     # Prioritize seeds
     crawl_queue = {bid: 9e7 for bid in seed_ids}
-    
+
     # Read already scraped book IDs and similar_books
-    cursor = conn.execute("SELECT book_id, similar_books FROM books WHERE book_id IS NOT NULL")
+    cursor = conn.execute(
+        "SELECT book_id, similar_books FROM books WHERE book_id IS NOT NULL"
+    )
     scraped_rows = cursor.fetchall()
     scraped_ids = {int(row["book_id"]) for row in scraped_rows}
-    
+
     for row in scraped_rows:
         similar_books_str = row["similar_books"]
         if similar_books_str:
-            for book_id, score in parse_and_score_similar_books(similar_books_str, scoring_func):
+            for book_id, score in parse_and_score_similar_books(
+                similar_books_str, scoring_func
+            ):
                 if book_id not in scraped_ids:
                     crawl_queue[book_id] = max(score, crawl_queue.get(book_id, 0))
-                    
+
     for book_id in scraped_ids:
         crawl_queue.pop(book_id, None)
-        
+
     conn.close()
-    
+
     crawl_queue = [(-rating, book_id) for book_id, rating in crawl_queue.items()]
     heapq.heapify(crawl_queue)
-    
+
     return crawl_queue, scraped_ids, {book_id for _, book_id in crawl_queue}, seed_ids
+
 
 async def fetch_book(page, book_id, bad_book_ids):
 
-    async def handle_response(response):       
-        if collecting and "graphql" in response.url and response.request.method == "POST":
+    async def handle_response(response):
+        if (
+            collecting
+            and "graphql" in response.url
+            and response.request.method == "POST"
+        ):
             try:
                 json_body = await response.json()
                 captured_payloads.append(json_body)
@@ -133,114 +157,147 @@ async def fetch_book(page, book_id, bad_book_ids):
         soup = BeautifulSoup(html_content, "html.parser")
 
         # Stars distribution — keys written as star_N to match the DB schema directly
-        for i in range(1, 6):   
+        for i in range(1, 6):
             label = soup.find(attrs={"data-testid": f"labelTotal-{i}"})
-            text = label.get_text().strip().split()[0].replace(",", "") if label else "0"
+            text = (
+                label.get_text().strip().split()[0].replace(",", "") if label else "0"
+            )
             book_data[f"star_{i}"] = int(text) if text.isdigit() else 0
 
         # Genres
         try:
-            if await page.query_selector('button[aria-label="Show all items in the list"]'):
+            if await page.query_selector(
+                'button[aria-label="Show all items in the list"]'
+            ):
                 await page.click('button[aria-label="Show all items in the list"]')
-                await page.wait_for_timeout(100) 
+                await page.wait_for_timeout(100)
                 html_content = await page.content()
                 soup = BeautifulSoup(html_content, "html.parser")
         except Exception:
             pass
 
-        genre_nodes = soup.select(".BookPageMetadataSection__genreButton .Button__labelItem")
-        genres = [node.get_text() for node in genre_nodes if node.get_text() != "...more"]
-        book_data['genres'] = "|".join(genres)
+        genre_nodes = soup.select(
+            ".BookPageMetadataSection__genreButton .Button__labelItem"
+        )
+        genres = [
+            node.get_text() for node in genre_nodes if node.get_text() != "...more"
+        ]
+        book_data["genres"] = "|".join(genres)
 
         # Series id
         series_el = soup.select_one("h3.Text__italic a")
-        book_data['series'] = series_el['href'].split('/')[-1] if series_el and series_el.get('href') else ""
+        book_data["series"] = (
+            series_el["href"].split("/")[-1]
+            if series_el and series_el.get("href")
+            else ""
+        )
 
         # Year
         pub_el = soup.find(attrs={"data-testid": "publicationInfo"})
-        book_data['year'] = pub_el.get_text().split(", ")[-1].strip() if pub_el else ""
+        book_data["year"] = pub_el.get_text().split(", ")[-1].strip() if pub_el else ""
 
         # Description
-        desc_el = soup.select_one("[data-testid='description'] span.Formatted") or \
-                  soup.select_one(".DetailsLayoutRightParagraph__widthConstrained span.Formatted")
+        desc_el = soup.select_one(
+            "[data-testid='description'] span.Formatted"
+        ) or soup.select_one(
+            ".DetailsLayoutRightParagraph__widthConstrained span.Formatted"
+        )
         if desc_el:
             for br in desc_el.find_all("br"):
                 br.replace_with("\n")
-            book_data['description'] = re.sub(r'\n{3,}', '\n\n', desc_el.get_text()).strip()
+            book_data["description"] = re.sub(
+                r"\n{3,}", "\n\n", desc_el.get_text()
+            ).strip()
         else:
-            book_data['description'] = ""
+            book_data["description"] = ""
 
-        # Currently reading 
+        # Currently reading
         reading_el = soup.find(attrs={"data-testid": "currentlyReadingSignal"})
         if reading_el:
             text = reading_el.get_text()
-            match = re.search(r'(\d+)', text.replace(",", ""))
-            book_data['currently_reading'] = int(match.group(1)) if match else 0
+            match = re.search(r"(\d+)", text.replace(",", ""))
+            book_data["currently_reading"] = int(match.group(1)) if match else 0
         else:
-            book_data['currently_reading'] = 0
+            book_data["currently_reading"] = 0
 
         # Want to read
         wtr_el = soup.find(attrs={"data-testid": "toReadSignal"})
         if wtr_el:
             text = wtr_el.get_text()
-            match = re.search(r'(\d+)', text.replace(",", ""))
-            book_data['want_to_read'] = int(match.group(1)) if match else 0
+            match = re.search(r"(\d+)", text.replace(",", ""))
+            book_data["want_to_read"] = int(match.group(1)) if match else 0
         else:
-            book_data['want_to_read'] = 0
+            book_data["want_to_read"] = 0
 
         # Author name
         author_name_el = soup.find(attrs={"data-testid": "name"})
-        book_data['primary_author'] = author_name_el.get_text().strip() if author_name_el else ""
+        book_data["primary_author"] = (
+            author_name_el.get_text().strip() if author_name_el else ""
+        )
 
         # Author stats
         author_stats_el = soup.select_one(".FeaturedPerson__infoPrimary .Text__subdued")
-        book_data['author_num_books'] = 0
-        book_data['author_followers'] = 0
+        book_data["author_num_books"] = 0
+        book_data["author_followers"] = 0
         if author_stats_el:
             stats_text = author_stats_el.get_text(separator=" ", strip=True)
-            
-            books_match = re.search(r'([\d,]+)\s*books', stats_text)
+
+            books_match = re.search(r"([\d,]+)\s*books", stats_text)
             if books_match:
-                book_data['author_num_books'] = int(books_match.group(1).replace(",", ""))
+                book_data["author_num_books"] = int(
+                    books_match.group(1).replace(",", "")
+                )
 
             # Author follower count
-            followers_match = re.search(r'([\d,kKmM\.]+)\s*followers', stats_text)
+            followers_match = re.search(r"([\d,kKmM\.]+)\s*followers", stats_text)
             if followers_match:
                 val = followers_match.group(1).lower().replace(",", "")
-                if 'k' in val:
-                    val = float(val.replace('k', '')) * 1e3
-                elif 'm' in val:
-                    val = float(val.replace('m', '')) * 1e6
-                book_data['author_followers'] = int(val)
+                if "k" in val:
+                    val = float(val.replace("k", "")) * 1e3
+                elif "m" in val:
+                    val = float(val.replace("m", "")) * 1e6
+                book_data["author_followers"] = int(val)
 
         return book_data
 
-    async def extract_similar_books_json(page, book_data, captured_payloads, collecting):
+    async def extract_similar_books_json(
+        page, book_data, captured_payloads, collecting
+    ):
         wait_attempts = 0
-        while not any("getSimilarBooks" in str(p) for p in captured_payloads) and wait_attempts < PAYLOAD_WAIT_ATTEMPTS:
+        while (
+            not any("getSimilarBooks" in str(p) for p in captured_payloads)
+            and wait_attempts < PAYLOAD_WAIT_ATTEMPTS
+        ):
             await page.wait_for_timeout(500)
             wait_attempts += 1
-        collecting = False
-        
+
         similar_books = []
         for payload in captured_payloads:
-            for book_edge in payload.get("data", {}).get("getSimilarBooks", {}).get("edges", []):
+            for book_edge in (
+                payload.get("data", {}).get("getSimilarBooks", {}).get("edges", [])
+            ):
                 book_node = book_edge.get("node", {})
-                match = re.search(r'show/(\d+)', book_node.get("webUrl", ""))
+                match = re.search(r"show/(\d+)", book_node.get("webUrl", ""))
                 if match:
                     stats = book_node.get("work", {}).get("stats", {})
-                    similar_books.append(f"{match.group(1)}:{stats.get('averageRating')}:{stats.get('ratingsCount')}")
+                    similar_books.append(
+                        f"{match.group(1)}:{stats.get('averageRating')}:{stats.get('ratingsCount')}"
+                    )
 
         book_data["similar_books"] = "|".join(similar_books)
         return book_data
-    
+
     async def close_modal(page, book_id):
         global MODAL_DISMISSED
 
-        watch_seconds = MODAL_DISMISSED_WATCH_SECONDS if MODAL_DISMISSED else MODAL_WATCH_SECONDS
+        watch_seconds = (
+            MODAL_DISMISSED_WATCH_SECONDS if MODAL_DISMISSED else MODAL_WATCH_SECONDS
+        )
         deadline = datetime.now().timestamp() + watch_seconds
         overlay = page.locator(".Overlay").first
-        close_btn = page.locator('.Overlay button[aria-label="Close"], .Overlay .Overlay__close button').first
+        close_btn = page.locator(
+            '.Overlay button[aria-label="Close"], .Overlay .Overlay__close button'
+        ).first
 
         while datetime.now().timestamp() < deadline:
             try:
@@ -282,9 +339,7 @@ async def fetch_book(page, book_id, bad_book_ids):
         return False
 
     async def check_if_404(page):
-        if await page.locator(".ErrorPage__title").count() > 0:
-            return True
-        return False
+        return await page.locator(".ErrorPage__title").count() > 0
 
     async def check_if_unavailable(page):
         return await page.evaluate("""
@@ -299,17 +354,23 @@ async def fetch_book(page, book_id, bad_book_ids):
         url = f"https://www.goodreads.com/book/show/{book_id}"
         response = None
         for attempt in range(MAX_RATE_LIMIT_RETRIES):
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+            response = await page.goto(
+                url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS
+            )
             status = response.status if response else None
             if status not in RATE_LIMIT_STATUSES:
                 break
 
             wait_seconds = RATE_LIMIT_BACKOFF_SECONDS * (attempt + 1)
-            tqdm.write(f"Rate limited on {book_id} ({status}). Sleeping {wait_seconds}s before retry.")
+            tqdm.write(
+                f"Rate limited on {book_id} ({status}). Sleeping {wait_seconds}s before retry."
+            )
             await asyncio.sleep(wait_seconds)
 
         if response and response.status in RATE_LIMIT_STATUSES:
-            raise ValueError(f"Book {book_id} blocked by rate limit ({response.status})")
+            raise ValueError(
+                f"Book {book_id} blocked by rate limit ({response.status})"
+            )
 
         if await check_if_404(page):
             bad_book_ids.add(book_id)
@@ -320,12 +381,14 @@ async def fetch_book(page, book_id, bad_book_ids):
             raise ValueError(f"Book {book_id} unavailable")
 
         await close_modal(page, book_id)
-        await page.evaluate(f"window.scrollBy(0, {random.randint(100,200)})")
+        await page.evaluate(f"window.scrollBy(0, {random.randint(100, 200)})")
         await close_modal(page, book_id)
 
         book_data = await extract_linked_data_basics(page, book_id)
         book_data = await extract_dom_data(page, book_data)
-        book_data = await extract_similar_books_json(page, book_data, captured_payloads, collecting)
+        book_data = await extract_similar_books_json(
+            page, book_data, captured_payloads, collecting
+        )
 
         return book_data
 
@@ -336,10 +399,9 @@ async def fetch_book(page, book_id, bad_book_ids):
     finally:
         collecting = False
         page.remove_listener("response", handle_response)
-        try:
+        with contextlib.suppress(Exception):
             await page.goto("about:blank")
-        except Exception:
-            pass
+
 
 async def run_crawler(limit=None, concurrency=2, db_path=None):
 
@@ -356,11 +418,28 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
             page_pool.put_nowait(page)
 
     field_names = [
-        "book_id", "title", "authors", "avg_rating", "review_count",
-        "num_pages", "lang", "star_1", "star_2", "star_3", "star_4",
-        "star_5", "genres", "series", "year", "description", "similar_books",
-        "primary_author", "author_followers", "want_to_read",
-        "author_num_books", "currently_reading"
+        "book_id",
+        "title",
+        "authors",
+        "avg_rating",
+        "review_count",
+        "num_pages",
+        "lang",
+        "star_1",
+        "star_2",
+        "star_3",
+        "star_4",
+        "star_5",
+        "genres",
+        "series",
+        "year",
+        "description",
+        "similar_books",
+        "primary_author",
+        "author_followers",
+        "want_to_read",
+        "author_num_books",
+        "currently_reading",
     ]
 
     bad_book_ids = set()
@@ -373,21 +452,25 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
         current_algo_name = scoring_algo_names[cycle % len(scoring_algo_names)]
         scoring_func = SCORING_FUNCTIONS[current_algo_name]
 
-        crawl_queue, scraped_ids, queued_ids, seed_ids = prep_crawl_heapq(scoring_func, db_path)
+        crawl_queue, scraped_ids, queued_ids, seed_ids = prep_crawl_heapq(
+            scoring_func, db_path
+        )
         if not crawl_queue:
             print("No more books to crawl.")
             break
 
         remaining_seeds = seed_ids - scraped_ids - bad_book_ids
         pbar = tqdm(
-            total=len(scraped_ids) + len(crawl_queue), 
-            initial=len(scraped_ids), 
-            unit='book',
-            desc=f"{current_algo_name} | {f'{len(remaining_seeds)} Seeds remaining' if remaining_seeds else 'Seeds done'}" 
+            total=len(scraped_ids) + len(crawl_queue),
+            initial=len(scraped_ids),
+            unit="book",
+            desc=f"{current_algo_name} | {f'{len(remaining_seeds)} Seeds remaining' if remaining_seeds else 'Seeds done'}",
         )
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False) # Running headed is required for GraphQL triggers to fire
+            browser = await p.chromium.launch(
+                headless=False
+            )  # Running headed is required for GraphQL triggers to fire
             context = await browser.new_context(user_agent=USER_AGENT)
             await context.route("**/*", block_media)
 
@@ -398,12 +481,21 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
             active_tasks = set()
             processed_in_cycle = 0
             try:
-                while (crawl_queue or active_tasks) and processed_in_cycle < RESTART_THRESHOLD:
+                while (
+                    crawl_queue or active_tasks
+                ) and processed_in_cycle < RESTART_THRESHOLD:
                     if limit is not None and total_processed >= limit:
                         break
 
-                    while crawl_queue and not page_pool.empty() and processed_in_cycle < RESTART_THRESHOLD:
-                        if limit is not None and total_processed + len(active_tasks) >= limit:
+                    while (
+                        crawl_queue
+                        and not page_pool.empty()
+                        and processed_in_cycle < RESTART_THRESHOLD
+                    ):
+                        if (
+                            limit is not None
+                            and total_processed + len(active_tasks) >= limit
+                        ):
                             break
 
                         _, book_id = heapq.heappop(crawl_queue)
@@ -411,38 +503,57 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
                             continue
 
                         page = page_pool.get_nowait()
-                        task = asyncio.create_task(fetch_wrapper(page_pool, page, book_id, bad_book_ids))
+                        task = asyncio.create_task(
+                            fetch_wrapper(page_pool, page, book_id, bad_book_ids)
+                        )
                         active_tasks.add(task)
 
                     if not active_tasks:
                         break
 
-                    done, active_tasks = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                    done, active_tasks = await asyncio.wait(
+                        active_tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
                     for task in done:
                         try:
                             processed_in_cycle += 1
                             total_processed += 1
                             book_data = task.result()
                             if book_data:
-                                row_tuple = tuple(book_data.get(field) for field in field_names)
-                                db.upsert_rows(db_conn, "books", [row_tuple], field_names)
+                                row_tuple = tuple(
+                                    book_data.get(field) for field in field_names
+                                )
+                                db.upsert_rows(
+                                    db_conn, "books", [row_tuple], field_names
+                                )
 
-                                bid = book_data['book_id']
+                                bid = book_data["book_id"]
                                 scraped_ids.add(bid)
 
                                 if bid in remaining_seeds:
                                     remaining_seeds.remove(bid)
                                     if remaining_seeds:
-                                        pbar.set_description(f"{len(remaining_seeds)} Seeds remaining")
+                                        pbar.set_description(
+                                            f"{len(remaining_seeds)} Seeds remaining"
+                                        )
                                     else:
-                                        pbar.set_description(f"{current_algo_name} | Seeds done")
+                                        pbar.set_description(
+                                            f"{current_algo_name} | Seeds done"
+                                        )
 
                                 pbar.update(1)
-                            
+
                                 added = 0
-                                for similar_id, score in parse_and_score_similar_books(book_data.get('similar_books', ''), scoring_func):
-                                    if similar_id not in scraped_ids and similar_id not in queued_ids:
-                                        heapq.heappush(crawl_queue, (-score, similar_id))
+                                for similar_id, score in parse_and_score_similar_books(
+                                    book_data.get("similar_books", ""), scoring_func
+                                ):
+                                    if (
+                                        similar_id not in scraped_ids
+                                        and similar_id not in queued_ids
+                                    ):
+                                        heapq.heappush(
+                                            crawl_queue, (-score, similar_id)
+                                        )
                                         queued_ids.add(similar_id)
                                         added += 1
                                 pbar.total += added
@@ -467,20 +578,20 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
 
     db_conn.close()
 
+
 async def main():
     load_dotenv()
     db.init_db()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=None, help="Max number of books to crawl")
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Max number of books to crawl"
+    )
     parser.add_argument("--concurrency", type=int, default=2, help="Concurrency limit")
     args = parser.parse_args()
 
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         await run_crawler(limit=args.limit, concurrency=args.concurrency)
-    except KeyboardInterrupt:
-        pass
-
 
 
 if __name__ == "__main__":

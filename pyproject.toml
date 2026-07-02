@@ -1,0 +1,44 @@
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+extend-exclude = [
+    "notebooks",
+    "old",
+    "assets",
+    "data",
+    "docs",
+    ".agents",
+]
+
+[tool.ruff.lint]
+select = [
+    "F",    # Pyflakes (errors, unused imports)
+    "E",    # pycodestyle (errors)
+    "W",    # pycodestyle (warnings)
+    "I",    # isort (import sorting)
+    "UP",   # pyupgrade (upgrades code to Python 3.12 syntax)
+    "B",    # flake8-bugbear (catches tricky design flaws and logic bugs)
+    "SIM",  # flake8-simplify (helps you refactor messy if/else blocks)
+    "N",    # pep8 conventions
+]
+ignore = ["E501"]
+fixable = ["ALL"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pyright]
+pythonVersion = "3.14"
+exclude = [
+    "notebooks",
+    "old",
+    "assets",
+    "data",
+    "docs",
+    ".agents",
+]
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false
+venvPath = "."
+venv = "venv"

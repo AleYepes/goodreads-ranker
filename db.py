@@ -6,9 +6,9 @@ helpers for bulk reads/writes — especially for embedding BLOB storage.
 """
 
 import sqlite3
-import struct
-import numpy as np
 from pathlib import Path
+
+import numpy as np
 
 DB_PATH = Path("data/goodreads.db")
 
@@ -126,10 +126,6 @@ def init_db(db_path=None):
     conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Embedding helpers — memory-efficient binary (de)serialization
-# ---------------------------------------------------------------------------
-
 def vector_to_blob(vec):
     """Serialize a numpy float32 array to bytes for SQLite BLOB storage."""
     return vec.astype(np.float32).tobytes()
@@ -152,8 +148,7 @@ def save_embeddings(conn, book_ids, vectors):
     """
     dim = vectors.shape[1]
     rows = [
-        (int(bid), dim, vector_to_blob(vectors[i]))
-        for i, bid in enumerate(book_ids)
+        (int(bid), dim, vector_to_blob(vectors[i])) for i, bid in enumerate(book_ids)
     ]
     conn.executemany(
         "INSERT OR REPLACE INTO embeddings (book_id, dim, vector) VALUES (?, ?, ?)",
@@ -218,7 +213,9 @@ def load_embeddings_for_books(conn, ordered_book_ids):
     """
     loaded_ids, loaded_matrix = load_embeddings(conn)
     if loaded_matrix.size == 0:
-        return np.empty((len(ordered_book_ids), 0), dtype=np.float32), list(ordered_book_ids)
+        return np.empty((len(ordered_book_ids), 0), dtype=np.float32), list(
+            ordered_book_ids
+        )
 
     dim = loaded_matrix.shape[1]
     id_to_idx = {int(bid): i for i, bid in enumerate(loaded_ids)}
@@ -234,10 +231,6 @@ def load_embeddings_for_books(conn, ordered_book_ids):
 
     return matrix, missing_ids
 
-
-# ---------------------------------------------------------------------------
-# Generic upsert helpers
-# ---------------------------------------------------------------------------
 
 def upsert_rows(conn, table, rows, columns):
     """
@@ -260,10 +253,6 @@ def upsert_rows(conn, table, rows, columns):
     )
     conn.commit()
 
-
-# ---------------------------------------------------------------------------
-# Data normalisation helpers
-# ---------------------------------------------------------------------------
 
 def normalise_library_columns(df):
     """
