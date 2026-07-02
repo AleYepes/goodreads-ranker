@@ -7,13 +7,60 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # Format: https://www.goodreads.com/review/list/75706676?print=true&sort=date_read&view=reviews
-LIST_IDS = [75706676, 104945614, 124720847, 91998392, 34518408, 105258888, 129155685, 113185438,
- 166997642, 174792571, 13737030, 27115955, 24885719, 51281420, 104343033, 65139494, 115764833]
+LIST_IDS = [
+    104343033, #104343033-santiago-lecumberri **
+    104945614, #104945614-aadil-kumar
+    105258888, #105258888-zach-saylor
+    11116469, #11116469-sebastian-gebski
+    113185438, #113185438-taiyr
+    115764833, #115764833-austin-george
+    118560285, #118560285-bichons-and-books-nz
+    124720847, #124720847-abrish
+    129155685, #129155685-ignacio-mu-oz-lanza **
+    13448447, #13448447-lyda
+    13647498, #13647498.Oana_David
+    13737030, #13737030-maddy
+    156484926, #156484926-victoria
+    160516894, #160516894-janine
+    166997642, #166997642-carson-cummins
+    174792571, #174792571-annie
+    1834894, #1834894.Manny_Rayner
+    18922126, #18922126-ella-park
+    18913667, #18913667.Edward_Vass
+    21397146, #21397146-stefy
+    22482559, #22482559-mathi-fonseca
+    22726983, #22726983-gast-n-mousqu-s
+    23161382, #23161382-vanesa
+    24885719, #24885719-fran-oise
+    267189, #267189-todd-n
+    26052616, #26052616-margherita
+    27115955, #27115955-catherine-wood
+    22978411, #22978411-cristina
+    31565140, #31565140-irina-toledo
+    33074940, #33074940-anca-e-milea
+    34518408, #34518408-dawood
+    40426330, #40426330-sabrina-li
+    41797321, #41797321-cristina-cojocaru
+    42001957, #42001957-matty-van-hoof
+    43400637, #43400637-fay-pretty
+    46459461, #46459461-an-fech
+    51281420, #51281420-daniela-g-mez
+    54115664, #54115664-mandy
+    5868084, #5868084-mairi
+    65139494, #65139494-daniel-castro
+    70012245, #70012245-till-chen
+    7043947, #7043947-andra-enache
+    75706676, #75706676-steve-abreu
+    76860332, #76860332-cecilia
+    8136076, #8136076.Cosmin_Leucu_a
+    90649237, #90649237-sara
+    91998392, #91998392-daniel-prelipcean
+    ]
 
 OUTPUT_FILE = "data/friend_ratings.csv"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 SIGNIN_URL = "https://www.goodreads.com/ap/signin?language=en_US&openid.assoc_handle=amzn_goodreads_web_na&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.mode=checkid_setup&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.goodreads.com%2Fap-handler%2Fsign-in"
-LIST_SORT = "date_read"
+LIST_SORT = "date_added"
 LIST_ORDER = "d"
 FIELDNAMES = ["list_id", "book_id", "title", "rating", "num_pages", "date_read", "date_added"]
 
