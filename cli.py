@@ -1,8 +1,6 @@
 import os
 import asyncio
 from pathlib import Path
-import pandas as pd
-import numpy as np
 import fire
 import db
 
@@ -108,6 +106,8 @@ class GoodreadsRankerCLI:
 
     def migrate_csv(self):
         """Migrate all existing CSV files in the data/ directory into the SQLite database."""
+        import pandas as pd
+        import numpy as np
         db.init_db()
         conn = db.get_connection()
 
@@ -116,7 +116,7 @@ class GoodreadsRankerCLI:
         if user_lib_path.exists():
             print("Migrating user library...")
             df = pd.read_csv(user_lib_path)
-            df.columns = [col.lower().replace(' ', '_').replace('author_l-f', 'author_lf') for col in df.columns]
+            df = db.normalise_library_columns(df)
             
             # Clean Excel formulas from ISBNs
             from seeder import clean_isbn

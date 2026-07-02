@@ -7,12 +7,37 @@ import heapq
 import html
 import random
 import traceback
+import numpy as np
 from datetime import datetime
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
 from playwright.async_api import async_playwright
 import db
+
+# ---------------------------------------------------------------------------
+# Configuration constants
+# ---------------------------------------------------------------------------
+PAYLOAD_WAIT_ATTEMPTS = 20
+PAGE_TIMEOUT_MS = 20000
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+RESTART_THRESHOLD = 100
+RATE_LIMIT_STATUSES = {403, 429}
+MAX_RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_BACKOFF_SECONDS = 15
+MODAL_WATCH_SECONDS = 4
+MODAL_DISMISSED_WATCH_SECONDS = 1
+MODAL_POLL_MS = 250
+MODAL_CLOSE_ATTEMPTS = 3
+# MODAL_DISMISSED is intentionally a module-level flag: the Goodreads sign-in
+# modal only appears once per browser session, so once dismissed we can afford
+# a much shorter watch window for every subsequent book.
+MODAL_DISMISSED = False
+
+SCORING_FUNCTIONS = {
+    "Rating": lambda avg_rating, rating_count: avg_rating - avg_rating / np.log10(rating_count + 10),
+    "Count": lambda avg_rating, rating_count: rating_count,
+}
 
 RATING_MAP = {"it was amazing": 5, "really liked it": 4, "liked it": 3, "it was ok": 2, "did not like it": 1}
 
@@ -107,11 +132,11 @@ async def fetch_book(page, book_id, bad_book_ids):
         html_content = await page.content()
         soup = BeautifulSoup(html_content, "html.parser")
 
-        # Stars distribution
+        # Stars distribution — keys written as star_N to match the DB schema directly
         for i in range(1, 6):   
             label = soup.find(attrs={"data-testid": f"labelTotal-{i}"})
             text = label.get_text().strip().split()[0].replace(",", "") if label else "0"
-            book_data[f"{i}_star"] = int(text) if text.isdigit() else 0
+            book_data[f"star_{i}"] = int(text) if text.isdigit() else 0
 
         # Genres
         try:
@@ -331,10 +356,10 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
             page_pool.put_nowait(page)
 
     field_names = [
-        "book_id", "title", "authors", "avg_rating", "review_count", 
-        "num_pages", "lang", "star_1", "star_2", "star_3", "star_4", 
+        "book_id", "title", "authors", "avg_rating", "review_count",
+        "num_pages", "lang", "star_1", "star_2", "star_3", "star_4",
         "star_5", "genres", "series", "year", "description", "similar_books",
-        "primary_author", "author_followers", "want_to_read", 
+        "primary_author", "author_followers", "want_to_read",
         "author_num_books", "currently_reading"
     ]
 
@@ -342,6 +367,7 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
     cycle = 0
     scoring_algo_names = list(SCORING_FUNCTIONS.keys())
     total_processed = 0
+    db_conn = db.get_connection(db_path)
 
     while True:
         current_algo_name = scoring_algo_names[cycle % len(scoring_algo_names)]
@@ -398,21 +424,9 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
                             total_processed += 1
                             book_data = task.result()
                             if book_data:
-                                mapped_data = {}
-                                for k, v in book_data.items():
-                                    if k == "1_star": mapped_data["star_1"] = v
-                                    elif k == "2_star": mapped_data["star_2"] = v
-                                    elif k == "3_star": mapped_data["star_3"] = v
-                                    elif k == "4_star": mapped_data["star_4"] = v
-                                    elif k == "5_star": mapped_data["star_5"] = v
-                                    else: mapped_data[k] = v
-
-                                row_tuple = tuple(mapped_data.get(field) for field in field_names)
-
-                                db_conn = db.get_connection(db_path)
+                                row_tuple = tuple(book_data.get(field) for field in field_names)
                                 db.upsert_rows(db_conn, "books", [row_tuple], field_names)
-                                db_conn.close()
-                                
+
                                 bid = book_data['book_id']
                                 scraped_ids.add(bid)
 
@@ -451,6 +465,8 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
 
         cycle += 1
 
+    db_conn.close()
+
 async def main():
     load_dotenv()
     db.init_db()
@@ -465,23 +481,7 @@ async def main():
     except KeyboardInterrupt:
         pass
 
-PAYLOAD_WAIT_ATTEMPTS = 20
-PAGE_TIMEOUT_MS = 20000
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-RESTART_THRESHOLD = 100
-RATE_LIMIT_STATUSES = {403, 429}
-MAX_RATE_LIMIT_RETRIES = 3
-RATE_LIMIT_BACKOFF_SECONDS = 15
-MODAL_WATCH_SECONDS = 4
-MODAL_DISMISSED_WATCH_SECONDS = 1
-MODAL_POLL_MS = 250
-MODAL_CLOSE_ATTEMPTS = 3
-MODAL_DISMISSED = False
 
-SCORING_FUNCTIONS = {
-    "Rating": lambda avg_rating, rating_count: avg_rating - avg_rating / np.log10(rating_count + 10),
-    "Count": lambda avg_rating, rating_count: rating_count,
-}
 
 if __name__ == "__main__":
     asyncio.run(main())

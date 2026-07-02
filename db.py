@@ -259,3 +259,27 @@ def upsert_rows(conn, table, rows, columns):
         rows,
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Data normalisation helpers
+# ---------------------------------------------------------------------------
+
+def normalise_library_columns(df):
+    """
+    Normalise the column names of a raw Goodreads library export DataFrame.
+
+    Goodreads exports columns like "Title", "Author l-f", "My Rating" etc.
+    This converts them to the snake_case names used by the ``user_library``
+    table schema.
+    """
+    rename = {}
+    for col in df.columns:
+        normalised = col.lower().replace(" ", "_")
+        # Goodreads uses "Author l-f" for last-name-first; normalise the
+        # hyphen so it maps to the schema column name ``author_lf``.
+        if normalised == "author_l-f":
+            normalised = "author_lf"
+        rename[col] = normalised
+    df = df.rename(columns=rename)
+    return df

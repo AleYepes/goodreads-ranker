@@ -129,22 +129,23 @@ def refine_ratings(target_df, rating_col, conn, interactive=False, title_col='ti
         titles = dict(zip(target_df['book_id'], target_df[title_col]))
         for star in sorted(target_clean[rating_col].unique(), reverse=True):
             elo_df = run_interactive_ranking(elo_df, titles, star)
-            
-        # Save ELO scores back to database
-        db_rows = []
-        for _, row in elo_df.iterrows():
-            db_rows.append((
-                int(row['book_id']),
-                float(row['original_rating']) if row['original_rating'] is not None else None,
-                float(row['elo_score']),
-                int(row['matches_played'])
-            ))
-        db.upsert_rows(
-            conn, 
-            "elo_ratings", 
-            db_rows, 
-            ['book_id', 'original_rating', 'elo_score', 'matches_played']
-        )
+
+    # Always persist ELO state so subsequent runs (interactive or not) pick up
+    # any new books that were added to the table since the last run.
+    db_rows = []
+    for _, row in elo_df.iterrows():
+        db_rows.append((
+            int(row['book_id']),
+            float(row['original_rating']) if row['original_rating'] is not None else None,
+            float(row['elo_score']),
+            int(row['matches_played'])
+        ))
+    db.upsert_rows(
+        conn,
+        "elo_ratings",
+        db_rows,
+        ['book_id', 'original_rating', 'elo_score', 'matches_played']
+    )
 
     return compute_continuous(elo_df)
 
@@ -569,40 +570,56 @@ def run_ranking(interactive=False, optimize=False, db_path=None):
 
     # 5. Friend taste calibration
     print("Calibrating friend ratings...")
+
+    # Build a boolean mask for books that have real embeddings.
+    # Books with zero vectors (missing embeddings) are excluded from model
+    # training and GCN propagation to avoid corrupting cosine distances.
+    has_embedding = np.any(embeddings_matrix != 0, axis=1)
+    if not np.all(has_embedding):
+        n_missing = int((~has_embedding).sum())
+        print(f"Excluding {n_missing} books with missing embeddings from model inputs.")
+
+    embedded_books_df = books_df[has_embedding].copy().reset_index(drop=True)
+    embedded_embeddings = embeddings_matrix[has_embedding]
+
     similar_friend_ratings, similar_friends, friend_scores = get_similar_friend_ratings(
-        books_df,
+        embedded_books_df,
         conn,
-        embeddings_matrix,
+        embedded_embeddings,
         min_correlation=0.3
     )
     books_df['training_ratings'] = books_df['my_refined'].fillna(books_df['book_id'].map(similar_friend_ratings))
+    embedded_books_df['training_ratings'] = embedded_books_df['my_refined'].fillna(
+        embedded_books_df['book_id'].map(similar_friend_ratings)
+    )
     
     my_rating_count = len(books_df[books_df['my_rating'].notna()])
-    total_training_count = len(books_df[books_df['training_ratings'].notna()])
+    total_training_count = len(embedded_books_df[embedded_books_df['training_ratings'].notna()])
     print(f"Taste calibration stats: My ratings ({my_rating_count}) + Friends calibrated ({total_training_count - my_rating_count})")
     
     # 6. Build adjacency matrix and propagate
     print("Running graph GCN propagation...")
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     
-    # Precompute dimensions
-    train_size = (~books_df['training_ratings'].isna()).sum()
+    # Precompute mrl_dimensions based on the embedded subset only
+    train_size = (~embedded_books_df['training_ratings'].isna()).sum()
     mrl_dimensions = 32
     while mrl_dimensions * 2 < train_size:
         mrl_dimensions *= 2
-        
-    embeddings_tensor = torch.tensor(embeddings_matrix, dtype=torch.float32, device=device)
-    adj_matrix = build_adjacency_matrix(books_df, len(books_df)).to(device)
+
+    embeddings_tensor = torch.tensor(embedded_embeddings, dtype=torch.float32, device=device)
+    adj_matrix = build_adjacency_matrix(embedded_books_df, len(embedded_books_df)).to(device)
     
+
     propagated = embeddings_tensor.clone()
     norm_l2 = Normalizer(norm='l2')
     precomputed_embeddings = [norm_l2.transform(propagated.cpu().numpy())]
-    
+
     max_propagations = 2
     for _ in range(max_propagations):
         propagated = torch.sparse.mm(adj_matrix, propagated)
         precomputed_embeddings.append(norm_l2.transform(propagated.cpu().numpy()))
-        
+
     del propagated, adj_matrix, embeddings_tensor
     
     # 7. Model hyperparameter optimization
@@ -639,10 +656,17 @@ def run_ranking(interactive=False, optimize=False, db_path=None):
             'brr_weight': 0.1852941582795484
         }
         
-    # 8. Run regression ensemble
+    # 8. Run regression ensemble — trained and predicted on embedded_books_df only
     print("Running ensemble models...")
-    friend_final_pred = run_optimized(friend_params, books_df, precomputed_embeddings, 'training_ratings')
-    solo_final_pred = run_optimized(solo_params, books_df, precomputed_embeddings, 'my_refined')
+    friend_final_pred_embedded = run_optimized(friend_params, embedded_books_df, precomputed_embeddings, 'training_ratings')
+    solo_final_pred_embedded = run_optimized(solo_params, embedded_books_df, precomputed_embeddings, 'my_refined')
+
+    # Back-project predictions onto the full books_df (NaN for books without embeddings)
+    friend_final_pred = np.full(len(books_df), np.nan)
+    solo_final_pred = np.full(len(books_df), np.nan)
+    embedded_positions = np.where(has_embedding)[0]
+    friend_final_pred[embedded_positions] = friend_final_pred_embedded
+    solo_final_pred[embedded_positions] = solo_final_pred_embedded
     
     # 9. Compute combined ratings
     print("Formulating final recommendations...")
@@ -662,8 +686,13 @@ def run_ranking(interactive=False, optimize=False, db_path=None):
     count_adjusted = books_df.apply(weighted_rating, axis=1)
     
     scaler = MinMaxScaler()
-    solo_pred = scaler.fit_transform(solo_final_pred.reshape(-1, 1)).flatten()
-    friend_pred = scaler.fit_transform(friend_final_pred.reshape(-1, 1)).flatten()
+    # Scale only where predictions exist (i.e., books with embeddings)
+    valid_mask = ~np.isnan(solo_final_pred)
+    solo_pred = np.full(len(books_df), np.nan)
+    friend_pred = np.full(len(books_df), np.nan)
+    if valid_mask.any():
+        solo_pred[valid_mask] = scaler.fit_transform(solo_final_pred[valid_mask].reshape(-1, 1)).flatten()
+        friend_pred[valid_mask] = scaler.fit_transform(friend_final_pred[valid_mask].reshape(-1, 1)).flatten()
     count_adjusted_scaled = scaler.fit_transform(count_adjusted.values.reshape(-1, 1)).flatten()
     
     books_df['solo_pred_rating'] = solo_pred

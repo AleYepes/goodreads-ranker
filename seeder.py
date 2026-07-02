@@ -111,9 +111,7 @@ async def download_user_library(email, password, db_path=None, force=False):
     print("Export downloaded. Importing into database...")
     
     df = pd.read_csv(temp_csv_path)
-    
-    # Normalize columns
-    df.columns = [col.lower().replace(' ', '_').replace('author_l-f', 'author_lf') for col in df.columns]
+    df = db.normalise_library_columns(df)
     
     # Clean ISBNs
     if 'isbn' in df.columns:
@@ -250,25 +248,17 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
                     extracted_data,
                     ["list_id", "book_id", "title", "rating", "num_pages", "date_read", "date_added"]
                 )
-                
-                today = datetime.now().strftime("%Y-%m-%d")
-                db_conn.execute(
-                    "UPDATE friend_lists SET scrape_complete = 1, date_last_scraped = ? WHERE list_id = ?",
-                    (today, list_id)
-                )
-                db_conn.commit()
-                db_conn.close()
-                print(f"Successfully processed list {list_id} ({len(extracted_data)} books)")
             else:
                 db_conn = db.get_connection(db_path)
-                today = datetime.now().strftime("%Y-%m-%d")
-                db_conn.execute(
-                    "UPDATE friend_lists SET scrape_complete = 1, date_last_scraped = ? WHERE list_id = ?",
-                    (today, list_id)
-                )
-                db_conn.commit()
-                db_conn.close()
-                print(f"Processed list {list_id} (0 books found)")
+
+            today = datetime.now().strftime("%Y-%m-%d")
+            db_conn.execute(
+                "UPDATE friend_lists SET scrape_complete = 1, date_last_scraped = ? WHERE list_id = ?",
+                (today, list_id)
+            )
+            db_conn.commit()
+            db_conn.close()
+            print(f"Processed list {list_id} ({len(extracted_data)} books)")
 
         except Exception as e:
             print(f"Failed list {list_id}: {e}")
