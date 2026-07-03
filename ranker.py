@@ -18,6 +18,124 @@ from torch_geometric.utils import add_self_loops
 
 import db
 
+DEFAULT_FRIEND_PARAMS = {
+    "num_propagations": 0,
+    "knn_neighbors": 18,
+    "brr_alpha_1": 0.0007083523294476891,
+    "brr_alpha_2": 0.0005052291699790206,
+    "brr_lambda_1": 6.723461212511323e-06,
+    "brr_lambda_2": 0.00065032051532833,
+    "brr_uncertainty_penalty": 1.124317064784675,
+    "svr_regularization": 0.045512095772648135,
+    "svr_epsilon": 0.45635064943633097,
+    "knn_weight": 0.6072006217417109,
+    "brr_weight": 0.7469140779723126,
+}
+
+DEFAULT_SOLO_PARAMS = {
+    "num_propagations": 1,
+    "knn_neighbors": 39,
+    "brr_alpha_1": 0.0007917501343982147,
+    "brr_alpha_2": 0.0003673094481243756,
+    "brr_lambda_1": 0.0009261898325379562,
+    "brr_lambda_2": 0.0004845024834776367,
+    "brr_uncertainty_penalty": 1.4875061034371395,
+    "svr_regularization": 2.0283092484268437,
+    "svr_epsilon": 0.2673464313322004,
+    "knn_weight": 0.11589067396260068,
+    "brr_weight": 0.1852941582795484,
+}
+
+
+def normalize_model_params(params):
+    params = {
+        key: value.item() if hasattr(value, "item") else value
+        for key, value in dict(params).items()
+    }
+    if "svr_regularization" not in params and "svr_C" in params:
+        params["svr_regularization"] = params.pop("svr_C")
+    params["num_propagations"] = int(params["num_propagations"])
+    params["knn_neighbors"] = int(params["knn_neighbors"])
+    return params
+
+
+def get_or_create_model_params(conn, name, defaults):
+    params = db.load_model_params(conn, name)
+    if params is None:
+        params = dict(defaults)
+        db.save_model_params(conn, name, params)
+        return params
+    params = normalize_model_params(params)
+    db.save_model_params(conn, name, params)
+    return params
+
+
+def load_valid_embeddings_for_books(conn, books_df):
+    rows = conn.execute(
+        """
+        SELECT b.book_id,
+               COALESCE(b.verified_embedding, 0) AS verified_embedding,
+               e.dim,
+               e.vector
+        FROM books b
+        LEFT JOIN embeddings e ON e.book_id = b.book_id
+        """
+    ).fetchall()
+    embedding_rows = {int(row["book_id"]): row for row in rows}
+
+    counts = {
+        "missing": 0,
+        "wrong_byte_length": 0,
+        "zero_vector": 0,
+        "unverified": 0,
+        "dimension_mismatch": 0,
+    }
+    valid_vectors = []
+    valid_mask = []
+    expected_dim = None
+
+    for book_id in books_df["book_id"]:
+        row = embedding_rows.get(int(book_id))
+        if not row or row["vector"] is None:
+            counts["missing"] += 1
+            valid_mask.append(False)
+            continue
+
+        dim = int(row["dim"])
+        vector_blob = row["vector"]
+        if len(vector_blob) != dim * np.dtype(np.float32).itemsize:
+            counts["wrong_byte_length"] += 1
+            valid_mask.append(False)
+            continue
+
+        vector = np.frombuffer(vector_blob, dtype=np.float32).copy()
+        if not np.any(vector != 0):
+            counts["zero_vector"] += 1
+            valid_mask.append(False)
+            continue
+
+        if int(row["verified_embedding"] or 0) == 0:
+            counts["unverified"] += 1
+            valid_mask.append(False)
+            continue
+
+        if expected_dim is None:
+            expected_dim = dim
+        elif dim != expected_dim:
+            counts["dimension_mismatch"] += 1
+            valid_mask.append(False)
+            continue
+
+        valid_vectors.append(vector)
+        valid_mask.append(True)
+
+    matrix = (
+        np.vstack(valid_vectors).astype(np.float32, copy=False)
+        if valid_vectors
+        else np.empty((0, 0), dtype=np.float32)
+    )
+    return np.array(valid_mask, dtype=bool), matrix, counts
+
 
 def get_expected_score(rating_a, rating_b):
     return 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
@@ -370,6 +488,9 @@ def get_similar_friend_ratings(
             }
         )
 
+    if not friend_scores:
+        return pd.Series(dtype=float), [], pd.DataFrame()
+
     friend_scores = (
         pd.DataFrame(friend_scores)
         .sort_values("score", ascending=False)
@@ -459,6 +580,8 @@ def prep_optimization(
 ):
     training_mask = ~books_df[training_col].isna()
     my_ratings = books_df.loc[training_mask, training_col].values
+    if len(my_ratings) < 2:
+        raise RuntimeError(f"Need at least 2 ratings to optimize {training_col}.")
     scaler = MinMaxScaler(feature_range=(0, 1))
     my_ratings_scaled = scaler.fit_transform(my_ratings.reshape(-1, 1)).flatten()
 
@@ -482,7 +605,9 @@ def prep_optimization(
 
         y_reals = []
         y_preds = []
-        skf = KFold(n_splits=10, shuffle=True, random_state=42)
+        skf = KFold(
+            n_splits=min(10, len(train_embeddings)), shuffle=True, random_state=42
+        )
         for train_idx, test_idx in skf.split(train_embeddings):
             train_fold_embeddings, test_fold_embeddings = (
                 train_embeddings[train_idx],
@@ -491,7 +616,7 @@ def prep_optimization(
             y_train, y_test = y[train_idx], y[test_idx]
 
             knn = KNeighborsRegressor(
-                n_neighbors=knn_neighbors,
+                n_neighbors=min(knn_neighbors, len(train_fold_embeddings)),
                 metric="cosine",
                 weights="distance",
                 n_jobs=-1,
@@ -579,6 +704,8 @@ def run_optimized(best_params, books_df, precomputed_embeddings, training_col):
 
     training_mask = ~books_df[training_col].isna()
     my_ratings = books_df.loc[training_mask, training_col].values
+    if len(my_ratings) < 2:
+        raise RuntimeError(f"Need at least 2 ratings to model {training_col}.")
     scaler = MinMaxScaler(feature_range=(0, 1))
     my_ratings_scaled = scaler.fit_transform(my_ratings.reshape(-1, 1)).flatten()
 
@@ -586,7 +713,7 @@ def run_optimized(best_params, books_df, precomputed_embeddings, training_col):
     y_train = my_ratings_scaled
 
     knn = KNeighborsRegressor(
-        n_neighbors=best_params["knn_neighbors"],
+        n_neighbors=min(int(best_params["knn_neighbors"]), len(train_embeddings)),
         metric="cosine",
         weights="distance",
         n_jobs=-1,
@@ -632,10 +759,13 @@ def run_optimized(best_params, books_df, precomputed_embeddings, training_col):
 
 
 def run_ranking(interactive=False, optimize=False, db_path=None):
+    db.init_db(db_path)
     conn = db.get_connection(db_path)
+    conn.execute("DELETE FROM predictions")
+    conn.commit()
 
     # 1. Load books metadata
-    cursor = conn.execute("SELECT * FROM books")
+    cursor = conn.execute("SELECT * FROM books ORDER BY book_id")
     books_rows = cursor.fetchall()
     if not books_rows:
         print("No book records found in the books table. Run crawler first.")
@@ -671,28 +801,31 @@ def run_ranking(interactive=False, optimize=False, db_path=None):
     )
     books_df = books_df.merge(my_refined.rename("my_refined"), on="book_id", how="left")
 
-    # 4. Load embeddings memory-efficiently
-    print("Loading embeddings...")
-    book_ids = books_df["book_id"].tolist()
-    embeddings_matrix, missing_ids = db.load_embeddings_for_books(conn, book_ids)
-    if len(missing_ids) > 0:
+    # 4. Load only valid, verified embeddings.
+    print("Loading valid embeddings...")
+    has_embedding, embedded_embeddings, invalid_counts = (
+        load_valid_embeddings_for_books(conn, books_df)
+    )
+    excluded_count = int((~has_embedding).sum())
+    if excluded_count:
         print(
-            f"Warning: {len(missing_ids)} books are missing embeddings in database. Run embedder first to fill."
+            "Excluding "
+            f"{excluded_count} books from model inputs "
+            f"(missing={invalid_counts['missing']}, "
+            f"wrong_byte_length={invalid_counts['wrong_byte_length']}, "
+            f"zero_vector={invalid_counts['zero_vector']}, "
+            f"unverified={invalid_counts['unverified']}, "
+            f"dimension_mismatch={invalid_counts['dimension_mismatch']})."
         )
+    if embedded_embeddings.size == 0:
+        print("No valid embeddings found. Run embedder before ranking.")
+        conn.close()
+        return
 
     # 5. Friend taste calibration
     print("Calibrating friend ratings...")
 
-    # Build a boolean mask for books that have real embeddings.
-    # Books with zero vectors (missing embeddings) are excluded from model
-    # training and GCN propagation to avoid corrupting cosine distances.
-    has_embedding = np.any(embeddings_matrix != 0, axis=1)
-    if not np.all(has_embedding):
-        n_missing = int((~has_embedding).sum())
-        print(f"Excluding {n_missing} books with missing embeddings from model inputs.")
-
     embedded_books_df = books_df[has_embedding].copy().reset_index(drop=True)
-    embedded_embeddings = embeddings_matrix[has_embedding]
 
     similar_friend_ratings, similar_friends, friend_scores = get_similar_friend_ratings(
         embedded_books_df, conn, embedded_embeddings, min_correlation=0.3
@@ -718,6 +851,14 @@ def run_ranking(interactive=False, optimize=False, db_path=None):
 
     # Precompute mrl_dimensions based on the embedded subset only
     train_size = (~embedded_books_df["training_ratings"].isna()).sum()
+    solo_train_size = (~embedded_books_df["my_refined"].isna()).sum()
+    if train_size < 2 or solo_train_size < 2:
+        print(
+            "Not enough rated books with valid embeddings to train ranking models "
+            f"(training={train_size}, personal={solo_train_size})."
+        )
+        conn.close()
+        return
     mrl_dimensions = 32
     while mrl_dimensions * 2 < train_size:
         mrl_dimensions *= 2
@@ -744,7 +885,7 @@ def run_ranking(interactive=False, optimize=False, db_path=None):
     if optimize:
         print("Tuning hyperparameters via Nevergrad (budget=200)...")
         friend_params = prep_optimization(
-            books_df,
+            embedded_books_df,
             precomputed_embeddings,
             "training_ratings",
             mrl_dimensions,
@@ -752,41 +893,25 @@ def run_ranking(interactive=False, optimize=False, db_path=None):
             budget=200,
         )
         solo_params = prep_optimization(
-            books_df,
+            embedded_books_df,
             precomputed_embeddings,
             "my_refined",
             mrl_dimensions,
             max_propagations,
             budget=200,
         )
+        friend_params = normalize_model_params(friend_params)
+        solo_params = normalize_model_params(solo_params)
+        db.save_model_params(conn, "friend_params", friend_params)
+        db.save_model_params(conn, "solo_params", solo_params)
     else:
-        print("Using pre-saved default hyperparameters...")
-        friend_params = {
-            "num_propagations": 0,
-            "knn_neighbors": 18,
-            "brr_alpha_1": 0.0007083523294476891,
-            "brr_alpha_2": 0.0005052291699790206,
-            "brr_lambda_1": 6.723461212511323e-06,
-            "brr_lambda_2": 0.00065032051532833,
-            "brr_uncertainty_penalty": 1.124317064784675,
-            "svr_C": 0.045512095772648135,
-            "svr_epsilon": 0.45635064943633097,
-            "knn_weight": 0.6072006217417109,
-            "brr_weight": 0.7469140779723126,
-        }
-        solo_params = {
-            "num_propagations": 1,
-            "knn_neighbors": 39,
-            "brr_alpha_1": 0.0007917501343982147,
-            "brr_alpha_2": 0.0003673094481243756,
-            "brr_lambda_1": 0.0009261898325379562,
-            "brr_lambda_2": 0.0004845024834776367,
-            "brr_uncertainty_penalty": 1.4875061034371395,
-            "svr_C": 2.0283092484268437,
-            "svr_epsilon": 0.2673464313322004,
-            "knn_weight": 0.11589067396260068,
-            "brr_weight": 0.1852941582795484,
-        }
+        print("Using stored/default hyperparameters...")
+        friend_params = get_or_create_model_params(
+            conn, "friend_params", DEFAULT_FRIEND_PARAMS
+        )
+        solo_params = get_or_create_model_params(
+            conn, "solo_params", DEFAULT_SOLO_PARAMS
+        )
 
     # 8. Run regression ensemble — trained and predicted on embedded_books_df only
     print("Running ensemble models...")
@@ -851,6 +976,14 @@ def run_ranking(interactive=False, optimize=False, db_path=None):
     predictions_data = []
 
     for _, row in books_df.iterrows():
+        required = [
+            row["solo_pred_rating"],
+            row["friend_pred_rating"],
+            row["pred_rating"],
+            row["final_rating"],
+        ]
+        if any(pd.isna(value) for value in required):
+            continue
         predictions_data.append(
             (
                 int(row["book_id"]),

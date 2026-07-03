@@ -7,7 +7,7 @@ import json
 import random
 import re
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 from bs4 import BeautifulSoup
@@ -17,16 +17,13 @@ from tqdm.asyncio import tqdm
 
 import db
 
-# ---------------------------------------------------------------------------
-# Configuration constants
-# ---------------------------------------------------------------------------
 PAYLOAD_WAIT_ATTEMPTS = 20
 PAGE_TIMEOUT_MS = 20000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 RESTART_THRESHOLD = 100
 RATE_LIMIT_STATUSES = {403, 429}
 MAX_RATE_LIMIT_RETRIES = 3
-RATE_LIMIT_BACKOFF_SECONDS = 15
+RATE_LIMIT_BACKOFF_SECONDS = 10
 MODAL_WATCH_SECONDS = 4
 MODAL_DISMISSED_WATCH_SECONDS = 1
 MODAL_POLL_MS = 250
@@ -71,7 +68,37 @@ def parse_and_score_similar_books(encoded_str, scoring_func):
     return similar_books
 
 
-def prep_crawl_heapq(scoring_func, db_path=None):
+def parse_scraped_at(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        try:
+            return datetime.strptime(str(value), "%Y-%m-%d")
+        except ValueError:
+            return None
+
+
+def is_stale_scrape(value, now=None):
+    scraped_at = parse_scraped_at(value)
+    if scraped_at is None:
+        return True
+    return scraped_at < (now or datetime.now()) - timedelta(days=30)
+
+
+def embedding_components_changed(old_row, new_data):
+    if not old_row:
+        return True
+    for field in ("title", "authors", "genres", "description"):
+        old_value = old_row[field] or ""
+        new_value = new_data.get(field) or ""
+        if str(old_value) != str(new_value):
+            return True
+    return False
+
+
+def prep_crawl_heapq(scoring_func, limit=None, force_recrawl=False, db_path=None):
     conn = db.get_connection(db_path)
 
     # Read seeds from user_library
@@ -84,34 +111,59 @@ def prep_crawl_heapq(scoring_func, db_path=None):
     )
     seed_ids.update(int(row["book_id"]) for row in cursor.fetchall())
 
-    # Prioritize seeds
-    crawl_queue = {bid: 9e7 for bid in seed_ids}
+    include_expansion = limit is not None
 
     # Read already scraped book IDs and similar_books
     cursor = conn.execute(
-        "SELECT book_id, similar_books FROM books WHERE book_id IS NOT NULL"
+        """
+        SELECT book_id, similar_books, date_last_scraped
+        FROM books
+        WHERE book_id IS NOT NULL
+        """
     )
     scraped_rows = cursor.fetchall()
-    scraped_ids = {int(row["book_id"]) for row in scraped_rows}
+    scraped_by_id = {int(row["book_id"]): row for row in scraped_rows}
+    scraped_ids = set(scraped_by_id)
+    recrawl_ids = {
+        book_id
+        for book_id, row in scraped_by_id.items()
+        if force_recrawl and is_stale_scrape(row["date_last_scraped"])
+    }
 
-    for row in scraped_rows:
-        similar_books_str = row["similar_books"]
-        if similar_books_str:
-            for book_id, score in parse_and_score_similar_books(
-                similar_books_str, scoring_func
-            ):
-                if book_id not in scraped_ids:
-                    crawl_queue[book_id] = max(score, crawl_queue.get(book_id, 0))
+    crawl_queue = {}
+    for book_id in seed_ids:
+        if book_id not in scraped_ids or book_id in recrawl_ids:
+            crawl_queue[book_id] = (0, 0)
 
-    for book_id in scraped_ids:
-        crawl_queue.pop(book_id, None)
+    if include_expansion:
+        for row in scraped_rows:
+            similar_books_str = row["similar_books"]
+            if similar_books_str:
+                for book_id, score in parse_and_score_similar_books(
+                    similar_books_str, scoring_func
+                ):
+                    should_crawl = book_id not in scraped_ids or book_id in recrawl_ids
+                    if should_crawl and book_id not in seed_ids:
+                        priority = (1, -score)
+                        existing = crawl_queue.get(book_id)
+                        if existing is None or priority < existing:
+                            crawl_queue[book_id] = priority
 
     conn.close()
 
-    crawl_queue = [(-rating, book_id) for book_id, rating in crawl_queue.items()]
+    crawl_queue = [
+        (group, sort_score, book_id)
+        for book_id, (group, sort_score) in crawl_queue.items()
+    ]
     heapq.heapify(crawl_queue)
 
-    return crawl_queue, scraped_ids, {book_id for _, book_id in crawl_queue}, seed_ids
+    return (
+        crawl_queue,
+        scraped_ids,
+        {book_id for _, _, book_id in crawl_queue},
+        seed_ids,
+        recrawl_ids,
+    )
 
 
 async def fetch_book(page, book_id, bad_book_ids):
@@ -403,7 +455,8 @@ async def fetch_book(page, book_id, bad_book_ids):
             await page.goto("about:blank")
 
 
-async def run_crawler(limit=None, concurrency=2, db_path=None):
+async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=None):
+    db.init_db(db_path)
 
     async def block_media(route):
         if route.request.resource_type in ["image", "media", "font"]:
@@ -440,6 +493,8 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
         "want_to_read",
         "author_num_books",
         "currently_reading",
+        "date_last_scraped",
+        "verified_embedding",
     ]
 
     bad_book_ids = set()
@@ -447,19 +502,26 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
     scoring_algo_names = list(SCORING_FUNCTIONS.keys())
     total_processed = 0
     db_conn = db.get_connection(db_path)
+    enforce_limit = limit is not None and limit > 0
+    include_expansion = limit is not None
 
     while True:
         current_algo_name = scoring_algo_names[cycle % len(scoring_algo_names)]
         scoring_func = SCORING_FUNCTIONS[current_algo_name]
 
-        crawl_queue, scraped_ids, queued_ids, seed_ids = prep_crawl_heapq(
-            scoring_func, db_path
+        crawl_queue, scraped_ids, queued_ids, seed_ids, recrawl_ids = prep_crawl_heapq(
+            scoring_func, limit=limit, force_recrawl=force_recrawl, db_path=db_path
         )
         if not crawl_queue:
             print("No more books to crawl.")
             break
 
-        remaining_seeds = seed_ids - scraped_ids - bad_book_ids
+        remaining_seeds = {
+            book_id
+            for book_id in seed_ids
+            if (book_id not in scraped_ids or book_id in recrawl_ids)
+            and book_id not in bad_book_ids
+        }
         pbar = tqdm(
             total=len(scraped_ids) + len(crawl_queue),
             initial=len(scraped_ids),
@@ -484,7 +546,7 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
                 while (
                     crawl_queue or active_tasks
                 ) and processed_in_cycle < RESTART_THRESHOLD:
-                    if limit is not None and total_processed >= limit:
+                    if enforce_limit and total_processed >= limit:
                         break
 
                     while (
@@ -493,13 +555,15 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
                         and processed_in_cycle < RESTART_THRESHOLD
                     ):
                         if (
-                            limit is not None
+                            enforce_limit
                             and total_processed + len(active_tasks) >= limit
                         ):
                             break
 
-                        _, book_id = heapq.heappop(crawl_queue)
-                        if book_id in scraped_ids or book_id in bad_book_ids:
+                        _, _, book_id = heapq.heappop(crawl_queue)
+                        if (
+                            book_id in scraped_ids and book_id not in recrawl_ids
+                        ) or book_id in bad_book_ids:
                             continue
 
                         page = page_pool.get_nowait()
@@ -520,6 +584,22 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
                             total_processed += 1
                             book_data = task.result()
                             if book_data:
+                                old_row = db_conn.execute(
+                                    """
+                                    SELECT title, authors, genres, description
+                                    FROM books
+                                    WHERE book_id = ?
+                                    """,
+                                    (book_data["book_id"],),
+                                ).fetchone()
+                                book_data["date_last_scraped"] = (
+                                    datetime.now().isoformat()
+                                )
+                                book_data["verified_embedding"] = (
+                                    0
+                                    if embedding_components_changed(old_row, book_data)
+                                    else 1
+                                )
                                 row_tuple = tuple(
                                     book_data.get(field) for field in field_names
                                 )
@@ -529,6 +609,7 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
 
                                 bid = book_data["book_id"]
                                 scraped_ids.add(bid)
+                                recrawl_ids.discard(bid)
 
                                 if bid in remaining_seeds:
                                     remaining_seeds.remove(bid)
@@ -544,18 +625,22 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
                                 pbar.update(1)
 
                                 added = 0
-                                for similar_id, score in parse_and_score_similar_books(
-                                    book_data.get("similar_books", ""), scoring_func
-                                ):
-                                    if (
-                                        similar_id not in scraped_ids
-                                        and similar_id not in queued_ids
+                                if include_expansion:
+                                    for (
+                                        similar_id,
+                                        score,
+                                    ) in parse_and_score_similar_books(
+                                        book_data.get("similar_books", ""), scoring_func
                                     ):
-                                        heapq.heappush(
-                                            crawl_queue, (-score, similar_id)
-                                        )
-                                        queued_ids.add(similar_id)
-                                        added += 1
+                                        if (
+                                            similar_id not in scraped_ids
+                                            or similar_id in recrawl_ids
+                                        ) and similar_id not in queued_ids:
+                                            heapq.heappush(
+                                                crawl_queue, (1, -score, similar_id)
+                                            )
+                                            queued_ids.add(similar_id)
+                                            added += 1
                                 pbar.total += added
                         except Exception as e:
                             tqdm.write(f"\nError post-processing task: {e}")
@@ -570,7 +655,7 @@ async def run_crawler(limit=None, concurrency=2, db_path=None):
                 await browser.close()
                 await asyncio.sleep(1)
 
-        if limit is not None and total_processed >= limit:
+        if enforce_limit and total_processed >= limit:
             print(f"Reached crawl limit of {limit} books. Stopping.")
             break
 
@@ -588,10 +673,19 @@ async def main():
         "--limit", type=int, default=None, help="Max number of books to crawl"
     )
     parser.add_argument("--concurrency", type=int, default=2, help="Concurrency limit")
+    parser.add_argument(
+        "--force-recrawl",
+        action="store_true",
+        help="Recrawl rows scraped more than one month ago",
+    )
     args = parser.parse_args()
 
     with contextlib.suppress(KeyboardInterrupt):
-        await run_crawler(limit=args.limit, concurrency=args.concurrency)
+        await run_crawler(
+            limit=args.limit,
+            concurrency=args.concurrency,
+            force_recrawl=args.force_recrawl,
+        )
 
 
 if __name__ == "__main__":

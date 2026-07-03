@@ -3,7 +3,6 @@ import os
 import re
 
 import numpy as np
-import ollama
 from dotenv import load_dotenv
 from tqdm import tqdm
 
@@ -41,6 +40,7 @@ def build_embedding_inputs(conn):
     """Query all books and build their formatted embedding input strings."""
     cursor = conn.execute(
         "SELECT book_id, title, authors, genres, description FROM books"
+        " ORDER BY book_id"
     )
     rows = cursor.fetchall()
 
@@ -74,13 +74,50 @@ def build_embedding_inputs(conn):
     return inputs
 
 
+def find_books_needing_embeddings(conn, all_inputs):
+    if not all_inputs:
+        return []
+
+    cursor = conn.execute(
+        """
+        SELECT b.book_id,
+               COALESCE(b.verified_embedding, 0) AS verified_embedding,
+               e.dim,
+               e.vector
+        FROM books b
+        LEFT JOIN embeddings e ON e.book_id = b.book_id
+        ORDER BY b.book_id
+        """
+    )
+
+    queued = []
+    expected_dim = None
+    for row in cursor.fetchall():
+        book_id = int(row["book_id"])
+        if book_id not in all_inputs:
+            continue
+        if row["vector"] is None:
+            queued.append(book_id)
+            continue
+        if not db.is_valid_embedding_blob(row["vector"], row["dim"]):
+            queued.append(book_id)
+            continue
+        dim = int(row["dim"])
+        if expected_dim is None:
+            expected_dim = dim
+        elif dim != expected_dim:
+            queued.append(book_id)
+            continue
+        if int(row["verified_embedding"] or 0) == 0:
+            queued.append(book_id)
+
+    return queued
+
+
 def generate_embeddings(batch_size=128, model=None, db_path=None):
     """Identify books missing embeddings and generate them using Ollama."""
     load_dotenv()
     db.init_db(db_path)
-
-    if not model:
-        model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
 
     conn = db.get_connection(db_path)
 
@@ -91,17 +128,17 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
         conn.close()
         return
 
-    # Check which ones are already embedded
-    cursor = conn.execute("SELECT book_id FROM embeddings")
-    embedded_ids = {int(row["book_id"]) for row in cursor.fetchall()}
-
-    # Filter missing
-    missing_ids = [bid for bid in all_inputs if bid not in embedded_ids]
+    missing_ids = find_books_needing_embeddings(conn, all_inputs)
 
     if not missing_ids:
-        print("All books already have embeddings in the database.")
+        print("Nothing to embed: all scraped books have valid verified embeddings.")
         conn.close()
         return
+
+    if not model:
+        model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
+
+    import ollama
 
     print(
         f"Generating embeddings for {len(missing_ids)} books using Ollama model '{model}'..."
@@ -117,6 +154,11 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
 
             vectors = np.array(embeddings_list, dtype=np.float32)
             db.save_embeddings(conn, batch_ids, vectors)
+            conn.executemany(
+                "UPDATE books SET verified_embedding = 1 WHERE book_id = ?",
+                [(int(book_id),) for book_id in batch_ids],
+            )
+            conn.commit()
         except Exception as e:
             print(
                 f"\nError generating embeddings for batch starting with book_id {batch_ids[0]}: {e}"

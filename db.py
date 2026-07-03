@@ -5,7 +5,9 @@ Provides schema initialization, connection management, and memory-efficient
 helpers for bulk reads/writes — especially for embedding BLOB storage.
 """
 
+import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -42,7 +44,8 @@ CREATE TABLE IF NOT EXISTS user_library (
 CREATE TABLE IF NOT EXISTS friend_lists (
     list_id            INTEGER PRIMARY KEY,
     scrape_complete    INTEGER DEFAULT 0,
-    date_last_scraped  TEXT
+    date_last_scraped  TEXT,
+    scrape_error       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS friend_ratings (
@@ -78,7 +81,9 @@ CREATE TABLE IF NOT EXISTS books (
     author_followers  INTEGER DEFAULT 0,
     want_to_read      INTEGER DEFAULT 0,
     author_num_books  INTEGER DEFAULT 0,
-    currently_reading INTEGER DEFAULT 0
+    currently_reading INTEGER DEFAULT 0,
+    date_last_scraped TEXT,
+    verified_embedding INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS elo_ratings (
@@ -103,12 +108,18 @@ CREATE TABLE IF NOT EXISTS predictions (
     final_rating           REAL,
     updated_at             TEXT
 );
+
+CREATE TABLE IF NOT EXISTS model_params (
+    name TEXT PRIMARY KEY,
+    params_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
 def get_connection(db_path=None):
     """Return a new SQLite connection with WAL mode and pragmas for performance."""
-    path = db_path or DB_PATH
+    path = Path(db_path) if db_path is not None else DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.execute("PRAGMA journal_mode=WAL")
@@ -122,8 +133,31 @@ def init_db(db_path=None):
     """Create all tables if they don't exist."""
     conn = get_connection(db_path)
     conn.executescript(SCHEMA)
+    ensure_schema_compat(conn)
     conn.commit()
     conn.close()
+
+
+def ensure_schema_compat(conn):
+    """Apply additive schema changes for databases created by earlier versions."""
+    existing = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+
+    if "books" in existing:
+        ensure_column(conn, "books", "date_last_scraped", "TEXT")
+        ensure_column(conn, "books", "verified_embedding", "INTEGER DEFAULT 0")
+    if "friend_lists" in existing:
+        ensure_column(conn, "friend_lists", "scrape_error", "TEXT")
+
+
+def ensure_column(conn, table, column, definition):
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def vector_to_blob(vec):
@@ -134,6 +168,42 @@ def vector_to_blob(vec):
 def blob_to_vector(blob, dim):
     """Deserialize a SQLite BLOB back to a numpy float32 array."""
     return np.frombuffer(blob, dtype=np.float32, count=dim)
+
+
+def is_valid_embedding_blob(blob, dim):
+    """Return True when an embedding BLOB has the expected length and data."""
+    if blob is None or dim is None:
+        return False
+    expected_bytes = int(dim) * np.dtype(np.float32).itemsize
+    if len(blob) != expected_bytes:
+        return False
+    vector = np.frombuffer(blob, dtype=np.float32)
+    return bool(vector.size and np.any(vector != 0))
+
+
+def save_model_params(conn, name, params):
+    """Persist model hyperparameters as JSON."""
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO model_params (name, params_json, updated_at)
+        VALUES (?, ?, ?)
+        """,
+        (name, json.dumps(params, sort_keys=True), datetime.now().isoformat()),
+    )
+    conn.commit()
+
+
+def load_model_params(conn, name):
+    """Load model hyperparameters, returning None when absent or invalid."""
+    row = conn.execute(
+        "SELECT params_json FROM model_params WHERE name = ?", (name,)
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row["params_json"])
+    except json.JSONDecodeError:
+        return None
 
 
 def save_embeddings(conn, book_ids, vectors):

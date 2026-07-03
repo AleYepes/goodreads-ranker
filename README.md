@@ -43,14 +43,23 @@ Async crawler and ML recommendation pipeline to find good books to read.
 
 
 ## Usage
-1. **Crawl Goodreads:**
+1. **Run the main pipeline:**
     ```bash
-    python3 crawler.py
+    python3 cli.py run_pipeline
     ```
-    *Optional Flag*: `--fd` prompts a fresh download of your Goodreads library.
+    By default this initializes SQLite, seeds your library and friend ratings,
+    crawls missing seed books, embeds books that need embeddings, ranks with
+    stored/default model parameters, and prints a verification summary.
 
-2. **Train & Get Recommendations** WIP
+2. **Run individual stages when needed:**
     ```bash
-    python3 recommend.py
+    python3 cli.py seed
+    python3 cli.py crawl --limit=25
+    python3 cli.py embed
+    python3 cli.py rank
+    python3 cli.py verify
     ```
-    Outputs a ranked list of books for you to choose from.
+
+    `crawl --limit=None` crawls missing seed books only. Positive limits crawl
+    seed books first and then expansion books up to the limit. Zero or negative
+    limits crawl indefinitely, including expansion books.
