@@ -1,6 +1,7 @@
 import argparse
 import random
 from datetime import datetime
+from typing import cast
 
 import nevergrad as ng
 import numpy as np
@@ -52,8 +53,6 @@ def normalize_model_params(params):
         key: value.item() if hasattr(value, "item") else value
         for key, value in dict(params).items()
     }
-    if "svr_regularization" not in params and "svr_C" in params:
-        params["svr_regularization"] = params.pop("svr_C")
     params["num_propagations"] = int(params["num_propagations"])
     params["knn_neighbors"] = int(params["knn_neighbors"])
     return params
@@ -300,12 +299,13 @@ def refine_ratings(target_df, rating_col, conn, interactive=False, title_col="ti
     # Always persist ELO state so subsequent runs (interactive or not) pick up
     # any new books that were added to the table since the last run.
     db_rows = []
-    for _, row in elo_df.iterrows():
+    for row in elo_df.to_dict(orient="records"):
         db_rows.append(
             (
                 int(row["book_id"]),
                 float(row["original_rating"])
                 if row["original_rating"] is not None
+                and pd.notna(row["original_rating"])
                 else None,
                 float(row["elo_score"]),
                 int(row["matches_played"]),
@@ -326,8 +326,12 @@ def safe_spearman(x, y):
     y = np.asarray(y, dtype=float)
     if len(x) < 3 or len(y) < 3 or np.std(x) < 1e-9 or np.std(y) < 1e-9:
         return np.nan
-    rho, _ = spearmanr(x, y)
-    return float(rho) if not np.isnan(rho) else np.nan
+    import typing
+
+    res = spearmanr(x, y)
+    rho = typing.cast(typing.Any, res)[0]
+    val = float(rho)
+    return val if not np.isnan(val) else np.nan
 
 
 def calibrate_friend_ratings(overlap_df, clip_min, clip_max, shrink_after=10):
@@ -368,11 +372,9 @@ def get_similar_friend_ratings(
 
     current_book_ids = books_df["book_id"].to_numpy()
     current_book_id_set = set(current_book_ids.tolist())
-    friends = (
-        friends[friends["book_id"].isin(current_book_id_set)]
-        .dropna(subset=["rating"])
-        .copy()
-    )
+    friends_df = friends[friends["book_id"].isin(list(current_book_id_set))]
+    assert isinstance(friends_df, pd.DataFrame)
+    friends = friends_df.dropna(subset=["rating"]).copy()
     friends = friends.groupby(["list_id", "book_id"], as_index=False)["rating"].mean()
 
     my_books = books_df[["book_id", "my_refined"]].dropna().copy()
@@ -397,6 +399,7 @@ def get_similar_friend_ratings(
     friend_scores = []
     calibrated_friend_rows = []
 
+    assert isinstance(friends, pd.DataFrame)
     for list_id, friend_df in friends.groupby("list_id"):
         overlap = (
             friend_df.merge(my_books, on="book_id", how="inner")
@@ -411,8 +414,9 @@ def get_similar_friend_ratings(
         slope, intercept = calibrate_friend_ratings(overlap, clip_min, clip_max)
 
         friend_df = friend_df.copy()
+        friend_ratings = np.asarray(friend_df["rating"], dtype=float)
         friend_df["calibrated_rating"] = np.clip(
-            slope * friend_df["rating"].astype(float).to_numpy(copy=True) + intercept,
+            slope * friend_ratings + intercept,
             clip_min,
             clip_max,
         )
@@ -520,34 +524,42 @@ def get_similar_friend_ratings(
     if len(selected) < minimum_selected:
         selected = friend_scores.head(minimum_selected).copy()
 
+    assert isinstance(selected, pd.DataFrame)
     similar_friends = selected["list_id"].tolist()
     similar_friend_ratings = pd.concat(calibrated_friend_rows, ignore_index=True)
+    assert isinstance(similar_friend_ratings, pd.DataFrame)
+    selected_sub = selected[["list_id", "score"]]
+    assert isinstance(selected_sub, pd.DataFrame)
     similar_friend_ratings = similar_friend_ratings.merge(
-        selected[["list_id", "score"]].rename(columns={"score": "friend_weight"}),
+        selected_sub.rename(columns={"score": "friend_weight"}),
         on="list_id",
         how="inner",
     )
     similar_friend_ratings = similar_friend_ratings[
-        ~similar_friend_ratings["book_id"].isin(my_book_id_set)
+        ~similar_friend_ratings["book_id"].isin(list(my_book_id_set))
     ].copy()
     if similar_friend_ratings.empty:
         return pd.Series(dtype=float), similar_friends, friend_scores
 
+    assert isinstance(similar_friend_ratings, pd.DataFrame)
     similar_friend_ratings["weighted_rating"] = (
         similar_friend_ratings["calibrated_rating"]
         * similar_friend_ratings["friend_weight"]
     )
-    similar_friend_ratings = similar_friend_ratings.groupby("book_id").agg(
-        weighted_rating=("weighted_rating", "sum"),
-        total_weight=("friend_weight", "sum"),
-        supporting_friends=("list_id", "nunique"),
+    similar_friend_ratings = pd.DataFrame(
+        similar_friend_ratings.groupby("book_id").agg(
+            weighted_rating=("weighted_rating", "sum"),
+            total_weight=("friend_weight", "sum"),
+            supporting_friends=("list_id", "nunique"),
+        )
     )
     similar_friend_ratings["rating"] = (
         similar_friend_ratings["weighted_rating"]
         / similar_friend_ratings["total_weight"]
     )
 
-    return similar_friend_ratings["rating"], similar_friends, friend_scores
+    rating_series = pd.Series(similar_friend_ratings["rating"])
+    return rating_series, similar_friends, friend_scores
 
 
 def build_adjacency_matrix(books_df, num_nodes):
@@ -555,7 +567,7 @@ def build_adjacency_matrix(books_df, num_nodes):
     book_ids_set = set(id_to_idx.keys())
 
     edge_indices = []
-    for _, row in books_df.iterrows():
+    for row in books_df.to_dict(orient="records"):
         current_idx = id_to_idx[int(row["book_id"])]
         similar_books_str = row["similar_books"]
         if not isinstance(similar_books_str, str) or not similar_books_str:
@@ -580,8 +592,14 @@ def build_adjacency_matrix(books_df, num_nodes):
         edge_index_with_loops, num_nodes=num_nodes
     )
 
+    assert isinstance(edge_index_norm, torch.Tensor), (
+        "gcn_norm returned a SparseTensor; expected a dense edge_index Tensor"
+    )
+    assert edge_weight_norm is not None, "gcn_norm returned no edge weights"
     adj_matrix = torch.sparse_coo_tensor(
-        edge_index_norm, edge_weight_norm, (num_nodes, num_nodes)
+        edge_index_norm,
+        edge_weight_norm,
+        (num_nodes, num_nodes),
     )
     return adj_matrix
 
@@ -677,9 +695,10 @@ def prep_optimization(
         if np.std(y_preds) < 1e-9:
             spearman = 0
         else:
-            spearman, _ = spearmanr(y_reals, y_preds)
+            spearman_result = spearmanr(y_reals, y_preds)
+            spearman: float = cast(float, spearman_result[0])
             if np.isnan(spearman):
-                spearman = 0
+                spearman = 0.0
 
         return mse + (1 - ndcg) + (1 - spearman)
 
@@ -804,9 +823,9 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         conn.close()
         return
     gr_export = pd.DataFrame([dict(r) for r in library_rows])
-    gr_export["my_rating"] = pd.to_numeric(
-        gr_export["my_rating"], errors="coerce"
-    ).replace(0, np.nan)
+    my_rating_series = pd.to_numeric(gr_export["my_rating"], errors="coerce")
+    assert isinstance(my_rating_series, pd.Series)
+    gr_export["my_rating"] = my_rating_series.replace(0, np.nan)
 
     # 3. ELO ratings refinement
     print("  Running ELO ratings refinement...")
@@ -846,12 +865,14 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     similar_friend_ratings, similar_friends, friend_scores = get_similar_friend_ratings(
         embedded_books_df, conn, embedded_embeddings, min_correlation=0.3
     )
-    books_df["training_ratings"] = books_df["my_refined"].fillna(
-        books_df["book_id"].map(similar_friend_ratings)
+    friend_ratings_series = pd.Series(similar_friend_ratings)
+    friend_ratings_dict = friend_ratings_series.to_dict()
+    books_df["training_ratings"] = pd.Series(books_df["my_refined"]).fillna(
+        pd.Series(books_df["book_id"]).map(friend_ratings_dict)
     )
-    embedded_books_df["training_ratings"] = embedded_books_df["my_refined"].fillna(
-        embedded_books_df["book_id"].map(similar_friend_ratings)
-    )
+    embedded_books_df["training_ratings"] = pd.Series(
+        embedded_books_df["my_refined"]
+    ).fillna(pd.Series(embedded_books_df["book_id"]).map(friend_ratings_dict))
 
     my_rating_count = len(books_df[books_df["my_rating"].notna()])
     print("  Taste calibration")
@@ -869,7 +890,8 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         selected_scores = friend_scores[
             friend_scores["list_id"].astype(int).isin([int(x) for x in similar_friends])
         ]
-        for _, row in selected_scores.iterrows():
+        records: list[dict] = list(selected_scores.to_dict(orient="records"))  # type: ignore[call-overload]
+        for row in records:
             lid = int(row["list_id"])
             username = list_to_user.get(lid, str(lid))
             overlap_c = int(row["overlap_count"])
@@ -880,8 +902,8 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
     # Precompute mrl_dimensions based on the embedded subset only
-    train_size = (~embedded_books_df["training_ratings"].isna()).sum()
-    solo_train_size = (~embedded_books_df["my_refined"].isna()).sum()
+    train_size = (~pd.isna(embedded_books_df["training_ratings"])).sum()
+    solo_train_size = (~pd.isna(embedded_books_df["my_refined"])).sum()
     if train_size < 2 or solo_train_size < 2:
         print(
             "  Not enough rated books with valid embeddings to train ranking models "
@@ -991,7 +1013,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             friend_final_pred[valid_mask].reshape(-1, 1)
         ).flatten()
     count_adjusted_scaled = scaler.fit_transform(
-        count_adjusted.values.reshape(-1, 1)
+        np.asarray(count_adjusted).reshape(-1, 1)
     ).flatten()
 
     books_df["solo_pred_rating"] = solo_pred
@@ -1005,7 +1027,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     now_str = datetime.now().isoformat()
     predictions_data = []
 
-    for _, row in books_df.iterrows():
+    for row in books_df.to_dict(orient="records"):
         required = [
             row["solo_pred_rating"],
             row["friend_pred_rating"],

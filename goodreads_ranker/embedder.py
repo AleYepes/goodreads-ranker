@@ -49,7 +49,7 @@ def _ensure_ollama(model: str):
             )
 
     # 2. Pull the model only if it is not already present.
-    available = {m.model for m in ollama.list().models}
+    available = {m.model for m in ollama.list().models if m.model is not None}
 
     # Normalise: ollama may append ':latest' to untagged names.
     def _normalise(name: str) -> str:
@@ -110,23 +110,19 @@ def build_embedding_inputs(conn):
         book_id = int(row["book_id"])
         title = row["title"] or ""
 
-        # Authors
         authors_raw = row["authors"] or ""
         authors_list = [a.strip() for a in authors_raw.split("|") if a.strip()]
         authors_post = format_string_for_embedding(authors_list, truncate=4)
 
-        # Genres
         genres_raw = row["genres"] or ""
         genres_list = [g.strip() for g in genres_raw.split("|") if g.strip()]
         genres_post = format_string_for_embedding(genres_list, kind="genre")
 
-        # Description
         desc_raw = row["description"] or ""
         desc_clean = re.sub(r"\s+", " ", desc_raw).strip()
         desc_list = [desc_clean] if desc_clean else []
         desc_post = format_string_for_embedding(desc_list, kind="description")
 
-        # Combined string
         embedding_input = join_embedding_parts(
             title, authors_post, genres_post, desc_post
         )
@@ -197,7 +193,6 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
     if not model:
         model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
 
-    # Get all book IDs and input strings
     all_inputs = build_embedding_inputs(conn)
     if not all_inputs:
         print("  No books found. Run crawler first.")
@@ -228,7 +223,6 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
 
                 vectors = np.array(embeddings_list, dtype=np.float32)
 
-                # Compute hashes for the saved embeddings
                 batch_hashes = {
                     bid: hashlib.md5(all_inputs[bid].encode("utf-8")).hexdigest()
                     for bid in batch_ids

@@ -40,18 +40,6 @@ SCORING_FUNCTIONS = {
     "Count": lambda avg_rating, rating_count: rating_count,
 }
 
-RATING_MAP = {
-    "it was amazing": 5,
-    "really liked it": 4,
-    "liked it": 3,
-    "it was ok": 2,
-    "did not like it": 1,
-}
-
-
-def clean_text(text):
-    return text.strip().replace("\n", "") if text else ""
-
 
 def parse_and_score_similar_books(encoded_str, scoring_func):
     if not isinstance(encoded_str, str) or not encoded_str:
@@ -196,13 +184,12 @@ async def fetch_book(page, book_id, bad_book_ids):
 
         # Stars distribution — keys written as star_N to match the DB schema directly
         for i in range(1, 6):
-            label = soup.find(attrs={"data-testid": f"labelTotal-{i}"})
+            label = soup.select_one(f'[data-testid="labelTotal-{i}"]')
             text = (
                 label.get_text().strip().split()[0].replace(",", "") if label else "0"
             )
             book_data[f"star_{i}"] = int(text) if text.isdigit() else 0
 
-        # Genres
         try:
             if await page.query_selector(
                 'button[aria-label="Show all items in the list"]'
@@ -222,19 +209,15 @@ async def fetch_book(page, book_id, bad_book_ids):
         ]
         book_data["genres"] = "|".join(genres)
 
-        # Series id
         series_el = soup.select_one("h3.Text__italic a")
+        href = series_el.get("href") if series_el else None
         book_data["series"] = (
-            series_el["href"].split("/")[-1]
-            if series_el and series_el.get("href")
-            else ""
+            str(href).split("/")[-1] if series_el and isinstance(href, str) else ""
         )
 
-        # Year
-        pub_el = soup.find(attrs={"data-testid": "publicationInfo"})
+        pub_el = soup.select_one('[data-testid="publicationInfo"]')
         book_data["year"] = pub_el.get_text().split(", ")[-1].strip() if pub_el else ""
 
-        # Description
         desc_el = soup.select_one(
             "[data-testid='description'] span.Formatted"
         ) or soup.select_one(
@@ -249,8 +232,7 @@ async def fetch_book(page, book_id, bad_book_ids):
         else:
             book_data["description"] = ""
 
-        # Currently reading
-        reading_el = soup.find(attrs={"data-testid": "currentlyReadingSignal"})
+        reading_el = soup.select_one('[data-testid="currentlyReadingSignal"]')
         if reading_el:
             text = reading_el.get_text()
             match = re.search(r"(\d+)", text.replace(",", ""))
@@ -258,8 +240,7 @@ async def fetch_book(page, book_id, bad_book_ids):
         else:
             book_data["currently_reading"] = 0
 
-        # Want to read
-        wtr_el = soup.find(attrs={"data-testid": "toReadSignal"})
+        wtr_el = soup.select_one('[data-testid="toReadSignal"]')
         if wtr_el:
             text = wtr_el.get_text()
             match = re.search(r"(\d+)", text.replace(",", ""))
@@ -267,13 +248,11 @@ async def fetch_book(page, book_id, bad_book_ids):
         else:
             book_data["want_to_read"] = 0
 
-        # Author name
-        author_name_el = soup.find(attrs={"data-testid": "name"})
+        author_name_el = soup.select_one('[data-testid="name"]')
         book_data["primary_author"] = (
             author_name_el.get_text().strip() if author_name_el else ""
         )
 
-        # Author stats
         author_stats_el = soup.select_one(".FeaturedPerson__infoPrimary .Text__subdued")
         book_data["author_num_books"] = 0
         book_data["author_followers"] = 0
@@ -286,7 +265,6 @@ async def fetch_book(page, book_id, bad_book_ids):
                     books_match.group(1).replace(",", "")
                 )
 
-            # Author follower count
             followers_match = re.search(r"([\d,kKmM\.]+)\s*followers", stats_text)
             if followers_match:
                 val = followers_match.group(1).lower().replace(",", "")
@@ -298,9 +276,7 @@ async def fetch_book(page, book_id, bad_book_ids):
 
         return book_data
 
-    async def extract_similar_books_json(
-        page, book_data, captured_payloads, collecting
-    ):
+    async def extract_similar_books_json(page, book_data, captured_payloads):
         wait_attempts = 0
         while (
             not any("getSimilarBooks" in str(p) for p in captured_payloads)
@@ -424,9 +400,7 @@ async def fetch_book(page, book_id, bad_book_ids):
 
         book_data = await extract_linked_data_basics(page, book_id)
         book_data = await extract_dom_data(page, book_data)
-        book_data = await extract_similar_books_json(
-            page, book_data, captured_payloads, collecting
-        )
+        book_data = await extract_similar_books_json(page, book_data, captured_payloads)
 
         return book_data
 
@@ -553,7 +527,11 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
                 while (
                     crawl_queue or active_tasks
                 ) and processed_in_cycle < RESTART_THRESHOLD:
-                    if enforce_limit and total_processed >= remaining_budget:
+                    if (
+                        enforce_limit
+                        and remaining_budget is not None
+                        and total_processed >= remaining_budget
+                    ):
                         break
 
                     while (
@@ -563,6 +541,7 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
                     ):
                         if (
                             enforce_limit
+                            and remaining_budget is not None
                             and total_processed + len(active_tasks) >= remaining_budget
                         ):
                             break
@@ -649,7 +628,11 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
                 await browser.close()
                 await asyncio.sleep(1)
 
-        if enforce_limit and total_processed >= remaining_budget:
+        if (
+            enforce_limit
+            and remaining_budget is not None
+            and total_processed >= remaining_budget
+        ):
             total_scraped_now = already_scraped + total_processed
             print(
                 f"  Reached crawl target: {total_scraped_now} total scraped books "

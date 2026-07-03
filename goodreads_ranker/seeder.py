@@ -299,7 +299,7 @@ async def download_user_library(email, password, db_path=None, force=False):
 
     # Extract only matching columns and format rows
     rows = []
-    for _, row in df.iterrows():
+    for row in df.to_dict(orient="records"):
         row_tuple = tuple(row.get(col) for col in columns)
         rows.append(row_tuple)
 
@@ -467,8 +467,6 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
         total_rows = 0
         valid_page_parsed = False
         target_url = await open_list_page(page, list_id, email, password)
-
-        await ensure_list_page(page, target_url, email, password)
 
         with contextlib.suppress(PlaywrightTimeoutError):
             await page.wait_for_selector("h1", timeout=10000)

@@ -292,58 +292,42 @@ class GoodreadsRankerCLI:
             invalid_embeddings = 0
             outdated_embeddings = 0
             if {"books", "embeddings"}.issubset(tables):
-                emb_columns = table_columns("embeddings")
-                if "embedding_model" in emb_columns:
-                    # Books with no embedding row for this model
-                    scraped_missing_embeddings = conn.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM books b
-                        LEFT JOIN embeddings e
-                            ON e.book_id = b.book_id AND e.embedding_model = ?
-                        WHERE e.book_id IS NULL
-                        """,
-                        (model,),
-                    ).fetchone()[0]
-                    # Invalid blob embeddings for this model
-                    for row in conn.execute(
-                        "SELECT dim, vector FROM embeddings WHERE embedding_model = ?",
-                        (model,),
-                    ):
-                        if not db.is_valid_embedding_blob(row["vector"], row["dim"]):
-                            invalid_embeddings += 1
-                    # Outdated: hash mismatch against current book metadata
-                    if "text_hash" in emb_columns:
-                        from goodreads_ranker import embedder
+                # Books with no embedding row for this model
+                scraped_missing_embeddings = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM books b
+                    LEFT JOIN embeddings e
+                        ON e.book_id = b.book_id AND e.embedding_model = ?
+                    WHERE e.book_id IS NULL
+                    """,
+                    (model,),
+                ).fetchone()[0]
+                # Invalid blob embeddings for this model
+                for row in conn.execute(
+                    "SELECT dim, vector FROM embeddings WHERE embedding_model = ?",
+                    (model,),
+                ):
+                    if not db.is_valid_embedding_blob(row["vector"], row["dim"]):
+                        invalid_embeddings += 1
+                # Outdated: hash mismatch against current book metadata
+                from goodreads_ranker import embedder
 
-                        # Compute current hashes for all books
-                        rw_conn = db.get_connection()
-                        all_inputs = embedder.build_embedding_inputs(rw_conn)
-                        rw_conn.close()
-                        current_hashes = {
-                            bid: hashlib.md5(text.encode("utf-8")).hexdigest()
-                            for bid, text in all_inputs.items()
-                        }
-                        for row in conn.execute(
-                            "SELECT book_id, text_hash FROM embeddings WHERE embedding_model = ?",
-                            (model,),
-                        ):
-                            bid = int(row["book_id"])
-                            if current_hashes.get(bid) != row["text_hash"]:
-                                outdated_embeddings += 1
-                else:
-                    # Legacy schema — count all books missing any embedding row
-                    scraped_missing_embeddings = conn.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM books b
-                        LEFT JOIN embeddings e ON e.book_id = b.book_id
-                        WHERE e.book_id IS NULL
-                        """
-                    ).fetchone()[0]
-                    for row in conn.execute("SELECT dim, vector FROM embeddings"):
-                        if not db.is_valid_embedding_blob(row["vector"], row["dim"]):
-                            invalid_embeddings += 1
+                # Compute current hashes for all books
+                rw_conn = db.get_connection()
+                all_inputs = embedder.build_embedding_inputs(rw_conn)
+                rw_conn.close()
+                current_hashes = {
+                    bid: hashlib.md5(text.encode("utf-8")).hexdigest()
+                    for bid, text in all_inputs.items()
+                }
+                for row in conn.execute(
+                    "SELECT book_id, text_hash FROM embeddings WHERE embedding_model = ?",
+                    (model,),
+                ):
+                    bid = int(row["book_id"])
+                    if current_hashes.get(bid) != row["text_hash"]:
+                        outdated_embeddings += 1
 
             prediction_count = table_count("predictions")
             null_prediction_fields = 0
