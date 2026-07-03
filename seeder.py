@@ -198,7 +198,7 @@ async def download_user_library(email, password, db_path=None, force=False):
         count = cursor.fetchone()[0]
         if count > 0:
             print(
-                f"user_library table already has {count} rows. Skipping download. Use --force to override."
+                f"  Library already seeded ({count} books). Use --force to re-download."
             )
             conn.close()
             return
@@ -208,7 +208,7 @@ async def download_user_library(email, password, db_path=None, force=False):
             "GOODREADS_EMAIL and GOODREADS_PASSWORD must be set to download user library."
         )
 
-    print("Logging into Goodreads to download library export...")
+    print("  Logging into Goodreads to download library export...")
 
     temp_dir = tempfile.mkdtemp()
     temp_csv_path = Path(temp_dir) / "library_export.csv"
@@ -258,7 +258,7 @@ async def download_user_library(email, password, db_path=None, force=False):
         await download.save_as(str(temp_csv_path))
         await browser.close()
 
-    print("Export downloaded. Importing into database...")
+    print("  Export downloaded. Importing into database...")
 
     df = pd.read_csv(temp_csv_path)
     df = db.normalise_library_columns(df)
@@ -305,9 +305,7 @@ async def download_user_library(email, password, db_path=None, force=False):
 
     db.upsert_rows(conn, "user_library", rows, columns)
 
-    print(
-        f"Successfully imported {len(rows)} books from your library into the 'user_library' table."
-    )
+    print(f"  Imported {len(rows)} books into library.")
 
     try:
         os.remove(temp_csv_path)
@@ -355,10 +353,10 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
     conn.close()
 
     if not to_scrape:
-        print("All friend lists are already scraped. Use --force-all to re-scrape.")
+        print("  Friend lists already scraped. Use --force-all to re-scrape.")
         return
 
-    print(f"Preparing to scrape {len(to_scrape)} friend lists...")
+    print(f"  Scraping {len(to_scrape)} friend lists...")
 
     def update_friend_info(list_id, username, href):
         db_conn = db.get_connection(db_path)
@@ -464,7 +462,7 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
             db_conn.close()
 
     async def process_list(page, list_id, metadata_only=False):
-        print(f"Scraping list {list_id} (metadata_only={metadata_only})...")
+        print(f"  Scraping list {list_id} (metadata_only={metadata_only})...")
         page_num = 1
         total_rows = 0
         valid_page_parsed = False
@@ -493,7 +491,7 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
             print(f"    Updated metadata: {username} ({href})")
 
         if metadata_only:
-            print(f"Finished metadata-only scrape for {list_id}")
+            print(f"    Finished metadata-only scrape for {list_id}")
             return
 
         existing_rows = load_existing_rows(list_id)
@@ -518,7 +516,7 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
                     page_rows.append(extracted)
                 except Exception as e:
                     page_all_known = False
-                    print(f"Error parsing book in list {list_id}: {e}")
+                    print(f"    Error parsing book in list {list_id}: {e}")
 
             if not page_rows:
                 raise RuntimeError(f"No valid rows parsed on page {page_num}")
@@ -528,7 +526,7 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
             upsert_extracted(page_rows)
 
             if page_all_known:
-                print(f"    P{page_num} unchanged, stopping early")
+                print(f"      P{page_num} unchanged, stopping early")
                 break
 
             next_button = await page.query_selector("a.next_page")
@@ -538,19 +536,19 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
                 target_url = urljoin(page.url, next_href)
                 async with page.expect_navigation():
                     await next_button.click()
-                print(f"    P{page_num}")
+                print(f"      P{page_num}")
                 page_num += 1
                 await asyncio.sleep(1)
                 continue
 
-            print(f"Finished {list_id}")
+            print(f"    Finished {list_id}")
             break
 
         if not valid_page_parsed:
             raise RuntimeError("No valid list page was parsed")
 
         mark_list_complete(list_id)
-        print(f"Processed list {list_id} ({total_rows} books)")
+        print(f"  Processed list {list_id} ({total_rows} books)")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
@@ -560,7 +558,7 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
             try:
                 await process_list(page, list_id, metadata_only=metadata_only)
             except Exception as e:
-                print(f"Failed list {list_id}: {e}")
+                print(f"  Failed list {list_id}: {e}")
                 mark_list_failed(list_id, e)
                 with contextlib.suppress(Exception):
                     await page.goto("about:blank")

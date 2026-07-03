@@ -500,7 +500,7 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
         ).fetchone()[0]
         if already_scraped >= limit:
             print(
-                f"Already have {already_scraped} scraped books "
+                f"  Already have {already_scraped} scraped books "
                 f"(>= limit of {limit}). Skipping crawler."
             )
             db_conn.close()
@@ -520,7 +520,7 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
             scoring_func, limit=limit, force_recrawl=force_recrawl, db_path=db_path
         )
         if not crawl_queue:
-            print("No more books to crawl.")
+            print("  No more books to crawl.")
             break
 
         remaining_seeds = {
@@ -652,7 +652,7 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
         if enforce_limit and total_processed >= remaining_budget:
             total_scraped_now = already_scraped + total_processed
             print(
-                f"Reached crawl target: {total_scraped_now} total scraped books "
+                f"  Reached crawl target: {total_scraped_now} total scraped books "
                 f"(target was {limit}). Stopping."
             )
             break

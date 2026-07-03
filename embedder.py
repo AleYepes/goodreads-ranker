@@ -26,7 +26,7 @@ def _ensure_ollama(model: str):
     try:
         ollama.list()
     except Exception:
-        print("Ollama server not detected — starting 'ollama serve'...")
+        print("  Ollama server not detected — starting 'ollama serve'...")
         proc = subprocess.Popen(
             ["ollama", "serve"],
             stdout=subprocess.DEVNULL,
@@ -47,7 +47,6 @@ def _ensure_ollama(model: str):
                 "Ollama server did not become ready in time. "
                 "Check that 'ollama' is on your PATH and is a valid installation."
             )
-        print("Ollama server started.")
 
     # 2. Pull the model only if it is not already present.
     available = {m.model for m in ollama.list().models}
@@ -57,15 +56,16 @@ def _ensure_ollama(model: str):
         return name if ":" in name else f"{name}:latest"
 
     if _normalise(model) not in {_normalise(m) for m in available}:
-        print(f"Model '{model}' not found locally — pulling (this may take a while)...")
+        print(
+            f"  Model '{model}' not found locally — pulling (this may take a while)..."
+        )
         ollama.pull(model)
-        print(f"Model '{model}' ready.")
+        print(f"  Model '{model}' ready.")
 
     try:
         yield
     finally:
         if server_started_here and proc is not None:
-            print("Stopping Ollama server (started by this process)...")
             proc.terminate()
             proc.wait(timeout=10)
 
@@ -200,7 +200,7 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
     # Get all book IDs and input strings
     all_inputs = build_embedding_inputs(conn)
     if not all_inputs:
-        print("No books found in database. Please crawl books first.")
+        print("  No books found. Run crawler first.")
         conn.close()
         return
 
@@ -208,7 +208,7 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
 
     if not missing_ids:
         print(
-            f"Nothing to embed: all scraped books have valid verified embeddings for model '{model}'."
+            f"  Nothing to embed: all books have valid embeddings for model '{model}'."
         )
         conn.close()
         return
@@ -216,10 +216,6 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
     import hashlib
 
     import ollama
-
-    print(
-        f"Generating embeddings for {len(missing_ids)} books using Ollama model '{model}'..."
-    )
 
     with _ensure_ollama(model):
         for i in tqdm(range(0, len(missing_ids), batch_size)):
@@ -240,12 +236,11 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
                 db.save_embeddings(conn, batch_ids, vectors, model, batch_hashes)
             except Exception as e:
                 print(
-                    f"\nError generating embeddings for batch starting with book_id {batch_ids[0]}: {e}"
+                    f"\n  Error generating embeddings for batch starting with book_id {batch_ids[0]}: {e}"
                 )
                 # Continue with other batches
                 continue
 
-    print("Embedding generation process finished.")
     conn.close()
 
 

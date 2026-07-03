@@ -809,7 +809,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     ).replace(0, np.nan)
 
     # 3. ELO ratings refinement
-    print("Running ELO ratings refinement...")
+    print("  Running ELO ratings refinement...")
     my_refined = refine_ratings(gr_export, "my_rating", conn, interactive=interactive)
 
     books_df = books_df.merge(
@@ -818,14 +818,14 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     books_df = books_df.merge(my_refined.rename("my_refined"), on="book_id", how="left")
 
     # 4. Load only valid, verified embeddings.
-    print("Loading valid embeddings...")
+    print("  Loading valid embeddings...")
     has_embedding, embedded_embeddings, invalid_counts = (
         load_valid_embeddings_for_books(conn, books_df, model=model)
     )
     excluded_count = int((~has_embedding).sum())
     if excluded_count:
         print(
-            "Excluding "
+            "  Excluding "
             f"{excluded_count} books from model inputs "
             f"(missing={invalid_counts['missing']}, "
             f"wrong_byte_length={invalid_counts['wrong_byte_length']}, "
@@ -834,12 +834,12 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             f"dimension_mismatch={invalid_counts['dimension_mismatch']})."
         )
     if embedded_embeddings.size == 0:
-        print("No valid embeddings found. Run embedder before ranking.")
+        print("  No valid embeddings found. Run embedder before ranking.")
         conn.close()
         return
 
     # 5. Friend taste calibration
-    print("Calibrating friend ratings...")
+    print("  Calibrating friend ratings...")
 
     embedded_books_df = books_df[has_embedding].copy().reset_index(drop=True)
 
@@ -854,15 +854,29 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     )
 
     my_rating_count = len(books_df[books_df["my_rating"].notna()])
-    total_training_count = len(
-        embedded_books_df[embedded_books_df["training_ratings"].notna()]
-    )
-    print(
-        f"Taste calibration stats: My ratings ({my_rating_count}) + Friends calibrated ({total_training_count - my_rating_count})"
-    )
+    print("  Taste calibration")
+    print(f"    My ratings ({my_rating_count})")
+
+    # Load username map
+    friend_meta = conn.execute("SELECT list_id, username FROM friend_lists").fetchall()
+    list_to_user = {
+        int(row["list_id"]): row["username"] or str(row["list_id"])
+        for row in friend_meta
+    }
+
+    if not friend_scores.empty:
+        # Filter friend_scores to only include selected list IDs
+        selected_scores = friend_scores[
+            friend_scores["list_id"].astype(int).isin([int(x) for x in similar_friends])
+        ]
+        for _, row in selected_scores.iterrows():
+            lid = int(row["list_id"])
+            username = list_to_user.get(lid, str(lid))
+            overlap_c = int(row["overlap_count"])
+            print(f"    {username} - {lid} ({overlap_c} books)")
 
     # 6. Build adjacency matrix and propagate
-    print("Running graph GCN propagation...")
+    print("  Running graph GCN propagation...")
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
     # Precompute mrl_dimensions based on the embedded subset only
@@ -870,7 +884,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     solo_train_size = (~embedded_books_df["my_refined"].isna()).sum()
     if train_size < 2 or solo_train_size < 2:
         print(
-            "Not enough rated books with valid embeddings to train ranking models "
+            "  Not enough rated books with valid embeddings to train ranking models "
             f"(training={train_size}, personal={solo_train_size})."
         )
         conn.close()
@@ -899,7 +913,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
 
     # 7. Model hyperparameter optimization
     if optimize:
-        print("Tuning hyperparameters via Nevergrad (budget=200)...")
+        print("  Tuning hyperparameters via Nevergrad (budget=200)...")
         friend_params = prep_optimization(
             embedded_books_df,
             precomputed_embeddings,
@@ -921,7 +935,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         db.save_model_params(conn, "friend_params", friend_params)
         db.save_model_params(conn, "solo_params", solo_params)
     else:
-        print("Using stored/default hyperparameters...")
+        print("  Using stored/default hyperparameters...")
         friend_params = get_or_create_model_params(
             conn, "friend_params", DEFAULT_FRIEND_PARAMS
         )
@@ -930,7 +944,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         )
 
     # 8. Run regression ensemble — trained and predicted on embedded_books_df only
-    print("Running ensemble models...")
+    print("  Running ensemble models...")
     friend_final_pred_embedded = run_optimized(
         friend_params, embedded_books_df, precomputed_embeddings, "training_ratings"
     )
@@ -946,7 +960,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     solo_final_pred[embedded_positions] = solo_final_pred_embedded
 
     # 9. Compute combined ratings
-    print("Formulating final recommendations...")
+    print("  Formulating final recommendations...")
     star_cols = ["star_1", "star_2", "star_3", "star_4", "star_5"]
     books_df["rating_count"] = books_df[star_cols].sum(axis=1)
 
@@ -987,7 +1001,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     books_df["final_rating"] = count_adjusted_scaled * friend_pred * solo_pred
 
     # 10. Save results back to DB predictions table
-    print("Saving predictions to database...")
+    print("  Saving predictions to database...")
     now_str = datetime.now().isoformat()
     predictions_data = []
 
@@ -1027,9 +1041,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         ],
     )
 
-    print(
-        f"Successfully computed and saved predictions for {len(predictions_data)} books."
-    )
+    print(f"  Saved predictions for {len(predictions_data)} books.")
     conn.close()
 
 
