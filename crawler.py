@@ -87,17 +87,6 @@ def is_stale_scrape(value, now=None):
     return scraped_at < (now or datetime.now()) - timedelta(days=30)
 
 
-def embedding_components_changed(old_row, new_data):
-    if not old_row:
-        return True
-    for field in ("title", "authors", "genres", "description"):
-        old_value = old_row[field] or ""
-        new_value = new_data.get(field) or ""
-        if str(old_value) != str(new_value):
-            return True
-    return False
-
-
 def prep_crawl_heapq(scoring_func, limit=None, force_recrawl=False, db_path=None):
     conn = db.get_connection(db_path)
 
@@ -494,7 +483,6 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
         "author_num_books",
         "currently_reading",
         "date_last_scraped",
-        "verified_embedding",
     ]
 
     bad_book_ids = set()
@@ -584,21 +572,8 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
                             total_processed += 1
                             book_data = task.result()
                             if book_data:
-                                old_row = db_conn.execute(
-                                    """
-                                    SELECT title, authors, genres, description
-                                    FROM books
-                                    WHERE book_id = ?
-                                    """,
-                                    (book_data["book_id"],),
-                                ).fetchone()
                                 book_data["date_last_scraped"] = (
                                     datetime.now().isoformat()
-                                )
-                                book_data["verified_embedding"] = (
-                                    0
-                                    if embedding_components_changed(old_row, book_data)
-                                    else 1
                                 )
                                 row_tuple = tuple(
                                     book_data.get(field) for field in field_names

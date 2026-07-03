@@ -74,20 +74,29 @@ def build_embedding_inputs(conn):
     return inputs
 
 
-def find_books_needing_embeddings(conn, all_inputs):
+def find_books_needing_embeddings(conn, all_inputs, model):
     if not all_inputs:
         return []
+
+    import hashlib
+
+    # Precompute current hashes for all inputs
+    input_hashes = {
+        book_id: hashlib.md5(text.encode("utf-8")).hexdigest()
+        for book_id, text in all_inputs.items()
+    }
 
     cursor = conn.execute(
         """
         SELECT b.book_id,
-               COALESCE(b.verified_embedding, 0) AS verified_embedding,
                e.dim,
-               e.vector
+               e.vector,
+               e.text_hash
         FROM books b
-        LEFT JOIN embeddings e ON e.book_id = b.book_id
+        LEFT JOIN embeddings e ON e.book_id = b.book_id AND e.embedding_model = ?
         ORDER BY b.book_id
-        """
+        """,
+        (model,),
     )
 
     queued = []
@@ -108,7 +117,10 @@ def find_books_needing_embeddings(conn, all_inputs):
         elif dim != expected_dim:
             queued.append(book_id)
             continue
-        if int(row["verified_embedding"] or 0) == 0:
+
+        # Validate hash
+        current_hash = input_hashes.get(book_id, "")
+        if not current_hash or row["text_hash"] != current_hash:
             queued.append(book_id)
 
     return queued
@@ -121,6 +133,9 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
 
     conn = db.get_connection(db_path)
 
+    if not model:
+        model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
+
     # Get all book IDs and input strings
     all_inputs = build_embedding_inputs(conn)
     if not all_inputs:
@@ -128,15 +143,16 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
         conn.close()
         return
 
-    missing_ids = find_books_needing_embeddings(conn, all_inputs)
+    missing_ids = find_books_needing_embeddings(conn, all_inputs, model)
 
     if not missing_ids:
-        print("Nothing to embed: all scraped books have valid verified embeddings.")
+        print(
+            f"Nothing to embed: all scraped books have valid verified embeddings for model '{model}'."
+        )
         conn.close()
         return
 
-    if not model:
-        model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
+    import hashlib
 
     import ollama
 
@@ -153,12 +169,13 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
             embeddings_list = response["embeddings"]
 
             vectors = np.array(embeddings_list, dtype=np.float32)
-            db.save_embeddings(conn, batch_ids, vectors)
-            conn.executemany(
-                "UPDATE books SET verified_embedding = 1 WHERE book_id = ?",
-                [(int(book_id),) for book_id in batch_ids],
-            )
-            conn.commit()
+
+            # Compute hashes for the saved embeddings
+            batch_hashes = {
+                bid: hashlib.md5(all_inputs[bid].encode("utf-8")).hexdigest()
+                for bid in batch_ids
+            }
+            db.save_embeddings(conn, batch_ids, vectors, model, batch_hashes)
         except Exception as e:
             print(
                 f"\nError generating embeddings for batch starting with book_id {batch_ids[0]}: {e}"

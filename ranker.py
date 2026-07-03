@@ -70,16 +70,29 @@ def get_or_create_model_params(conn, name, defaults):
     return params
 
 
-def load_valid_embeddings_for_books(conn, books_df):
+def load_valid_embeddings_for_books(conn, books_df, model=None):
+    import hashlib
+    import os
+
+    import embedder
+
+    if not model:
+        model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
+
+    # Get formatted inputs and compute current hashes
+    all_inputs = embedder.build_embedding_inputs(conn)
+    input_hashes = {
+        book_id: hashlib.md5(text.encode("utf-8")).hexdigest()
+        for book_id, text in all_inputs.items()
+    }
+
     rows = conn.execute(
         """
-        SELECT b.book_id,
-               COALESCE(b.verified_embedding, 0) AS verified_embedding,
-               e.dim,
-               e.vector
-        FROM books b
-        LEFT JOIN embeddings e ON e.book_id = b.book_id
-        """
+        SELECT book_id, dim, vector, text_hash
+        FROM embeddings
+        WHERE embedding_model = ?
+        """,
+        (model,),
     ).fetchall()
     embedding_rows = {int(row["book_id"]): row for row in rows}
 
@@ -95,7 +108,8 @@ def load_valid_embeddings_for_books(conn, books_df):
     expected_dim = None
 
     for book_id in books_df["book_id"]:
-        row = embedding_rows.get(int(book_id))
+        bid = int(book_id)
+        row = embedding_rows.get(bid)
         if not row or row["vector"] is None:
             counts["missing"] += 1
             valid_mask.append(False)
@@ -114,7 +128,9 @@ def load_valid_embeddings_for_books(conn, books_df):
             valid_mask.append(False)
             continue
 
-        if int(row["verified_embedding"] or 0) == 0:
+        # Check hash
+        current_hash = input_hashes.get(bid, "")
+        if not current_hash or row["text_hash"] != current_hash:
             counts["unverified"] += 1
             valid_mask.append(False)
             continue
@@ -758,7 +774,7 @@ def run_optimized(best_params, books_df, precomputed_embeddings, training_col):
     return final_pred
 
 
-def run_ranking(interactive=False, optimize=False, db_path=None):
+def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     db.init_db(db_path)
     conn = db.get_connection(db_path)
     conn.execute("DELETE FROM predictions")
@@ -804,7 +820,7 @@ def run_ranking(interactive=False, optimize=False, db_path=None):
     # 4. Load only valid, verified embeddings.
     print("Loading valid embeddings...")
     has_embedding, embedded_embeddings, invalid_counts = (
-        load_valid_embeddings_for_books(conn, books_df)
+        load_valid_embeddings_for_books(conn, books_df, model=model)
     )
     excluded_count = int((~has_embedding).sum())
     if excluded_count:
@@ -1031,6 +1047,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Tune model hyperparameters using Nevergrad",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Ollama embedding model name to use for ranking",
+    )
     args = parser.parse_args()
 
-    run_ranking(interactive=args.interactive, optimize=args.optimize)
+    run_ranking(interactive=args.interactive, optimize=args.optimize, model=args.model)

@@ -104,7 +104,7 @@ class GoodreadsRankerCLI:
         db.init_db()
         embedder.generate_embeddings(batch_size=int(batch_size), model=model)
 
-    def rank(self, interactive=False, optimize=False):
+    def rank(self, interactive=False, optimize=False, model=None):
         """
         Run ELO ratings refinement and ML recommendation model.
 
@@ -114,20 +114,25 @@ class GoodreadsRankerCLI:
             Launch terminal interface for ELO pairwise ranking.
         optimize : bool
             Tune model hyperparameters using Nevergrad.
+        model : str, optional
+            Ollama embedding model name to load embeddings for.
         """
         import ranker
 
         db.init_db()
-        ranker.run_ranking(interactive=as_bool(interactive), optimize=as_bool(optimize))
+        ranker.run_ranking(
+            interactive=as_bool(interactive), optimize=as_bool(optimize), model=model
+        )
 
     def run_pipeline(
         self,
         seed=True,
         seed_user=True,
         seed_friends=True,
-        crawl_limit=None,
+        limit=None,
         force_recrawl=False,
         optimize=False,
+        model=None,
     ):
         """
         Run the entire seeding, crawling, embedding, and ranking pipeline end-to-end.
@@ -140,13 +145,15 @@ class GoodreadsRankerCLI:
             Download/import the user's Goodreads library when seeding.
         seed_friends : bool
             Scrape friend ratings when seeding.
-        crawl_limit : int, optional
+        limit : int, optional
             None crawls missing seeds only. Positive values crawl up to N books
             seed-first. Zero or negative crawls indefinitely, including expansion.
         force_recrawl : bool
             Recrawl rows last scraped more than one month ago.
         optimize : bool
             Run Nevergrad optimization and persist best model params.
+        model : str, optional
+            Ollama embedding model name to use for embedding and ranking.
         """
         db.init_db()
         seed = as_bool(seed)
@@ -154,7 +161,7 @@ class GoodreadsRankerCLI:
         seed_friends = as_bool(seed_friends)
         force_recrawl = as_bool(force_recrawl)
         optimize = as_bool(optimize)
-        crawl_limit = parse_optional_int(crawl_limit)
+        limit = parse_optional_int(limit)
 
         if seed:
             print("STEP 1: Seeding database")
@@ -166,21 +173,33 @@ class GoodreadsRankerCLI:
             print("STEP 1: Seeding skipped")
 
         print("\nSTEP 2: Crawling book details")
-        self.crawl(limit=crawl_limit, force_recrawl=force_recrawl)
+        self.crawl(limit=limit, force_recrawl=force_recrawl)
 
         print("\nSTEP 3: Generating embeddings")
-        self.embed()
+        self.embed(model=model)
 
         print("\nSTEP 4: Running models and predictions")
-        self.rank(interactive=False, optimize=optimize)
+        self.rank(interactive=False, optimize=optimize, model=model)
 
         print("\nSTEP 5: Verifying pipeline state")
         self.verify()
 
         print("\nPipeline run finished successfully!")
 
-    def verify(self):
-        """Report pipeline state without scraping, embedding, crawling, or ranking."""
+    def verify(self, model=None):
+        """Report pipeline state without scraping, embedding, crawling, or ranking.
+
+        Parameters:
+        -----------
+        model : str, optional
+            Ollama embedding model name to verify embeddings for.
+        """
+        import hashlib
+        import os
+
+        if not model:
+            model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
+
         path = db.DB_PATH
         if not path.exists():
             print(f"Database not found at {path}.")
@@ -265,32 +284,63 @@ class GoodreadsRankerCLI:
                 )
             seed_missing = len(seed_ids - scraped_ids)
 
+            # Embedding health checks — all scoped to the selected model
             scraped_missing_embeddings = 0
             invalid_embeddings = 0
-            unverified_books = 0
+            outdated_embeddings = 0
             if {"books", "embeddings"}.issubset(tables):
-                scraped_missing_embeddings = conn.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM books b
-                    LEFT JOIN embeddings e ON e.book_id = b.book_id
-                    WHERE e.book_id IS NULL
-                    """
-                ).fetchone()[0]
-                for row in conn.execute("SELECT dim, vector FROM embeddings"):
-                    if not db.is_valid_embedding_blob(row["vector"], row["dim"]):
-                        invalid_embeddings += 1
-            if "books" in tables:
-                if "verified_embedding" in table_columns("books"):
-                    unverified_books = conn.execute(
+                emb_columns = table_columns("embeddings")
+                if "embedding_model" in emb_columns:
+                    # Books with no embedding row for this model
+                    scraped_missing_embeddings = conn.execute(
                         """
                         SELECT COUNT(*)
-                        FROM books
-                        WHERE COALESCE(verified_embedding, 0) = 0
+                        FROM books b
+                        LEFT JOIN embeddings e
+                            ON e.book_id = b.book_id AND e.embedding_model = ?
+                        WHERE e.book_id IS NULL
+                        """,
+                        (model,),
+                    ).fetchone()[0]
+                    # Invalid blob embeddings for this model
+                    for row in conn.execute(
+                        "SELECT dim, vector FROM embeddings WHERE embedding_model = ?",
+                        (model,),
+                    ):
+                        if not db.is_valid_embedding_blob(row["vector"], row["dim"]):
+                            invalid_embeddings += 1
+                    # Outdated: hash mismatch against current book metadata
+                    if "text_hash" in emb_columns:
+                        import embedder
+
+                        # Compute current hashes for all books
+                        rw_conn = db.get_connection()
+                        all_inputs = embedder.build_embedding_inputs(rw_conn)
+                        rw_conn.close()
+                        current_hashes = {
+                            bid: hashlib.md5(text.encode("utf-8")).hexdigest()
+                            for bid, text in all_inputs.items()
+                        }
+                        for row in conn.execute(
+                            "SELECT book_id, text_hash FROM embeddings WHERE embedding_model = ?",
+                            (model,),
+                        ):
+                            bid = int(row["book_id"])
+                            if current_hashes.get(bid) != row["text_hash"]:
+                                outdated_embeddings += 1
+                else:
+                    # Legacy schema — count all books missing any embedding row
+                    scraped_missing_embeddings = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM books b
+                        LEFT JOIN embeddings e ON e.book_id = b.book_id
+                        WHERE e.book_id IS NULL
                         """
                     ).fetchone()[0]
-                else:
-                    unverified_books = table_count("books")
+                    for row in conn.execute("SELECT dim, vector FROM embeddings"):
+                        if not db.is_valid_embedding_blob(row["vector"], row["dim"]):
+                            invalid_embeddings += 1
 
             prediction_count = table_count("predictions")
             null_prediction_fields = 0
@@ -319,13 +369,13 @@ class GoodreadsRankerCLI:
                 else:
                     unread_scored = prediction_count
 
-            print("State checks:")
+            print(f"State checks (embedding model: '{model}'):")
             print(f"  friend_lists incomplete: {incomplete_friends}")
             print(f"  friend_lists with scrape_error: {friend_errors}")
             print(f"  seed books missing from books: {seed_missing}")
             print(f"  scraped books missing embeddings: {scraped_missing_embeddings}")
             print(f"  invalid embeddings: {invalid_embeddings}")
-            print(f"  books with verified_embedding = 0: {unverified_books}")
+            print(f"  outdated embeddings (hash mismatch): {outdated_embeddings}")
             print(f"  prediction rows: {prediction_count}")
             print(f"  null prediction-field rows: {null_prediction_fields}")
             print(f"  unread scored count: {unread_scored}")

@@ -82,8 +82,7 @@ CREATE TABLE IF NOT EXISTS books (
     want_to_read      INTEGER DEFAULT 0,
     author_num_books  INTEGER DEFAULT 0,
     currently_reading INTEGER DEFAULT 0,
-    date_last_scraped TEXT,
-    verified_embedding INTEGER DEFAULT 0
+    date_last_scraped TEXT
 );
 
 CREATE TABLE IF NOT EXISTS elo_ratings (
@@ -94,9 +93,12 @@ CREATE TABLE IF NOT EXISTS elo_ratings (
 );
 
 CREATE TABLE IF NOT EXISTS embeddings (
-    book_id   INTEGER PRIMARY KEY,
-    dim       INTEGER NOT NULL,
-    vector    BLOB NOT NULL
+    book_id           INTEGER,
+    embedding_model   TEXT,
+    dim               INTEGER NOT NULL,
+    vector            BLOB NOT NULL,
+    text_hash         TEXT NOT NULL,
+    PRIMARY KEY (book_id, embedding_model)
 );
 
 CREATE TABLE IF NOT EXISTS predictions (
@@ -132,8 +134,8 @@ def get_connection(db_path=None):
 def init_db(db_path=None):
     """Create all tables if they don't exist."""
     conn = get_connection(db_path)
-    conn.executescript(SCHEMA)
     ensure_schema_compat(conn)
+    conn.executescript(SCHEMA)
     conn.commit()
     conn.close()
 
@@ -149,11 +151,15 @@ def ensure_schema_compat(conn):
 
     if "books" in existing:
         ensure_column(conn, "books", "date_last_scraped", "TEXT")
-        ensure_column(conn, "books", "verified_embedding", "INTEGER DEFAULT 0")
     if "friend_lists" in existing:
         ensure_column(conn, "friend_lists", "username", "TEXT")
         ensure_column(conn, "friend_lists", "href", "TEXT")
         ensure_column(conn, "friend_lists", "scrape_error", "TEXT")
+    if "embeddings" in existing:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(embeddings)")}
+        if "embedding_model" not in columns:
+            print("Recreating empty embeddings table for new schema...")
+            conn.execute("DROP TABLE embeddings")
 
 
 def ensure_column(conn, table, column, definition):
@@ -208,7 +214,7 @@ def load_model_params(conn, name):
         return None
 
 
-def save_embeddings(conn, book_ids, vectors):
+def save_embeddings(conn, book_ids, vectors, model, text_hashes):
     """
     Bulk-insert embeddings into the embeddings table.
 
@@ -217,19 +223,31 @@ def save_embeddings(conn, book_ids, vectors):
     conn : sqlite3.Connection
     book_ids : array-like of int
     vectors : np.ndarray of shape (n, dim), dtype float32
+    model : str
+    text_hashes : dict or list of str
     """
     dim = vectors.shape[1]
-    rows = [
-        (int(bid), dim, vector_to_blob(vectors[i])) for i, bid in enumerate(book_ids)
-    ]
+    rows = []
+    for i, bid in enumerate(book_ids):
+        bid_int = int(bid)
+        h = (
+            text_hashes.get(bid_int)
+            if isinstance(text_hashes, dict)
+            else text_hashes[i]
+        )
+        rows.append((bid_int, model, dim, vector_to_blob(vectors[i]), h))
+
     conn.executemany(
-        "INSERT OR REPLACE INTO embeddings (book_id, dim, vector) VALUES (?, ?, ?)",
+        """
+        INSERT OR REPLACE INTO embeddings (book_id, embedding_model, dim, vector, text_hash)
+        VALUES (?, ?, ?, ?, ?)
+        """,
         rows,
     )
     conn.commit()
 
 
-def load_embeddings(conn, book_ids=None):
+def load_embeddings(conn, book_ids=None, model=None):
     """
     Load embeddings into a pre-allocated numpy array.
 
@@ -238,20 +256,30 @@ def load_embeddings(conn, book_ids=None):
     conn : sqlite3.Connection
     book_ids : list[int] or None
         If None, load all embeddings.
+    model : str or None
+        The embedding model name. If None, uses default.
 
     Returns
     -------
     loaded_ids : np.ndarray of int
     matrix : np.ndarray of shape (n, dim), dtype float32
     """
+    import os
+
+    if not model:
+        model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
+
     if book_ids is not None:
         placeholders = ",".join("?" for _ in book_ids)
         cursor = conn.execute(
-            f"SELECT book_id, dim, vector FROM embeddings WHERE book_id IN ({placeholders})",
-            list(book_ids),
+            f"SELECT book_id, dim, vector FROM embeddings WHERE embedding_model = ? AND book_id IN ({placeholders})",
+            [model] + list(book_ids),
         )
     else:
-        cursor = conn.execute("SELECT book_id, dim, vector FROM embeddings")
+        cursor = conn.execute(
+            "SELECT book_id, dim, vector FROM embeddings WHERE embedding_model = ?",
+            (model,),
+        )
 
     rows = cursor.fetchall()
     if not rows:
@@ -266,7 +294,7 @@ def load_embeddings(conn, book_ids=None):
     return loaded_ids, matrix
 
 
-def load_embeddings_for_books(conn, ordered_book_ids):
+def load_embeddings_for_books(conn, ordered_book_ids, model=None):
     """
     Load embeddings aligned to a specific ordered list of book IDs.
 
@@ -277,13 +305,14 @@ def load_embeddings_for_books(conn, ordered_book_ids):
     ----------
     conn : sqlite3.Connection
     ordered_book_ids : array-like of int
+    model : str or None
 
     Returns
     -------
     matrix : np.ndarray of shape (len(ordered_book_ids), dim)
     missing_ids : list[int]
     """
-    loaded_ids, loaded_matrix = load_embeddings(conn)
+    loaded_ids, loaded_matrix = load_embeddings(conn, model=model)
     if loaded_matrix.size == 0:
         return np.empty((len(ordered_book_ids), 0), dtype=np.float32), list(
             ordered_book_ids
