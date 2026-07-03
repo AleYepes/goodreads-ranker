@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 from tqdm.asyncio import tqdm
 
-import db
+from . import db
 
 PAYLOAD_WAIT_ATTEMPTS = 20
 PAGE_TIMEOUT_MS = 20000
@@ -187,7 +187,7 @@ async def fetch_book(page, book_id, bad_book_ids):
             "avg_rating": agg_rating.get("ratingValue"),
             "review_count": agg_rating.get("reviewCount"),
             "num_pages": ld.get("numberOfPages"),
-            "lang": langs,
+            "style": langs,
         }
 
     async def extract_dom_data(page, book_data):

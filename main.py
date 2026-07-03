@@ -4,7 +4,7 @@ import sqlite3
 
 import fire
 
-import db
+from goodreads_ranker import db
 
 
 def as_bool(value):
@@ -41,7 +41,7 @@ class GoodreadsRankerCLI:
         """
         from dotenv import load_dotenv
 
-        import seeder
+        from goodreads_ranker import seeder
 
         load_dotenv()
         db.init_db()
@@ -78,7 +78,7 @@ class GoodreadsRankerCLI:
         force_recrawl : bool
             Recrawl rows last scraped more than one month ago.
         """
-        import crawler
+        from goodreads_ranker import crawler
 
         db.init_db()
         limit = parse_optional_int(limit)
@@ -101,7 +101,7 @@ class GoodreadsRankerCLI:
         model : str, optional
             Ollama embedding model name.
         """
-        import embedder
+        from goodreads_ranker import embedder
 
         db.init_db()
         embedder.generate_embeddings(batch_size=int(batch_size), model=model)
@@ -119,7 +119,7 @@ class GoodreadsRankerCLI:
         model : str, optional
             Ollama embedding model name to load embeddings for.
         """
-        import ranker
+        from goodreads_ranker import ranker
 
         db.init_db()
         ranker.run_ranking(
@@ -314,7 +314,7 @@ class GoodreadsRankerCLI:
                             invalid_embeddings += 1
                     # Outdated: hash mismatch against current book metadata
                     if "text_hash" in emb_columns:
-                        import embedder
+                        from goodreads_ranker import embedder
 
                         # Compute current hashes for all books
                         rw_conn = db.get_connection()
@@ -386,5 +386,9 @@ class GoodreadsRankerCLI:
             conn.close()
 
 
-if __name__ == "__main__":
+def main():
     fire.Fire(GoodreadsRankerCLI)
+
+
+if __name__ == "__main__":
+    main()

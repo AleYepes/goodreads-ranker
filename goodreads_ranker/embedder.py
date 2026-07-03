@@ -9,7 +9,7 @@ import numpy as np
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-import db
+from . import db
 
 
 @contextlib.contextmanager

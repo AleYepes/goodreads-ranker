@@ -37,6 +37,7 @@ exclude = [
     "data",
     "docs",
     ".agents",
+    "venv",
 ]
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false

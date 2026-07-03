@@ -16,7 +16,7 @@ from sklearn.svm import SVR
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
 from torch_geometric.utils import add_self_loops
 
-import db
+from . import db
 
 DEFAULT_FRIEND_PARAMS = {
     "num_propagations": 0,
@@ -74,7 +74,7 @@ def load_valid_embeddings_for_books(conn, books_df, model=None):
     import hashlib
     import os
 
-    import embedder
+    from . import embedder
 
     if not model:
         model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
