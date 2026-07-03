@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS user_library (
 
 CREATE TABLE IF NOT EXISTS friend_lists (
     list_id            INTEGER PRIMARY KEY,
+    username           TEXT,
+    href               TEXT,
     scrape_complete    INTEGER DEFAULT 0,
     date_last_scraped  TEXT,
     scrape_error       TEXT
@@ -51,9 +53,7 @@ CREATE TABLE IF NOT EXISTS friend_lists (
 CREATE TABLE IF NOT EXISTS friend_ratings (
     list_id    INTEGER NOT NULL,
     book_id    INTEGER NOT NULL,
-    title      TEXT,
     rating     INTEGER,
-    num_pages  INTEGER,
     date_read  TEXT,
     date_added TEXT,
     PRIMARY KEY (list_id, book_id)
@@ -151,6 +151,8 @@ def ensure_schema_compat(conn):
         ensure_column(conn, "books", "date_last_scraped", "TEXT")
         ensure_column(conn, "books", "verified_embedding", "INTEGER DEFAULT 0")
     if "friend_lists" in existing:
+        ensure_column(conn, "friend_lists", "username", "TEXT")
+        ensure_column(conn, "friend_lists", "href", "TEXT")
         ensure_column(conn, "friend_lists", "scrape_error", "TEXT")
 
 

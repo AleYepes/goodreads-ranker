@@ -158,8 +158,6 @@ async def ensure_list_page(page, target_url, email, password):
 
 async def extract_friend_row(row, list_id):
     title_el = await row.query_selector(".field.title a")
-    title = clean_text(await title_el.inner_text()) if title_el else "Unknown"
-
     href = await title_el.get_attribute("href") if title_el else ""
     book_id_match = re.search(r"/book/show/(\d+)", href)
     book_id = int(book_id_match.group(1)) if book_id_match else None
@@ -169,11 +167,6 @@ async def extract_friend_row(row, list_id):
     rating_el = await row.query_selector(".field.rating .staticStars")
     rating_text = await rating_el.get_attribute("title") if rating_el else ""
     rating = RATING_MAP.get(rating_text, 0)
-
-    pages_el = await row.query_selector(".field.num_pages .value")
-    raw_pages = await pages_el.text_content() if pages_el else ""
-    num_pages_raw = re.sub(r"[^\d]", "", raw_pages)
-    num_pages = int(num_pages_raw) if num_pages_raw else None
 
     date_read_el = await row.query_selector(".field.date_read .date_read_value")
     date_read = clean_text(await date_read_el.inner_text()) if date_read_el else ""
@@ -188,9 +181,7 @@ async def extract_friend_row(row, list_id):
     return {
         "list_id": int(list_id),
         "book_id": book_id,
-        "title": title,
         "rating": rating,
-        "num_pages": num_pages,
         "date_read": date_read,
         "date_added": date_added,
     }
@@ -351,13 +342,18 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
     conn.commit()
 
     if force_all:
-        cursor = conn.execute("SELECT list_id FROM friend_lists")
+        cursor = conn.execute("SELECT list_id, 0 as metadata_only FROM friend_lists")
     else:
         cursor = conn.execute(
-            "SELECT list_id FROM friend_lists WHERE scrape_complete != 1"
+            """
+            SELECT list_id,
+                   (scrape_complete = 1 AND (username IS NULL OR href IS NULL)) as metadata_only
+            FROM friend_lists
+            WHERE scrape_complete != 1 OR username IS NULL OR href IS NULL
+            """
         )
 
-    to_scrape = [row["list_id"] for row in cursor.fetchall()]
+    to_scrape = [(row["list_id"], bool(row["metadata_only"])) for row in cursor.fetchall()]
     conn.close()
 
     if not to_scrape:
@@ -366,12 +362,28 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
 
     print(f"Preparing to scrape {len(to_scrape)} friend lists...")
 
+    def update_friend_info(list_id, username, href):
+        db_conn = db.get_connection(db_path)
+        try:
+            db_conn.execute(
+                """
+                UPDATE friend_lists
+                SET username = ?,
+                    href = ?
+                WHERE list_id = ?
+                """,
+                (username, href, list_id),
+            )
+            db_conn.commit()
+        finally:
+            db_conn.close()
+
     def load_existing_rows(list_id):
         db_conn = db.get_connection(db_path)
         try:
             rows = db_conn.execute(
                 """
-                SELECT list_id, book_id, title, rating, num_pages, date_read, date_added
+                SELECT list_id, book_id, rating, date_read, date_added
                 FROM friend_ratings
                 WHERE list_id = ?
                 """,
@@ -381,9 +393,7 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
                 (int(row["list_id"]), int(row["book_id"])): {
                     "list_id": int(row["list_id"]),
                     "book_id": int(row["book_id"]),
-                    "title": row["title"] or "",
                     "rating": int(row["rating"] or 0),
-                    "num_pages": row["num_pages"],
                     "date_read": row["date_read"] or "",
                     "date_added": row["date_added"] or "",
                 }
@@ -438,9 +448,7 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
                     (
                         row["list_id"],
                         row["book_id"],
-                        row["title"],
                         row["rating"],
-                        row["num_pages"],
                         row["date_read"],
                         row["date_added"],
                     )
@@ -449,9 +457,7 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
                 [
                     "list_id",
                     "book_id",
-                    "title",
                     "rating",
-                    "num_pages",
                     "date_read",
                     "date_added",
                 ],
@@ -459,14 +465,42 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
         finally:
             db_conn.close()
 
-    async def process_list(page, list_id):
-        print(f"Scraping list {list_id}...")
+    async def process_list(page, list_id, metadata_only=False):
+        print(f"Scraping list {list_id} (metadata_only={metadata_only})...")
         page_num = 1
         total_rows = 0
         valid_page_parsed = False
-        existing_rows = load_existing_rows(list_id)
         target_url = await open_list_page(page, list_id, email, password)
 
+        await ensure_list_page(page, target_url, email, password)
+        try:
+            await page.wait_for_selector("h1", timeout=10000)
+        except PlaywrightTimeoutError:
+            pass
+
+        # Extract username and user profile URL on the first page
+        h1_el = await page.query_selector("h1")
+        username = None
+        href = None
+        if h1_el:
+            links = await h1_el.query_selector_all("a")
+            for link in links:
+                link_href = await link.get_attribute("href")
+                if link_href and "/user/show/" in link_href:
+                    if not href:
+                        href = link_href
+                    text = clean_text(await link.inner_text())
+                    if text:
+                        username = text
+        if username or href:
+            update_friend_info(list_id, username, href)
+            print(f"    Updated metadata: {username} ({href})")
+
+        if metadata_only:
+            print(f"Finished metadata-only scrape for {list_id}")
+            return
+
+        existing_rows = load_existing_rows(list_id)
         while True:
             await ensure_list_page(page, target_url, email, password)
             await page.wait_for_selector("#booksBody", timeout=10000)
@@ -526,9 +560,9 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
         browser = await p.chromium.launch(headless=False)
         context = await browser.new_context(user_agent=USER_AGENT)
         page = await context.new_page()
-        for list_id in to_scrape:
+        for list_id, metadata_only in to_scrape:
             try:
-                await process_list(page, list_id)
+                await process_list(page, list_id, metadata_only=metadata_only)
             except Exception as e:
                 print(f"Failed list {list_id}: {e}")
                 mark_list_failed(list_id, e)
