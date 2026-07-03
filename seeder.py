@@ -21,54 +21,54 @@ SIGNIN_URL = "https://www.goodreads.com/ap/signin?language=en_US&openid.assoc_ha
 
 
 DEFAULT_FRIEND_LIST_IDS = [
-    104343033, #104343033-santiago-lecumberri **
-    104945614, #104945614-aadil-kumar
-    105258888, #105258888-zach-saylor
-    11116469, #11116469-sebastian-gebski
-    113185438, #113185438-taiyr
-    115764833, #115764833-austin-george
-    118560285, #118560285-bichons-and-books-nz
-    124720847, #124720847-abrish
-    129155685, #129155685-ignacio-mu-oz-lanza **
-    13448447, #13448447-lyda
-    13647498, #13647498.Oana_David
-    13737030, #13737030-maddy 
-    156484926, #156484926-victoria
-    160516894, #160516894-janine
-    166997642, #166997642-carson-cummins
-    1713956, #1834894.Manny_Rayner ## Different list for some reason
-    174792571, #174792571-annie
-    18922126, #18922126-ella-park
-    18913667, #18913667.Edward_Vass
-    21397146, #21397146-stefy
-    22482559, #22482559-mathi-fonseca
-    22726983, #22726983-gast-n-mousqu-s
-    23161382, #23161382-vanesa
-    24885719, #24885719-fran-oise
-    267189, #267189-todd-n
-    26052616, #26052616-margherita
-    27115955, #27115955-catherine-wood
-    22978411, #22978411-cristina
-    31565140, #31565140-irina-toledo
-    33074940, #33074940-anca-e-milea
-    34518408, #34518408-dawood
-    40426330, #40426330-sabrina-li
-    41797321, #41797321-cristina-cojocaru
-    41944053, #8136076.Cosmin_Leucu_a ## Different list for some reason
-    42001957, #42001957-matty-van-hoof
-    43400637, #43400637-fay-pretty
-    46459461, #46459461-an-fech
-    51281420, #51281420-daniela-g-mez
-    54115664, #54115664-mandy
-    5868084, #5868084-mairi
-    65139494, #65139494-daniel-castro
-    70012245, #70012245-till-chen
-    7043947, #7043947-andra-enache
-    75706676, #75706676-steve-abreu
-    76860332, #76860332-cecilia
-    90649237, #90649237-sara
-    91998392, #91998392-daniel-prelipcean
-    ]
+    104343033,  # 104343033-santiago-lecumberri **
+    104945614,  # 104945614-aadil-kumar
+    105258888,  # 105258888-zach-saylor
+    11116469,  # 11116469-sebastian-gebski
+    113185438,  # 113185438-taiyr
+    115764833,  # 115764833-austin-george
+    118560285,  # 118560285-bichons-and-books-nz
+    124720847,  # 124720847-abrish
+    129155685,  # 129155685-ignacio-mu-oz-lanza **
+    13448447,  # 13448447-lyda
+    13647498,  # 13647498.Oana_David
+    13737030,  # 13737030-maddy
+    156484926,  # 156484926-victoria
+    160516894,  # 160516894-janine
+    166997642,  # 166997642-carson-cummins
+    1713956,  # 1834894.Manny_Rayner ## Different list for some reason
+    174792571,  # 174792571-annie
+    18922126,  # 18922126-ella-park
+    18913667,  # 18913667.Edward_Vass
+    21397146,  # 21397146-stefy
+    22482559,  # 22482559-mathi-fonseca
+    22726983,  # 22726983-gast-n-mousqu-s
+    23161382,  # 23161382-vanesa
+    24885719,  # 24885719-fran-oise
+    267189,  # 267189-todd-n
+    26052616,  # 26052616-margherita
+    27115955,  # 27115955-catherine-wood
+    22978411,  # 22978411-cristina
+    31565140,  # 31565140-irina-toledo
+    33074940,  # 33074940-anca-e-milea
+    34518408,  # 34518408-dawood
+    40426330,  # 40426330-sabrina-li
+    41797321,  # 41797321-cristina-cojocaru
+    41944053,  # 8136076.Cosmin_Leucu_a ## Different list for some reason
+    42001957,  # 42001957-matty-van-hoof
+    43400637,  # 43400637-fay-pretty
+    46459461,  # 46459461-an-fech
+    51281420,  # 51281420-daniela-g-mez
+    54115664,  # 54115664-mandy
+    5868084,  # 5868084-mairi
+    65139494,  # 65139494-daniel-castro
+    70012245,  # 70012245-till-chen
+    7043947,  # 7043947-andra-enache
+    75706676,  # 75706676-steve-abreu
+    76860332,  # 76860332-cecilia
+    90649237,  # 90649237-sara
+    91998392,  # 91998392-daniel-prelipcean
+]
 
 RATING_MAP = {
     "it was amazing": 5,
@@ -222,7 +222,6 @@ async def download_user_library(email, password, db_path=None, force=False):
         )
         page = await context.new_page()
 
-        # Log in
         await page.goto(SIGNIN_URL)
         await page.fill('input[type="email"]', email)
         await page.fill('input[type="password"]', password)
@@ -251,7 +250,6 @@ async def download_user_library(email, password, db_path=None, force=False):
                 break
             await page.wait_for_timeout(500)
 
-        # Export library
         async with page.expect_download() as download_info:
             list_link = prepped_export_list.locator("a").first
             await list_link.click()
@@ -271,7 +269,6 @@ async def download_user_library(email, password, db_path=None, force=False):
     if "isbn13" in df.columns:
         df["isbn13"] = df["isbn13"].apply(clean_isbn)
 
-    # Convert NaN to None for SQL NULL compatibility
     df = df.replace({np.nan: None})
 
     columns = [
@@ -312,7 +309,6 @@ async def download_user_library(email, password, db_path=None, force=False):
         f"Successfully imported {len(rows)} books from your library into the 'user_library' table."
     )
 
-    # Clean up temp file
     try:
         os.remove(temp_csv_path)
         os.rmdir(temp_dir)
@@ -353,7 +349,9 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
             """
         )
 
-    to_scrape = [(row["list_id"], bool(row["metadata_only"])) for row in cursor.fetchall()]
+    to_scrape = [
+        (row["list_id"], bool(row["metadata_only"])) for row in cursor.fetchall()
+    ]
     conn.close()
 
     if not to_scrape:
@@ -473,12 +471,10 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
         target_url = await open_list_page(page, list_id, email, password)
 
         await ensure_list_page(page, target_url, email, password)
-        try:
-            await page.wait_for_selector("h1", timeout=10000)
-        except PlaywrightTimeoutError:
-            pass
 
-        # Extract username and user profile URL on the first page
+        with contextlib.suppress(PlaywrightTimeoutError):
+            await page.wait_for_selector("h1", timeout=10000)
+
         h1_el = await page.query_selector("h1")
         username = None
         href = None
