@@ -90,11 +90,9 @@ def is_stale_scrape(value, now=None):
 def prep_crawl_heapq(scoring_func, limit=None, force_recrawl=False, db_path=None):
     conn = db.get_connection(db_path)
 
-    # Read seeds from user_library
     cursor = conn.execute("SELECT book_id FROM user_library WHERE book_id IS NOT NULL")
     seed_ids = {int(row["book_id"]) for row in cursor.fetchall()}
 
-    # Read seeds from friend_ratings
     cursor = conn.execute(
         "SELECT book_id FROM friend_ratings WHERE book_id IS NOT NULL"
     )
@@ -102,7 +100,6 @@ def prep_crawl_heapq(scoring_func, limit=None, force_recrawl=False, db_path=None
 
     include_expansion = limit is not None
 
-    # Read already scraped book IDs and similar_books
     cursor = conn.execute(
         """
         SELECT book_id, similar_books, date_last_scraped
@@ -488,10 +485,32 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
     bad_book_ids = set()
     cycle = 0
     scoring_algo_names = list(SCORING_FUNCTIONS.keys())
-    total_processed = 0
     db_conn = db.get_connection(db_path)
+
+    # Determine crawl mode:
+    #   limit=None  → seeds only, no expansion
+    #   limit<=0    → run indefinitely with expansion
+    #   limit>0     → crawl until total scraped books reaches `limit`
     enforce_limit = limit is not None and limit > 0
-    include_expansion = limit is not None
+    include_expansion = limit is not None  # False only in seeds-only mode
+
+    if enforce_limit:
+        already_scraped = db_conn.execute(
+            "SELECT COUNT(*) FROM books WHERE date_last_scraped IS NOT NULL"
+        ).fetchone()[0]
+        if already_scraped >= limit:
+            print(
+                f"Already have {already_scraped} scraped books "
+                f"(>= limit of {limit}). Skipping crawler."
+            )
+            db_conn.close()
+            return
+        remaining_budget = limit - already_scraped
+    else:
+        already_scraped = 0
+        remaining_budget = None  # unlimited
+
+    total_processed = 0  # books crawled this session
 
     while True:
         current_algo_name = scoring_algo_names[cycle % len(scoring_algo_names)]
@@ -534,7 +553,7 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
                 while (
                     crawl_queue or active_tasks
                 ) and processed_in_cycle < RESTART_THRESHOLD:
-                    if enforce_limit and total_processed >= limit:
+                    if enforce_limit and total_processed >= remaining_budget:
                         break
 
                     while (
@@ -544,7 +563,7 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
                     ):
                         if (
                             enforce_limit
-                            and total_processed + len(active_tasks) >= limit
+                            and total_processed + len(active_tasks) >= remaining_budget
                         ):
                             break
 
@@ -630,8 +649,12 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
                 await browser.close()
                 await asyncio.sleep(1)
 
-        if enforce_limit and total_processed >= limit:
-            print(f"Reached crawl limit of {limit} books. Stopping.")
+        if enforce_limit and total_processed >= remaining_budget:
+            total_scraped_now = already_scraped + total_processed
+            print(
+                f"Reached crawl target: {total_scraped_now} total scraped books "
+                f"(target was {limit}). Stopping."
+            )
             break
 
         cycle += 1

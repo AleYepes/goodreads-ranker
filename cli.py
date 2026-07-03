@@ -70,7 +70,9 @@ class GoodreadsRankerCLI:
         Parameters:
         -----------
         limit : int, optional
-            Hard cap on number of books to crawl.
+            Target total number of scraped books. If the DB already has this
+            many scraped books, the crawler is skipped. None = seeds only
+            (no graph expansion). 0 or negative = run indefinitely with expansion.
         concurrency : int
             Number of concurrent Playwright pages.
         force_recrawl : bool
@@ -146,8 +148,9 @@ class GoodreadsRankerCLI:
         seed_friends : bool
             Scrape friend ratings when seeding.
         limit : int, optional
-            None crawls missing seeds only. Positive values crawl up to N books
-            seed-first. Zero or negative crawls indefinitely, including expansion.
+            Target total number of scraped books. If the DB already has this
+            many scraped books, the crawler is skipped. None = seeds only
+            (no graph expansion). 0 or negative = run indefinitely with expansion.
         force_recrawl : bool
             Recrawl rows last scraped more than one month ago.
         optimize : bool

@@ -1,12 +1,73 @@
 import argparse
+import contextlib
 import os
 import re
+import subprocess
+import time
 
 import numpy as np
 from dotenv import load_dotenv
 from tqdm import tqdm
 
 import db
+
+
+@contextlib.contextmanager
+def _ensure_ollama(model: str):
+    """Context manager that guarantees an Ollama server is running and the
+    requested model is available.  Starts ``ollama serve`` if needed, pulls
+    the model if it is absent, and cleans up only what it created."""
+    import ollama
+
+    server_started_here = False
+    proc = None
+
+    # 1. Check whether a server is already reachable.
+    try:
+        ollama.list()
+    except Exception:
+        print("Ollama server not detected — starting 'ollama serve'...")
+        proc = subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        server_started_here = True
+        # Wait until the server is ready (up to 30 s).
+        for _ in range(30):
+            time.sleep(1)
+            try:
+                ollama.list()
+                break
+            except Exception:
+                pass
+        else:
+            proc.terminate()
+            raise RuntimeError(
+                "Ollama server did not become ready in time. "
+                "Check that 'ollama' is on your PATH and is a valid installation."
+            )
+        print("Ollama server started.")
+
+    # 2. Pull the model only if it is not already present.
+    available = {m.model for m in ollama.list().models}
+
+    # Normalise: ollama may append ':latest' to untagged names.
+    def _normalise(name: str) -> str:
+        return name if ":" in name else f"{name}:latest"
+
+    if _normalise(model) not in {_normalise(m) for m in available}:
+        print(f"Model '{model}' not found locally — pulling (this may take a while)...")
+        ollama.pull(model)
+        print(f"Model '{model}' ready.")
+
+    try:
+        yield
+    finally:
+        if server_started_here and proc is not None:
+            print("Stopping Ollama server (started by this process)...")
+            proc.terminate()
+            proc.wait(timeout=10)
 
 
 def format_string_for_embedding(items, kind=None, truncate=0):
@@ -160,28 +221,29 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
         f"Generating embeddings for {len(missing_ids)} books using Ollama model '{model}'..."
     )
 
-    for i in tqdm(range(0, len(missing_ids), batch_size)):
-        batch_ids = missing_ids[i : i + batch_size]
-        batch_strings = [all_inputs[bid] for bid in batch_ids]
+    with _ensure_ollama(model):
+        for i in tqdm(range(0, len(missing_ids), batch_size)):
+            batch_ids = missing_ids[i : i + batch_size]
+            batch_strings = [all_inputs[bid] for bid in batch_ids]
 
-        try:
-            response = ollama.embed(model=model, input=batch_strings)
-            embeddings_list = response["embeddings"]
+            try:
+                response = ollama.embed(model=model, input=batch_strings)
+                embeddings_list = response["embeddings"]
 
-            vectors = np.array(embeddings_list, dtype=np.float32)
+                vectors = np.array(embeddings_list, dtype=np.float32)
 
-            # Compute hashes for the saved embeddings
-            batch_hashes = {
-                bid: hashlib.md5(all_inputs[bid].encode("utf-8")).hexdigest()
-                for bid in batch_ids
-            }
-            db.save_embeddings(conn, batch_ids, vectors, model, batch_hashes)
-        except Exception as e:
-            print(
-                f"\nError generating embeddings for batch starting with book_id {batch_ids[0]}: {e}"
-            )
-            # Continue with other batches
-            continue
+                # Compute hashes for the saved embeddings
+                batch_hashes = {
+                    bid: hashlib.md5(all_inputs[bid].encode("utf-8")).hexdigest()
+                    for bid in batch_ids
+                }
+                db.save_embeddings(conn, batch_ids, vectors, model, batch_hashes)
+            except Exception as e:
+                print(
+                    f"\nError generating embeddings for batch starting with book_id {batch_ids[0]}: {e}"
+                )
+                # Continue with other batches
+                continue
 
     print("Embedding generation process finished.")
     conn.close()
