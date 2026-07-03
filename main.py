@@ -24,21 +24,7 @@ def parse_optional_int(value):
 
 
 class GoodreadsRankerCLI:
-    """CLI orchestrator for the Goodreads Ranker pipeline."""
-
     def seed(self, user=None, friends=None, force=False):
-        """
-        Download user library and/or scrape friend list reviews.
-
-        Parameters:
-        -----------
-        user : bool
-            Download user library export.
-        friends : bool
-            Scrape friend review list ratings.
-        force : bool
-            Force re-downloading/re-scraping.
-        """
         from dotenv import load_dotenv
 
         from goodreads_ranker import seeder
@@ -64,20 +50,6 @@ class GoodreadsRankerCLI:
             asyncio.run(seeder.scrape_friend_ratings(force_all=force))
 
     def crawl(self, limit=None, concurrency=2, force_recrawl=False):
-        """
-        Run the Goodreads book detail crawler.
-
-        Parameters:
-        -----------
-        limit : int, optional
-            Target total number of scraped books. If the DB already has this
-            many scraped books, the crawler is skipped. None = seeds only
-            (no graph expansion). 0 or negative = run indefinitely with expansion.
-        concurrency : int
-            Number of concurrent Playwright pages.
-        force_recrawl : bool
-            Recrawl rows last scraped more than one month ago.
-        """
         from goodreads_ranker import crawler
 
         db.init_db()
@@ -91,34 +63,12 @@ class GoodreadsRankerCLI:
         )
 
     def embed(self, batch_size=128, model=None):
-        """
-        Generate Ollama embeddings for crawled books.
-
-        Parameters:
-        -----------
-        batch_size : int
-            Batch size for embedding generation.
-        model : str, optional
-            Ollama embedding model name.
-        """
         from goodreads_ranker import embedder
 
         db.init_db()
         embedder.generate_embeddings(batch_size=int(batch_size), model=model)
 
     def rank(self, interactive=False, optimize=False, model=None):
-        """
-        Run ELO ratings refinement and ML recommendation model.
-
-        Parameters:
-        -----------
-        interactive : bool
-            Launch terminal interface for ELO pairwise ranking.
-        optimize : bool
-            Tune model hyperparameters using Nevergrad.
-        model : str, optional
-            Ollama embedding model name to load embeddings for.
-        """
         from goodreads_ranker import ranker
 
         db.init_db()
@@ -136,28 +86,6 @@ class GoodreadsRankerCLI:
         optimize=False,
         model=None,
     ):
-        """
-        Run the entire seeding, crawling, embedding, and ranking pipeline end-to-end.
-
-        Parameters:
-        -----------
-        seed : bool
-            Run enabled seed stages.
-        seed_user : bool
-            Download/import the user's Goodreads library when seeding.
-        seed_friends : bool
-            Scrape friend ratings when seeding.
-        limit : int, optional
-            Target total number of scraped books. If the DB already has this
-            many scraped books, the crawler is skipped. None = seeds only
-            (no graph expansion). 0 or negative = run indefinitely with expansion.
-        force_recrawl : bool
-            Recrawl rows last scraped more than one month ago.
-        optimize : bool
-            Run Nevergrad optimization and persist best model params.
-        model : str, optional
-            Ollama embedding model name to use for embedding and ranking.
-        """
         db.init_db()
         seed = as_bool(seed)
         seed_user = as_bool(seed_user)
@@ -190,13 +118,6 @@ class GoodreadsRankerCLI:
         print("\nPipeline run finished successfully!")
 
     def verify(self, model=None):
-        """Report pipeline state without scraping, embedding, crawling, or ranking.
-
-        Parameters:
-        -----------
-        model : str, optional
-            Ollama embedding model name to verify embeddings for.
-        """
         import hashlib
         import os
 
@@ -287,12 +208,10 @@ class GoodreadsRankerCLI:
                 )
             seed_missing = len(seed_ids - scraped_ids)
 
-            # Embedding health checks — all scoped to the selected model
             scraped_missing_embeddings = 0
             invalid_embeddings = 0
             outdated_embeddings = 0
             if {"books", "embeddings"}.issubset(tables):
-                # Books with no embedding row for this model
                 scraped_missing_embeddings = conn.execute(
                     """
                     SELECT COUNT(*)
@@ -310,10 +229,8 @@ class GoodreadsRankerCLI:
                 ):
                     if not db.is_valid_embedding_blob(row["vector"], row["dim"]):
                         invalid_embeddings += 1
-                # Outdated: hash mismatch against current book metadata
                 from goodreads_ranker import embedder
 
-                # Compute current hashes for all books
                 rw_conn = db.get_connection()
                 all_inputs = embedder.build_embedding_inputs(rw_conn)
                 rw_conn.close()

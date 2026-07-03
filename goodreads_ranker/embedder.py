@@ -1,4 +1,3 @@
-import argparse
 import contextlib
 import os
 import re
@@ -14,15 +13,11 @@ from . import db
 
 @contextlib.contextmanager
 def _ensure_ollama(model: str):
-    """Context manager that guarantees an Ollama server is running and the
-    requested model is available.  Starts ``ollama serve`` if needed, pulls
-    the model if it is absent, and cleans up only what it created."""
     import ollama
 
     server_started_here = False
     proc = None
 
-    # 1. Check whether a server is already reachable.
     try:
         ollama.list()
     except Exception:
@@ -33,7 +28,6 @@ def _ensure_ollama(model: str):
             stderr=subprocess.DEVNULL,
         )
         server_started_here = True
-        # Wait until the server is ready (up to 30 s).
         for _ in range(30):
             time.sleep(1)
             try:
@@ -48,10 +42,8 @@ def _ensure_ollama(model: str):
                 "Check that 'ollama' is on your PATH and is a valid installation."
             )
 
-    # 2. Pull the model only if it is not already present.
     available = {m.model for m in ollama.list().models if m.model is not None}
 
-    # Normalise: ollama may append ':latest' to untagged names.
     def _normalise(name: str) -> str:
         return name if ":" in name else f"{name}:latest"
 
@@ -98,7 +90,6 @@ def join_embedding_parts(title, authors, genres, desc):
 
 
 def build_embedding_inputs(conn):
-    """Query all books and build their formatted embedding input strings."""
     cursor = conn.execute(
         "SELECT book_id, title, authors, genres, description FROM books"
         " ORDER BY book_id"
@@ -137,7 +128,6 @@ def find_books_needing_embeddings(conn, all_inputs, model):
 
     import hashlib
 
-    # Precompute current hashes for all inputs
     input_hashes = {
         book_id: hashlib.md5(text.encode("utf-8")).hexdigest()
         for book_id, text in all_inputs.items()
@@ -175,7 +165,6 @@ def find_books_needing_embeddings(conn, all_inputs, model):
             queued.append(book_id)
             continue
 
-        # Validate hash
         current_hash = input_hashes.get(book_id, "")
         if not current_hash or row["text_hash"] != current_hash:
             queued.append(book_id)
@@ -184,7 +173,6 @@ def find_books_needing_embeddings(conn, all_inputs, model):
 
 
 def generate_embeddings(batch_size=128, model=None, db_path=None):
-    """Identify books missing embeddings and generate them using Ollama."""
     load_dotenv()
     db.init_db(db_path)
 
@@ -232,22 +220,6 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
                 print(
                     f"\n  Error generating embeddings for batch starting with book_id {batch_ids[0]}: {e}"
                 )
-                # Continue with other batches
                 continue
 
     conn.close()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Generate Ollama embeddings for crawled books."
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=128, help="Batch size for embedding calls"
-    )
-    parser.add_argument(
-        "--model", type=str, default=None, help="Ollama embedding model name"
-    )
-    args = parser.parse_args()
-
-    generate_embeddings(batch_size=args.batch_size, model=args.model)

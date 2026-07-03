@@ -1,7 +1,6 @@
-import argparse
 import random
 from datetime import datetime
-from typing import cast
+from typing import Any, cast
 
 import nevergrad as ng
 import numpy as np
@@ -80,7 +79,6 @@ def load_valid_embeddings_for_books(conn, books_df, model=None):
     if not model:
         model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
 
-    # Get formatted inputs and compute current hashes
     all_inputs = embedder.build_embedding_inputs(conn)
     input_hashes = {
         book_id: hashlib.md5(text.encode("utf-8")).hexdigest()
@@ -99,8 +97,7 @@ def load_valid_embeddings_for_books(conn, books_df, model=None):
 
     counts = {
         "missing": 0,
-        "wrong_byte_length": 0,
-        "zero_vector": 0,
+        "invalid": 0,
         "unverified": 0,
         "dimension_mismatch": 0,
     }
@@ -118,18 +115,11 @@ def load_valid_embeddings_for_books(conn, books_df, model=None):
 
         dim = int(row["dim"])
         vector_blob = row["vector"]
-        if len(vector_blob) != dim * np.dtype(np.float32).itemsize:
-            counts["wrong_byte_length"] += 1
+        if not db.is_valid_embedding_blob(vector_blob, dim):
+            counts["invalid"] += 1
             valid_mask.append(False)
             continue
 
-        vector = np.frombuffer(vector_blob, dtype=np.float32).copy()
-        if not np.any(vector != 0):
-            counts["zero_vector"] += 1
-            valid_mask.append(False)
-            continue
-
-        # Check hash
         current_hash = input_hashes.get(bid, "")
         if not current_hash or row["text_hash"] != current_hash:
             counts["unverified"] += 1
@@ -143,6 +133,7 @@ def load_valid_embeddings_for_books(conn, books_df, model=None):
             valid_mask.append(False)
             continue
 
+        vector = np.frombuffer(vector_blob, dtype=np.float32).copy()
         valid_vectors.append(vector)
         valid_mask.append(True)
 
@@ -257,7 +248,6 @@ def compute_continuous(elo_df):
 def refine_ratings(target_df, rating_col, conn, interactive=False, title_col="title"):
     target_clean = target_df.dropna(subset=[rating_col]).copy()
 
-    # Load from database table elo_ratings
     cursor = conn.execute(
         "SELECT book_id, original_rating, elo_score, matches_played FROM elo_ratings"
     )
@@ -277,7 +267,6 @@ def refine_ratings(target_df, rating_col, conn, interactive=False, title_col="ti
         common_books, rating_col
     ]
 
-    # Add new books
     new_books = target_clean[~target_clean["book_id"].isin(elo_df.index)]
     if not new_books.empty:
         new_entries = pd.DataFrame(
@@ -292,14 +281,11 @@ def refine_ratings(target_df, rating_col, conn, interactive=False, title_col="ti
 
     elo_df = elo_df.reset_index().rename(columns={"index": "book_id"})
 
-    # Interactive ELO refinement
     if interactive:
         titles = dict(zip(target_df["book_id"], target_df[title_col], strict=False))
         for star in sorted(target_clean[rating_col].unique(), reverse=True):
             elo_df = run_interactive_ranking(elo_df, titles, star)
 
-    # Always persist ELO state so subsequent runs (interactive or not) pick up
-    # any new books that were added to the table since the last run.
     db_rows = []
     for row in elo_df.to_dict(orient="records"):
         db_rows.append(
@@ -328,15 +314,13 @@ def safe_spearman(x, y):
     y = np.asarray(y, dtype=float)
     if len(x) < 3 or len(y) < 3 or np.std(x) < 1e-9 or np.std(y) < 1e-9:
         return np.nan
-    import typing
-
     res = spearmanr(x, y)
-    rho = typing.cast(typing.Any, res)[0]
+    rho = cast(tuple[Any, ...], res)[0]
     val = float(rho)
     return val if not np.isnan(val) else np.nan
 
 
-def calibrate_friend_ratings(overlap_df, clip_min, clip_max, shrink_after=10):
+def calibrate_friend_ratings(overlap_df, clip_min, shrink_after=10):
     x = overlap_df["rating"].astype(float).to_numpy(copy=True)
     y = overlap_df["my_refined"].astype(float).to_numpy(copy=True)
 
@@ -361,7 +345,6 @@ def get_similar_friend_ratings(
     min_correlation=0.3,
     min_similar_friends=2,
 ):
-    # Load friend ratings from sqlite
     cursor = conn.execute("SELECT list_id, book_id, rating FROM friend_ratings")
     rows = cursor.fetchall()
     friends = pd.DataFrame([dict(r) for r in rows])
@@ -374,10 +357,14 @@ def get_similar_friend_ratings(
 
     current_book_ids = books_df["book_id"].to_numpy()
     current_book_id_set = set(current_book_ids.tolist())
-    friends_df = friends[friends["book_id"].isin(list(current_book_id_set))]
-    assert isinstance(friends_df, pd.DataFrame)
-    friends = friends_df.dropna(subset=["rating"]).copy()
-    friends = friends.groupby(["list_id", "book_id"], as_index=False)["rating"].mean()
+    friends_df = cast(
+        pd.DataFrame, friends[friends["book_id"].isin(list(current_book_id_set))]
+    )
+    friends = cast(pd.DataFrame, friends_df.dropna(subset=["rating"]).copy())
+    friends = cast(
+        pd.DataFrame,
+        friends.groupby(["list_id", "book_id"], as_index=False)["rating"].mean(),
+    )
 
     my_books = books_df[["book_id", "my_refined"]].dropna().copy()
     my_book_id_set = set(my_books["book_id"].tolist())
@@ -388,7 +375,6 @@ def get_similar_friend_ratings(
     embedding_matrix = np.asarray(embeddings)
     book_id_to_idx = {book_id: i for i, book_id in enumerate(current_book_ids)}
 
-    # Train KNN_me once — predicts my rating from book embeddings
     my_train_ids = my_books["book_id"].to_numpy()
     embeddings_me = embedding_matrix[[book_id_to_idx[bid] for bid in my_train_ids]]
     y_me = my_lookup.loc[my_train_ids].to_numpy(copy=True)
@@ -401,7 +387,6 @@ def get_similar_friend_ratings(
     friend_scores = []
     calibrated_friend_rows = []
 
-    assert isinstance(friends, pd.DataFrame)
     for list_id, friend_df in friends.groupby("list_id"):
         overlap = (
             friend_df.merge(my_books, on="book_id", how="inner")
@@ -412,8 +397,7 @@ def get_similar_friend_ratings(
         if overlap_count < min_overlap:
             continue
 
-        # Calibrate friend's ratings onto my scale
-        slope, intercept = calibrate_friend_ratings(overlap, clip_min, clip_max)
+        slope, intercept = calibrate_friend_ratings(overlap, clip_min)
 
         friend_df = friend_df.copy()
         friend_ratings = np.asarray(friend_df["rating"], dtype=float)
@@ -424,13 +408,11 @@ def get_similar_friend_ratings(
         )
         calibrated_friend_rows.append(friend_df)
 
-        # Partition into overlap / my-only / friend-only
         overlap_ids = set(overlap["book_id"].tolist())
         friend_book_id_set = set(friend_df["book_id"].tolist())
         my_only_ids = sorted(my_book_id_set - overlap_ids)
         friend_only_ids = sorted(friend_book_id_set - overlap_ids)
 
-        # --- Overlap: real ratings on both sides ---
         calibrated_overlap = np.clip(
             slope * overlap["rating"].astype(float).to_numpy(copy=True) + intercept,
             clip_min,
@@ -439,10 +421,8 @@ def get_similar_friend_ratings(
         my_union = [overlap["my_refined"].to_numpy(copy=True)]
         friend_union = [calibrated_overlap]
 
-        # Raw Spearman on overlap only
         raw_corr = safe_spearman(my_union[0], friend_union[0])
 
-        # --- My-only books: predict friend's calibrated rating ---
         if my_only_ids and len(friend_df) >= 2:
             friend_indexed = friend_df.set_index("book_id")
             embeddings_friend = embedding_matrix[
@@ -466,7 +446,6 @@ def get_similar_friend_ratings(
             my_union.append(my_lookup.loc[my_only_ids].to_numpy(copy=True))
             friend_union.append(predicted_friend)
 
-        # --- Friend-only books: predict my rating ---
         if friend_only_ids:
             embeddings_friend_only = embedding_matrix[
                 [book_id_to_idx[bid] for bid in friend_only_ids]
@@ -481,7 +460,6 @@ def get_similar_friend_ratings(
             my_union.append(predicted_me)
             friend_union.append(real_friend)
 
-        # Synthetic Spearman over full union
         my_union = np.concatenate(my_union)
         friend_union = np.concatenate(friend_union)
         synthetic_corr = safe_spearman(my_union, friend_union)
@@ -526,12 +504,11 @@ def get_similar_friend_ratings(
     if len(selected) < minimum_selected:
         selected = friend_scores.head(minimum_selected).copy()
 
-    assert isinstance(selected, pd.DataFrame)
     similar_friends = selected["list_id"].tolist()
-    similar_friend_ratings = pd.concat(calibrated_friend_rows, ignore_index=True)
-    assert isinstance(similar_friend_ratings, pd.DataFrame)
-    selected_sub = selected[["list_id", "score"]]
-    assert isinstance(selected_sub, pd.DataFrame)
+    similar_friend_ratings = cast(
+        pd.DataFrame, pd.concat(calibrated_friend_rows, ignore_index=True)
+    )
+    selected_sub = cast(pd.DataFrame, selected[["list_id", "score"]])
     similar_friend_ratings = similar_friend_ratings.merge(
         selected_sub.rename(columns={"score": "friend_weight"}),
         on="list_id",
@@ -543,7 +520,6 @@ def get_similar_friend_ratings(
     if similar_friend_ratings.empty:
         return pd.Series(dtype=float), similar_friends, friend_scores
 
-    assert isinstance(similar_friend_ratings, pd.DataFrame)
     similar_friend_ratings["weighted_rating"] = (
         similar_friend_ratings["calibrated_rating"]
         * similar_friend_ratings["friend_weight"]
@@ -697,8 +673,7 @@ def prep_optimization(
         if np.std(y_preds) < 1e-9:
             spearman = 0
         else:
-            spearman_result = spearmanr(y_reals, y_preds)
-            spearman: float = cast(float, spearman_result[0])
+            spearman = safe_spearman(y_reals, y_preds)
             if np.isnan(spearman):
                 spearman = 0.0
 
@@ -801,7 +776,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     conn.execute("DELETE FROM predictions")
     conn.commit()
 
-    # 1. Load books metadata
     cursor = conn.execute("SELECT * FROM books ORDER BY book_id")
     books_rows = cursor.fetchall()
     if not books_rows:
@@ -817,7 +791,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         .str.strip()
     )
 
-    # 2. Load user library
     cursor = conn.execute("SELECT book_id, title, my_rating FROM user_library")
     library_rows = cursor.fetchall()
     if not library_rows:
@@ -825,11 +798,11 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         conn.close()
         return
     gr_export = pd.DataFrame([dict(r) for r in library_rows])
-    my_rating_series = pd.to_numeric(gr_export["my_rating"], errors="coerce")
-    assert isinstance(my_rating_series, pd.Series)
+    my_rating_series = cast(
+        pd.Series, pd.to_numeric(gr_export["my_rating"], errors="coerce")
+    )
     gr_export["my_rating"] = my_rating_series.replace(0, np.nan)
 
-    # 3. ELO ratings refinement
     print("  Running ELO ratings refinement...")
     my_refined = refine_ratings(gr_export, "my_rating", conn, interactive=interactive)
 
@@ -838,7 +811,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     )
     books_df = books_df.merge(my_refined.rename("my_refined"), on="book_id", how="left")
 
-    # 4. Load only valid, verified embeddings.
     print("  Loading valid embeddings...")
     has_embedding, embedded_embeddings, invalid_counts = (
         load_valid_embeddings_for_books(conn, books_df, model=model)
@@ -849,8 +821,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             "  Excluding "
             f"{excluded_count} books from model inputs "
             f"(missing={invalid_counts['missing']}, "
-            f"wrong_byte_length={invalid_counts['wrong_byte_length']}, "
-            f"zero_vector={invalid_counts['zero_vector']}, "
+            f"invalid={invalid_counts['invalid']}, "
             f"unverified={invalid_counts['unverified']}, "
             f"dimension_mismatch={invalid_counts['dimension_mismatch']})."
         )
@@ -859,7 +830,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         conn.close()
         return
 
-    # 5. Friend taste calibration
     print("  Calibrating friend ratings...")
 
     embedded_books_df = books_df[has_embedding].copy().reset_index(drop=True)
@@ -880,7 +850,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     print("  Taste calibration")
     print(f"    My ratings ({my_rating_count})")
 
-    # Load username map
     friend_meta = conn.execute("SELECT list_id, username FROM friend_lists").fetchall()
     list_to_user = {
         int(row["list_id"]): row["username"] or str(row["list_id"])
@@ -888,22 +857,24 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     }
 
     if not friend_scores.empty:
-        # Filter friend_scores to only include selected list IDs
-        selected_scores = friend_scores[
-            friend_scores["list_id"].astype(int).isin([int(x) for x in similar_friends])
-        ]
-        records: list[dict] = list(selected_scores.to_dict(orient="records"))  # type: ignore[call-overload]
+        selected_scores = cast(
+            pd.DataFrame,
+            friend_scores[
+                friend_scores["list_id"]
+                .astype(int)
+                .isin([int(x) for x in similar_friends])
+            ],
+        )
+        records = cast(list[dict[str, Any]], selected_scores.to_dict(orient="records"))
         for row in records:
             lid = int(row["list_id"])
             username = list_to_user.get(lid, str(lid))
             overlap_c = int(row["overlap_count"])
             print(f"    {username} - {lid} ({overlap_c} books)")
 
-    # 6. Build adjacency matrix and propagate
     print("  Running graph GCN propagation...")
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-    # Precompute mrl_dimensions based on the embedded subset only
     train_size = (~pd.isna(embedded_books_df["training_ratings"])).sum()
     solo_train_size = (~pd.isna(embedded_books_df["my_refined"])).sum()
     if train_size < 2 or solo_train_size < 2:
@@ -935,7 +906,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
 
     del propagated, adj_matrix, embeddings_tensor
 
-    # 7. Model hyperparameter optimization
     if optimize:
         print("  Tuning hyperparameters via Nevergrad (budget=200)...")
         friend_params = prep_optimization(
@@ -967,7 +937,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             conn, "solo_params", DEFAULT_SOLO_PARAMS
         )
 
-    # 8. Run regression ensemble — trained and predicted on embedded_books_df only
     print("  Running ensemble models...")
     friend_final_pred_embedded = run_optimized(
         friend_params, embedded_books_df, precomputed_embeddings, "training_ratings"
@@ -976,14 +945,12 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         solo_params, embedded_books_df, precomputed_embeddings, "my_refined"
     )
 
-    # Back-project predictions onto the full books_df (NaN for books without embeddings)
     friend_final_pred = np.full(len(books_df), np.nan)
     solo_final_pred = np.full(len(books_df), np.nan)
     embedded_positions = np.where(has_embedding)[0]
     friend_final_pred[embedded_positions] = friend_final_pred_embedded
     solo_final_pred[embedded_positions] = solo_final_pred_embedded
 
-    # 9. Compute combined ratings
     print("  Formulating final recommendations...")
     star_cols = ["star_1", "star_2", "star_3", "star_4", "star_5"]
     books_df["rating_count"] = books_df[star_cols].sum(axis=1)
@@ -1003,7 +970,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     count_adjusted = books_df.apply(weighted_rating, axis=1)
 
     scaler = MinMaxScaler()
-    # Scale only where predictions exist (i.e., books with embeddings)
     valid_mask = ~np.isnan(solo_final_pred)
     solo_pred = np.full(len(books_df), np.nan)
     friend_pred = np.full(len(books_df), np.nan)
@@ -1024,7 +990,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     books_df["pred_rating"] = friend_pred * solo_pred
     books_df["final_rating"] = count_adjusted_scaled * friend_pred * solo_pred
 
-    # 10. Save results back to DB predictions table
     print("  Saving predictions to database...")
     now_str = datetime.now().isoformat()
     predictions_data = []
@@ -1067,28 +1032,3 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
 
     print(f"  Saved predictions for {len(predictions_data)} books.")
     conn.close()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Run modeling and prediction ranking pipeline."
-    )
-    parser.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Run interactive ELO rating refinement",
-    )
-    parser.add_argument(
-        "--optimize",
-        action="store_true",
-        help="Tune model hyperparameters using Nevergrad",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Ollama embedding model name to use for ranking",
-    )
-    args = parser.parse_args()
-
-    run_ranking(interactive=args.interactive, optimize=args.optimize, model=args.model)

@@ -1,10 +1,3 @@
-"""
-SQLite database module for goodreads-ranker.
-
-Provides schema initialization, connection management, and memory-efficient
-helpers for bulk reads/writes — especially for embedding BLOB storage.
-"""
-
 import json
 import sqlite3
 from datetime import datetime
@@ -120,7 +113,6 @@ CREATE TABLE IF NOT EXISTS model_params (
 
 
 def get_connection(db_path=None):
-    """Return a new SQLite connection with WAL mode and pragmas for performance."""
     path = Path(db_path) if db_path is not None else DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
@@ -132,7 +124,6 @@ def get_connection(db_path=None):
 
 
 def init_db(db_path=None):
-    """Create all tables if they don't exist."""
     conn = get_connection(db_path)
     ensure_schema_compat(conn)
     conn.executescript(SCHEMA)
@@ -141,7 +132,6 @@ def init_db(db_path=None):
 
 
 def ensure_schema_compat(conn):
-    """Apply additive schema changes for databases created by earlier versions."""
     existing = {
         row["name"]
         for row in conn.execute(
@@ -169,17 +159,10 @@ def ensure_column(conn, table, column, definition):
 
 
 def vector_to_blob(vec):
-    """Serialize a numpy float32 array to bytes for SQLite BLOB storage."""
     return vec.astype(np.float32).tobytes()
 
 
-def blob_to_vector(blob, dim):
-    """Deserialize a SQLite BLOB back to a numpy float32 array."""
-    return np.frombuffer(blob, dtype=np.float32, count=dim)
-
-
 def is_valid_embedding_blob(blob, dim):
-    """Return True when an embedding BLOB has the expected length and data."""
     if blob is None or dim is None:
         return False
     expected_bytes = int(dim) * np.dtype(np.float32).itemsize
@@ -190,7 +173,6 @@ def is_valid_embedding_blob(blob, dim):
 
 
 def save_model_params(conn, name, params):
-    """Persist model hyperparameters as JSON."""
     conn.execute(
         """
         INSERT OR REPLACE INTO model_params (name, params_json, updated_at)
@@ -202,7 +184,6 @@ def save_model_params(conn, name, params):
 
 
 def load_model_params(conn, name):
-    """Load model hyperparameters, returning None when absent or invalid."""
     row = conn.execute(
         "SELECT params_json FROM model_params WHERE name = ?", (name,)
     ).fetchone()
@@ -215,17 +196,6 @@ def load_model_params(conn, name):
 
 
 def save_embeddings(conn, book_ids, vectors, model, text_hashes):
-    """
-    Bulk-insert embeddings into the embeddings table.
-
-    Parameters
-    ----------
-    conn : sqlite3.Connection
-    book_ids : array-like of int
-    vectors : np.ndarray of shape (n, dim), dtype float32
-    model : str
-    text_hashes : dict or list of str
-    """
     dim = vectors.shape[1]
     rows = []
     for i, bid in enumerate(book_ids):
@@ -247,103 +217,7 @@ def save_embeddings(conn, book_ids, vectors, model, text_hashes):
     conn.commit()
 
 
-def load_embeddings(conn, book_ids=None, model=None):
-    """
-    Load embeddings into a pre-allocated numpy array.
-
-    Parameters
-    ----------
-    conn : sqlite3.Connection
-    book_ids : list[int] or None
-        If None, load all embeddings.
-    model : str or None
-        The embedding model name. If None, uses default.
-
-    Returns
-    -------
-    loaded_ids : np.ndarray of int
-    matrix : np.ndarray of shape (n, dim), dtype float32
-    """
-    import os
-
-    if not model:
-        model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
-
-    if book_ids is not None:
-        placeholders = ",".join("?" for _ in book_ids)
-        cursor = conn.execute(
-            f"SELECT book_id, dim, vector FROM embeddings WHERE embedding_model = ? AND book_id IN ({placeholders})",
-            [model] + list(book_ids),
-        )
-    else:
-        cursor = conn.execute(
-            "SELECT book_id, dim, vector FROM embeddings WHERE embedding_model = ?",
-            (model,),
-        )
-
-    rows = cursor.fetchall()
-    if not rows:
-        return np.array([], dtype=int), np.empty((0, 0), dtype=np.float32)
-
-    dim = rows[0]["dim"]
-    loaded_ids = np.array([r["book_id"] for r in rows], dtype=int)
-    matrix = np.empty((len(rows), dim), dtype=np.float32)
-    for i, r in enumerate(rows):
-        matrix[i] = blob_to_vector(r["vector"], dim)
-
-    return loaded_ids, matrix
-
-
-def load_embeddings_for_books(conn, ordered_book_ids, model=None):
-    """
-    Load embeddings aligned to a specific ordered list of book IDs.
-
-    Returns a numpy float32 matrix with rows matching the order of
-    `ordered_book_ids`. Books without embeddings get zero vectors.
-
-    Parameters
-    ----------
-    conn : sqlite3.Connection
-    ordered_book_ids : array-like of int
-    model : str or None
-
-    Returns
-    -------
-    matrix : np.ndarray of shape (len(ordered_book_ids), dim)
-    missing_ids : list[int]
-    """
-    loaded_ids, loaded_matrix = load_embeddings(conn, model=model)
-    if loaded_matrix.size == 0:
-        return np.empty((len(ordered_book_ids), 0), dtype=np.float32), list(
-            ordered_book_ids
-        )
-
-    dim = loaded_matrix.shape[1]
-    id_to_idx = {int(bid): i for i, bid in enumerate(loaded_ids)}
-
-    matrix = np.zeros((len(ordered_book_ids), dim), dtype=np.float32)
-    missing_ids = []
-    for i, bid in enumerate(ordered_book_ids):
-        idx = id_to_idx.get(int(bid))
-        if idx is not None:
-            matrix[i] = loaded_matrix[idx]
-        else:
-            missing_ids.append(int(bid))
-
-    return matrix, missing_ids
-
-
 def upsert_rows(conn, table, rows, columns):
-    """
-    Bulk upsert rows into a table using INSERT OR REPLACE.
-
-    Parameters
-    ----------
-    conn : sqlite3.Connection
-    table : str
-    rows : list[tuple]
-    columns : list[str]
-    """
     if not rows:
         return
     placeholders = ",".join("?" for _ in columns)
@@ -356,18 +230,9 @@ def upsert_rows(conn, table, rows, columns):
 
 
 def normalise_library_columns(df):
-    """
-    Normalise the column names of a raw Goodreads library export DataFrame.
-
-    Goodreads exports columns like "Title", "Author l-f", "My Rating" etc.
-    This converts them to the snake_case names used by the ``user_library``
-    table schema.
-    """
     rename = {}
     for col in df.columns:
         normalised = col.lower().replace(" ", "_")
-        # Goodreads uses "Author l-f" for last-name-first; normalise the
-        # hyphen so it maps to the schema column name ``author_lf``.
         if normalised == "author_l-f":
             normalised = "author_lf"
         rename[col] = normalised

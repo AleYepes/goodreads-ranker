@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import contextlib
 import os
@@ -188,12 +187,10 @@ async def extract_friend_row(row, list_id):
 
 
 async def download_user_library(email, password, db_path=None, force=False):
-    """Download user's library export using Playwright and import into user_library table."""
     db.init_db(db_path)
     conn = db.get_connection(db_path)
 
     if not force:
-        # Check if table already has data
         cursor = conn.execute("SELECT COUNT(*) FROM user_library")
         count = cursor.fetchone()[0]
         if count > 0:
@@ -227,7 +224,6 @@ async def download_user_library(email, password, db_path=None, force=False):
         await page.fill('input[type="password"]', password)
         await page.click('input[type="submit"]')
 
-        # Prep export
         await page.wait_for_selector(".homePrimaryColumn", timeout=60000)
         await page.goto(
             "https://www.goodreads.com/review/import", wait_until="domcontentloaded"
@@ -263,7 +259,6 @@ async def download_user_library(email, password, db_path=None, force=False):
     df = pd.read_csv(temp_csv_path)
     df = db.normalise_library_columns(df)
 
-    # Clean ISBNs
     if "isbn" in df.columns:
         df["isbn"] = df["isbn"].apply(clean_isbn)
     if "isbn13" in df.columns:
@@ -297,7 +292,6 @@ async def download_user_library(email, password, db_path=None, force=False):
         "owned_copies",
     ]
 
-    # Extract only matching columns and format rows
     rows = []
     for row in df.to_dict(orient="records"):
         row_tuple = tuple(row.get(col) for col in columns)
@@ -317,7 +311,6 @@ async def download_user_library(email, password, db_path=None, force=False):
 
 
 async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=False):
-    """Scrape friend libraries/ratings lists and insert into friend_ratings table."""
     load_dotenv()
     db.init_db(db_path)
     email = os.getenv("GOODREADS_EMAIL")
@@ -327,7 +320,6 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
     if friend_list_ids is None:
         friend_list_ids = DEFAULT_FRIEND_LIST_IDS
 
-    # Ensure friend_lists table is initialized
     for lid in friend_list_ids:
         conn.execute(
             "INSERT OR IGNORE INTO friend_lists (list_id, scrape_complete) VALUES (?, 0)",
@@ -561,39 +553,3 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
                 with contextlib.suppress(Exception):
                     await page.goto("about:blank")
         await browser.close()
-
-
-async def main():
-    load_dotenv()
-    db.init_db()
-
-    parser = argparse.ArgumentParser(
-        description="Seed database with user and friend library ratings."
-    )
-    parser.add_argument("--user", action="store_true", help="Download user library")
-    parser.add_argument(
-        "--friends", action="store_true", help="Scrape friend review lists"
-    )
-    parser.add_argument(
-        "--force", action="store_true", help="Force redownload or re-scraping"
-    )
-    args = parser.parse_args()
-
-    # Default to running both if neither is specified
-    run_user = args.user
-    run_friends = args.friends
-    if not run_user and not run_friends:
-        run_user = True
-        run_friends = True
-
-    if run_user:
-        email = os.getenv("GOODREADS_EMAIL")
-        password = os.getenv("GOODREADS_PASSWORD")
-        await download_user_library(email, password, force=args.force)
-
-    if run_friends:
-        await scrape_friend_ratings(force_all=args.force)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

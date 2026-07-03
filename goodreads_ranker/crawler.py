@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import contextlib
 import heapq
@@ -11,7 +10,6 @@ from datetime import datetime, timedelta
 
 import numpy as np
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 from tqdm.asyncio import tqdm
 
@@ -182,7 +180,6 @@ async def fetch_book(page, book_id, bad_book_ids):
         html_content = await page.content()
         soup = BeautifulSoup(html_content, "html.parser")
 
-        # Stars distribution — keys written as star_N to match the DB schema directly
         for i in range(1, 6):
             label = soup.select_one(f'[data-testid="labelTotal-{i}"]')
             text = (
@@ -461,12 +458,8 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
     scoring_algo_names = list(SCORING_FUNCTIONS.keys())
     db_conn = db.get_connection(db_path)
 
-    # Determine crawl mode:
-    #   limit=None  → seeds only, no expansion
-    #   limit<=0    → run indefinitely with expansion
-    #   limit>0     → crawl until total scraped books reaches `limit`
     enforce_limit = limit is not None and limit > 0
-    include_expansion = limit is not None  # False only in seeds-only mode
+    include_expansion = limit is not None
 
     if enforce_limit:
         already_scraped = db_conn.execute(
@@ -482,9 +475,9 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
         remaining_budget = limit - already_scraped
     else:
         already_scraped = 0
-        remaining_budget = None  # unlimited
+        remaining_budget = None
 
-    total_processed = 0  # books crawled this session
+    total_processed = 0
 
     while True:
         current_algo_name = scoring_algo_names[cycle % len(scoring_algo_names)]
@@ -511,9 +504,8 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
         )
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=False
-            )  # Running headed is required for GraphQL triggers to fire
+            # Goodreads only triggers the similar-books GraphQL request in headed Chromium.
+            browser = await p.chromium.launch(headless=False)
             context = await browser.new_context(user_agent=USER_AGENT)
             await context.route("**/*", block_media)
 
@@ -648,31 +640,3 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
         cycle += 1
 
     db_conn.close()
-
-
-async def main():
-    load_dotenv()
-    db.init_db()
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--limit", type=int, default=None, help="Max number of books to crawl"
-    )
-    parser.add_argument("--concurrency", type=int, default=2, help="Concurrency limit")
-    parser.add_argument(
-        "--force-recrawl",
-        action="store_true",
-        help="Recrawl rows scraped more than one month ago",
-    )
-    args = parser.parse_args()
-
-    with contextlib.suppress(KeyboardInterrupt):
-        await run_crawler(
-            limit=args.limit,
-            concurrency=args.concurrency,
-            force_recrawl=args.force_recrawl,
-        )
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
