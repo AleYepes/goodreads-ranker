@@ -19,6 +19,8 @@ from torch_geometric.utils import add_self_loops
 
 from . import db
 
+torch.sparse.check_sparse_tensor_invariants.disable()
+
 DEFAULT_FRIEND_PARAMS = {
     "num_propagations": 0,
     "knn_neighbors": 18,

@@ -625,6 +625,11 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
                     task.cancel()
                 if active_tasks:
                     await asyncio.gather(*active_tasks, return_exceptions=True)
+                # Yield to the event loop so Playwright's internal abort futures
+                # (e.g. ERR_ABORTED from in-flight navigations that were cancelled)
+                # are retrieved before the browser tears down, preventing the
+                # "Future exception was never retrieved" asyncio warning.
+                await asyncio.sleep(0)
                 await browser.close()
                 await asyncio.sleep(1)
 
