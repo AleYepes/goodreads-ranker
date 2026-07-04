@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import numpy as np
 DB_PATH = Path("data/goodreads.db")
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS user_library (
+CREATE TABLE IF NOT EXISTS my_library (
     book_id       INTEGER PRIMARY KEY,
     title         TEXT,
     author        TEXT,
@@ -34,16 +35,17 @@ CREATE TABLE IF NOT EXISTS user_library (
     owned_copies  INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS friend_lists (
+CREATE TABLE IF NOT EXISTS readers (
     list_id            INTEGER PRIMARY KEY,
     username           TEXT,
-    href               TEXT,
+    user_id            INTEGER,
+    is_self            INTEGER DEFAULT 0,
     scrape_complete    INTEGER DEFAULT 0,
     date_last_scraped  TEXT,
     scrape_error       TEXT
 );
 
-CREATE TABLE IF NOT EXISTS friend_ratings (
+CREATE TABLE IF NOT EXISTS reader_libraries (
     list_id    INTEGER NOT NULL,
     book_id    INTEGER NOT NULL,
     rating     INTEGER,
@@ -112,43 +114,54 @@ CREATE TABLE IF NOT EXISTS model_params (
 """
 
 
+@contextmanager
 def get_connection(db_path=None):
     path = Path(db_path) if db_path is not None else DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     db_conn = sqlite3.connect(str(path))
-    db_conn.execute("PRAGMA journal_mode=WAL")
-    db_conn.execute("PRAGMA synchronous=NORMAL")
-    db_conn.execute("PRAGMA foreign_keys=ON")
-    db_conn.row_factory = sqlite3.Row
-    return db_conn
+    try:
+        db_conn.execute("PRAGMA journal_mode=WAL")
+        db_conn.execute("PRAGMA synchronous=NORMAL")
+        db_conn.execute("PRAGMA foreign_keys=ON")
+        db_conn.row_factory = sqlite3.Row
+        yield db_conn
+    finally:
+        db_conn.close()
 
 
 def init_db(db_path=None):
-    db_conn = get_connection(db_path)
-    ensure_schema_compat(db_conn)
-    db_conn.executescript(SCHEMA)
-    db_conn.commit()
-    db_conn.close()
+    with get_connection(db_path) as db_conn:
+        ensure_schema_compat(db_conn)
+        db_conn.executescript(SCHEMA)
+        db_conn.commit()
 
 
 def ensure_schema_compat(db_conn):
-    existing = {
-        row["name"]
-        for row in db_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
+    existing = {row["name"] for row in db_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+
+    if "user_library" in existing and "my_library" not in existing:
+        db_conn.execute("ALTER TABLE user_library RENAME TO my_library")
+    if "friend_lists" in existing and "readers" not in existing:
+        db_conn.execute("ALTER TABLE friend_lists RENAME TO readers")
+    if "friend_ratings" in existing and "reader_libraries" not in existing:
+        db_conn.execute("ALTER TABLE friend_ratings RENAME TO reader_libraries")
+
+    existing_after_renaming = {
+        row["name"] for row in db_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
 
-    if "books" in existing:
+    if "books" in existing_after_renaming:
         ensure_column(db_conn, "books", "date_last_scraped", "TEXT")
-    if "friend_lists" in existing:
-        ensure_column(db_conn, "friend_lists", "username", "TEXT")
-        ensure_column(db_conn, "friend_lists", "href", "TEXT")
-        ensure_column(db_conn, "friend_lists", "scrape_error", "TEXT")
-    if "embeddings" in existing:
+
+    if "readers" in existing_after_renaming:
+        ensure_column(db_conn, "readers", "username", "TEXT")
+        ensure_column(db_conn, "readers", "user_id", "INTEGER")
+        ensure_column(db_conn, "readers", "is_self", "INTEGER DEFAULT 0")
+        ensure_column(db_conn, "readers", "scrape_error", "TEXT")
+
+    if "embeddings" in existing_after_renaming:
         columns = {row["name"] for row in db_conn.execute("PRAGMA table_info(embeddings)")}
         if "embedding_model" not in columns:
-            print("Recreating empty embeddings table for new schema...")
             db_conn.execute("DROP TABLE embeddings")
 
 
@@ -184,9 +197,7 @@ def save_model_params(db_conn, name, params):
 
 
 def load_model_params(db_conn, name):
-    row = db_conn.execute(
-        "SELECT params_json FROM model_params WHERE name = ?", (name,)
-    ).fetchone()
+    row = db_conn.execute("SELECT params_json FROM model_params WHERE name = ?", (name,)).fetchone()
     if not row:
         return None
     try:
@@ -200,11 +211,7 @@ def save_embeddings(db_conn, book_ids, vectors, model, text_hashes):
     rows = []
     for i, bid in enumerate(book_ids):
         bid_int = int(bid)
-        h = (
-            text_hashes.get(bid_int)
-            if isinstance(text_hashes, dict)
-            else text_hashes[i]
-        )
+        h = text_hashes.get(bid_int) if isinstance(text_hashes, dict) else text_hashes[i]
         rows.append((bid_int, model, dim, vector_to_blob(vectors[i]), h))
 
     db_conn.executemany(

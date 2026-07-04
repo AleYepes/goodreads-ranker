@@ -48,9 +48,7 @@ def _ensure_ollama(model: str):
         return name if ":" in name else f"{name}:latest"
 
     if _normalise(model) not in {_normalise(m) for m in available}:
-        print(
-            f"  Model '{model}' not found locally — pulling (this may take a while)..."
-        )
+        print(f"  Model '{model}' not found locally — pulling (this may take a while)...")
         ollama.pull(model)
         print(f"  Model '{model}' ready.")
 
@@ -90,10 +88,7 @@ def join_embedding_parts(title, authors, genres, desc):
 
 
 def build_embedding_inputs(db_conn):
-    cursor = db_conn.execute(
-        "SELECT book_id, title, authors, genres, description FROM books"
-        " ORDER BY book_id"
-    )
+    cursor = db_conn.execute("SELECT book_id, title, authors, genres, description FROM books ORDER BY book_id")
     rows = cursor.fetchall()
 
     inputs = {}
@@ -114,9 +109,7 @@ def build_embedding_inputs(db_conn):
         desc_list = [desc_clean] if desc_clean else []
         desc_post = format_string_for_embedding(desc_list, kind="description")
 
-        embedding_input = join_embedding_parts(
-            title, authors_post, genres_post, desc_post
-        )
+        embedding_input = join_embedding_parts(title, authors_post, genres_post, desc_post)
         inputs[book_id] = embedding_input
 
     return inputs
@@ -128,10 +121,7 @@ def find_books_needing_embeddings(db_conn, all_inputs, model):
 
     import hashlib
 
-    input_hashes = {
-        book_id: hashlib.md5(text.encode("utf-8")).hexdigest()
-        for book_id, text in all_inputs.items()
-    }
+    input_hashes = {book_id: hashlib.md5(text.encode("utf-8")).hexdigest() for book_id, text in all_inputs.items()}
 
     cursor = db_conn.execute(
         """
@@ -176,50 +166,40 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
     load_dotenv()
     db.init_db(db_path)
 
-    db_conn = db.get_connection(db_path)
-
     if not model:
         model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
 
-    all_inputs = build_embedding_inputs(db_conn)
-    if not all_inputs:
-        print("  No books found. Run crawler first.")
-        db_conn.close()
-        return
+    with db.get_connection(db_path) as db_conn:
+        all_inputs = build_embedding_inputs(db_conn)
+        if not all_inputs:
+            print("  No books found. Run crawler first.")
+            db_conn.close()
+            return
 
-    missing_ids = find_books_needing_embeddings(db_conn, all_inputs, model)
+        missing_ids = find_books_needing_embeddings(db_conn, all_inputs, model)
 
-    if not missing_ids:
-        print(
-            f"  Nothing to embed: all books have valid embeddings for model '{model}'."
-        )
-        db_conn.close()
-        return
+        if not missing_ids:
+            print(f"  Nothing to embed: all books have valid embeddings for model '{model}'.")
+            db_conn.close()
+            return
 
-    import hashlib
+        import hashlib
 
-    import ollama
+        import ollama
 
-    with _ensure_ollama(model):
-        for i in tqdm(range(0, len(missing_ids), batch_size)):
-            batch_ids = missing_ids[i : i + batch_size]
-            batch_strings = [all_inputs[bid] for bid in batch_ids]
+        with _ensure_ollama(model):
+            for i in tqdm(range(0, len(missing_ids), batch_size)):
+                batch_ids = missing_ids[i : i + batch_size]
+                batch_strings = [all_inputs[bid] for bid in batch_ids]
 
-            try:
-                response = ollama.embed(model=model, input=batch_strings)
-                embeddings_list = response["embeddings"]
+                try:
+                    response = ollama.embed(model=model, input=batch_strings)
+                    embeddings_list = response["embeddings"]
 
-                vectors = np.array(embeddings_list, dtype=np.float32)
+                    vectors = np.array(embeddings_list, dtype=np.float32)
 
-                batch_hashes = {
-                    bid: hashlib.md5(all_inputs[bid].encode("utf-8")).hexdigest()
-                    for bid in batch_ids
-                }
-                db.save_embeddings(db_conn, batch_ids, vectors, model, batch_hashes)
-            except Exception as e:
-                print(
-                    f"\n  Error generating embeddings for batch starting with book_id {batch_ids[0]}: {e}"
-                )
-                continue
-
-    db_conn.close()
+                    batch_hashes = {bid: hashlib.md5(all_inputs[bid].encode("utf-8")).hexdigest() for bid in batch_ids}
+                    db.save_embeddings(db_conn, batch_ids, vectors, model, batch_hashes)
+                except Exception as e:
+                    print(f"\n  Error generating embeddings for batch starting with book_id {batch_ids[0]}: {e}")
+                    continue
