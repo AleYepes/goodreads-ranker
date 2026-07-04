@@ -531,9 +531,6 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
                         task.cancel()
                     if active_tasks:
                         await asyncio.gather(*active_tasks, return_exceptions=True)
-                    await asyncio.sleep(
-                        0
-                    )  # Yield to event loop to clear Playwright abort futures and avoid asyncio warnings
                     await browser.close()
                     await asyncio.sleep(1)
 

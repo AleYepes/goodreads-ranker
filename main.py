@@ -22,7 +22,7 @@ def parse_optional_int(value):
 
 
 class GoodreadsRankerCLI:
-    def seed(self, force=False, list_ids=None):
+    def seed(self, force_seed=False, list_ids=None):
         from dotenv import load_dotenv
 
         from goodreads_ranker import seeder
@@ -36,7 +36,7 @@ class GoodreadsRankerCLI:
                 parsed_ids = [int(x.strip()) for x in list_ids.split(",") if x.strip()]
             else:
                 parsed_ids = [int(x) for x in list_ids]
-        asyncio.run(seeder.scrape_reader_libraries(list_ids=parsed_ids, force_all=as_bool(force)))
+        asyncio.run(seeder.scrape_reader_libraries(list_ids=parsed_ids, force_seed=as_bool(force_seed)))
 
     def crawl(self, limit=None, concurrency=2, force_recrawl=False):
         from goodreads_ranker import crawler
@@ -65,21 +65,20 @@ class GoodreadsRankerCLI:
 
     def run_pipeline(
         self,
-        seed=True,
         limit=None,
+        force_seed=False,
         force_recrawl=False,
         optimize=False,
         model=None,
     ):
         db.init_db()
-        seed = as_bool(seed)
+        force_seed = as_bool(force_seed)
         force_recrawl = as_bool(force_recrawl)
         optimize = as_bool(optimize)
         limit = parse_optional_int(limit)
 
-        if seed:
-            print("\nSeeding database")
-            self.seed(force=False)
+        print("\nSeeding database")
+        self.seed(force_seed=force_seed)
 
         print("\nCrawling book details")
         self.crawl(limit=limit, force_recrawl=force_recrawl)

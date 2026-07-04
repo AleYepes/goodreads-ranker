@@ -3,12 +3,12 @@ import contextlib
 import os
 import re
 from datetime import datetime
-import select
 from urllib.parse import urljoin
 
 from dotenv import load_dotenv
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
+from tqdm import tqdm
 
 from . import db
 
@@ -51,14 +51,12 @@ async def is_login_page(page):
 async def login_to_goodreads(page, email, password):
 
     async def wait_for_post_login(page):
-        for selector in (
-            ".homePrimaryColumn",
-        ):
+        for selector in (".homePrimaryColumn",):
             try:
                 await page.wait_for_selector(selector, timeout=15000)
                 return
             except PlaywrightTimeoutError:
-                print(f'wait_for_post_login - {selector}')
+                print(f"wait_for_post_login - {selector}")
                 continue
 
         if await is_login_page(page):
@@ -104,52 +102,71 @@ async def extract_main_user(page):
     return {"user_id": user_id, "list_id": list_id, "username": username}
 
 
+async def get_total_pages(page) -> int:
+    next_btn = page.locator("a.next_page").first
+    if await next_btn.count() > 0:
+        sibling = page.locator("a.next_page >> xpath=preceding-sibling::a[1]").first
+        if await sibling.count() > 0:
+            text = await sibling.inner_text()
+            with contextlib.suppress(ValueError):
+                return int(text.strip())
+    return 1
+
+
 async def fetch_friends(page, user_id: int) -> list[dict]:
     friends = []
     page_num = 1
     target_url = f"https://www.goodreads.com/friend/user/{user_id}"
 
-    while True:
-        await page.goto(f"{target_url}?page={page_num}", wait_until="domcontentloaded")
-        rows = await page.locator("#friendTable tbody tr").all()
-        if not rows:
-            break
+    await page.goto(f"{target_url}?page={page_num}", wait_until="domcontentloaded")
+    total_pages = await get_total_pages(page)
 
-        for row in rows:
-            user_anchor = row.locator('td a[href^="/user/show/"]').first
-            list_anchor = row.locator('a[href^="/review/list/"]').first
+    with tqdm(total=total_pages, desc="  Fetching friends", unit="page") as pbar:
+        while True:
+            if page_num > 1:
+                await page.goto(f"{target_url}?page={page_num}", wait_until="domcontentloaded")
 
-            if await user_anchor.count() == 0 or await list_anchor.count() == 0:
-                continue
+            rows = await page.locator("#friendTable tbody tr").all()
+            if not rows:
+                pbar.update(total_pages - pbar.n)
+                break
 
-            user_href = await user_anchor.get_attribute("href")
-            list_href = await list_anchor.get_attribute("href")
-            username = await user_anchor.get_attribute("rel")
+            for row in rows:
+                user_anchor = row.locator('td a[href^="/user/show/"]').first
+                list_anchor = row.locator('a[href^="/review/list/"]').first
 
-            if not user_href or not list_href:
-                continue
+                if await user_anchor.count() == 0 or await list_anchor.count() == 0:
+                    continue
 
-            book_text = await list_anchor.inner_text()
-            book_match = re.search(r"(\d+)\s+books?", book_text, re.IGNORECASE)
-            book_count = int(book_match.group(1)) if book_match else 0
+                user_href = await user_anchor.get_attribute("href")
+                list_href = await list_anchor.get_attribute("href")
+                username = await user_anchor.get_attribute("rel")
 
-            if book_count == 0:
-                continue
+                if not user_href or not list_href:
+                    continue
 
-            friends.append(
-                {
-                    "user_id": parse_id_from_slug(user_href),
-                    "list_id": parse_id_from_slug(list_href),
-                    "username": username or "",
-                }
-            )
+                book_text = await list_anchor.inner_text()
+                book_match = re.search(r"(\d+)\s+books?", book_text, re.IGNORECASE)
+                book_count = int(book_match.group(1)) if book_match else 0
 
-        next_btn = page.locator("a.next_page").first
-        if await next_btn.count() > 0 and "disabled" not in (await next_btn.get_attribute("class") or ""):
-            page_num += 1
-            await asyncio.sleep(1)
-        else:
-            break
+                if book_count == 0:
+                    continue
+
+                friends.append(
+                    {
+                        "user_id": parse_id_from_slug(user_href),
+                        "list_id": parse_id_from_slug(list_href),
+                        "username": username or "",
+                    }
+                )
+
+            pbar.update(1)
+            next_btn = page.locator("a.next_page").first
+            if await next_btn.count() > 0 and "disabled" not in (await next_btn.get_attribute("class") or ""):
+                page_num += 1
+                await asyncio.sleep(1)
+            else:
+                break
 
     return friends
 
@@ -168,8 +185,8 @@ def upsert_readers(db_conn, main_user: dict, friends: list[dict]):
     )
     db_conn.executemany(
         """
-        INSERT OR IGNORE INTO readers (list_id, user_id, username, is_self)
-        VALUES (?, ?, ?, 0)
+        INSERT OR IGNORE INTO readers (list_id, user_id, username, is_self, scrape_complete)
+        VALUES (?, ?, ?, 0, 0)
         """,
         [(f["list_id"], f["user_id"], f["username"]) for f in friends],
     )
@@ -314,8 +331,7 @@ async def extract_friend_row(row, list_id):
     }
 
 
-async def process_list(db_conn, page, list_id, email, password, metadata_only=False):
-    print(f"  Scraping list {list_id} (metadata_only={metadata_only})...")
+async def process_list(db_conn, page, list_id, email, password, force_seed=False):
     page_num = 1
     total_rows = 0
     valid_page_parsed = False
@@ -339,85 +355,81 @@ async def process_list(db_conn, page, list_id, email, password, metadata_only=Fa
                     username = text
     if username or user_id:
         update_friend_info(db_conn, list_id, username, user_id)
-        print(f"    Updated metadata: {username} ({user_id})")
-
-    if metadata_only:
-        print(f"    Finished metadata-only scrape for {list_id}")
-        return
 
     existing_rows = load_existing_rows(db_conn, list_id)
-    while True:
-        await ensure_list_page(page, target_url, email, password)
-        await page.wait_for_selector("#booksBody", timeout=10000)
+    total_pages = await get_total_pages(page)
 
-        rows = await page.query_selector_all("tr.bookalike.review")
-        page_rows = []
-        page_all_known = bool(rows)
-        for row in rows:
-            try:
-                extracted = await extract_friend_row(row, list_id)
-                if not extracted:
+    with tqdm(total=total_pages, desc=f"  Scraping list {list_id}", unit="page") as pbar:
+        while True:
+            await ensure_list_page(page, target_url, email, password)
+            await page.wait_for_selector("#booksBody", timeout=10000)
+
+            rows = await page.query_selector_all("tr.bookalike.review")
+            page_rows = []
+            page_all_known = bool(rows)
+            for row in rows:
+                try:
+                    extracted = await extract_friend_row(row, list_id)
+                    if not extracted:
+                        page_all_known = False
+                        continue
+
+                    key = (extracted["list_id"], extracted["book_id"])
+                    if existing_rows.get(key) != extracted:
+                        page_all_known = False
+                    existing_rows[key] = extracted
+                    page_rows.append(extracted)
+                except Exception as e:
                     page_all_known = False
-                    continue
+                    tqdm.write(f"    Error parsing book in list {list_id}: {e}")
 
-                key = (extracted["list_id"], extracted["book_id"])
-                if existing_rows.get(key) != extracted:
-                    page_all_known = False
-                existing_rows[key] = extracted
-                page_rows.append(extracted)
-            except Exception as e:
-                page_all_known = False
-                print(f"    Error parsing book in list {list_id}: {e}")
+            if not page_rows:
+                raise RuntimeError(f"No valid rows parsed on page {page_num}")
 
-        if not page_rows:
-            raise RuntimeError(f"No valid rows parsed on page {page_num}")
+            valid_page_parsed = True
+            total_rows += len(page_rows)
+            upsert_extracted(db_conn, page_rows)
 
-        valid_page_parsed = True
-        total_rows += len(page_rows)
-        upsert_extracted(db_conn, page_rows)
+            pbar.update(1)
 
-        if page_all_known:
-            print(f"      P{page_num} unchanged, stopping early")
+            if page_all_known and not force_seed:
+                tqdm.write("  P1 unchanged, stopping early")
+                break
+
+            next_button = await page.query_selector("a.next_page")
+            next_class = await next_button.get_attribute("class") if next_button else ""
+            next_href = await next_button.get_attribute("href") if next_button else None
+            if next_button and next_href and "disabled" not in next_class:
+                target_url = urljoin(page.url, next_href)
+                async with page.expect_navigation():
+                    await next_button.click()
+                page_num += 1
+                await asyncio.sleep(1)
+                continue
+
             break
-
-        next_button = await page.query_selector("a.next_page")
-        next_class = await next_button.get_attribute("class") if next_button else ""
-        next_href = await next_button.get_attribute("href") if next_button else None
-        if next_button and next_href and "disabled" not in next_class:
-            target_url = urljoin(page.url, next_href)
-            async with page.expect_navigation():
-                await next_button.click()
-            print(f"      P{page_num}")
-            page_num += 1
-            await asyncio.sleep(1)
-            continue
-
-        print(f"    Finished {list_id}")
-        break
 
     if not valid_page_parsed:
         raise RuntimeError("No valid list page was parsed")
 
     mark_list_complete(db_conn, list_id)
-    print(f"  Processed list {list_id} ({total_rows} books)")
 
 
-def get_lists_to_scrape(db_conn, force_all):
-    if force_all:
-        cursor = db_conn.execute("SELECT list_id, 0 as metadata_only FROM readers")
+def get_lists_to_scrape(db_conn, force_seed):
+    if force_seed:
+        cursor = db_conn.execute("SELECT list_id FROM readers")
     else:
         cursor = db_conn.execute(
             """
-            SELECT list_id,
-                   (scrape_complete = 1 AND (username IS NULL OR user_id IS NULL)) as metadata_only
+            SELECT list_id
             FROM readers
-            WHERE scrape_complete != 1 OR username IS NULL OR user_id IS NULL
+            WHERE scrape_complete != 1
             """
         )
-    return [(row["list_id"], bool(row["metadata_only"])) for row in cursor.fetchall()]
+    return [row["list_id"] for row in cursor.fetchall()]
 
 
-async def scrape_reader_libraries(db_path=None, list_ids=None, force_all=False):
+async def scrape_reader_libraries(db_path=None, list_ids=None, force_seed=False):
     load_dotenv()
     db.init_db(db_path)
     email = os.getenv("GOODREADS_EMAIL")
@@ -425,7 +437,7 @@ async def scrape_reader_libraries(db_path=None, list_ids=None, force_all=False):
 
     with db.get_connection(db_path) as db_conn:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)
+            browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(user_agent=USER_AGENT)
             page = await context.new_page()
 
@@ -435,24 +447,28 @@ async def scrape_reader_libraries(db_path=None, list_ids=None, force_all=False):
                         "INSERT OR IGNORE INTO readers (list_id, is_self, scrape_complete) VALUES (?, 0, 0)",
                         (lid,),
                     )
+                    db_conn.execute(
+                        "UPDATE readers SET scrape_complete = 0 WHERE list_id = ?",
+                        (lid,),
+                    )
                 db_conn.commit()
+                to_scrape = list_ids
             else:
                 await page.goto(SIGNIN_URL)
                 await login_to_goodreads(page, email, password)
                 main_user = await extract_main_user(page)
                 friends = await fetch_friends(page, main_user["user_id"])
                 upsert_readers(db_conn, main_user, friends)
-
-            to_scrape = get_lists_to_scrape(db_conn, force_all)
+                to_scrape = get_lists_to_scrape(db_conn, force_seed)
 
             if not to_scrape:
-                print("  Friend lists already scraped. Use --force-all to re-scrape.")
+                print("  No new friends or incomplete lists to scrape. Use --force_seed to re-scrape.")
                 await browser.close()
                 return
 
-            print(f"  Scraping {len(to_scrape)} friend lists...")
+            print(f"  Scraping {len(to_scrape)} list(s)...")
 
-            for list_id, metadata_only in to_scrape:
+            for list_id in to_scrape:
                 try:
                     await process_list(
                         db_conn,
@@ -460,7 +476,7 @@ async def scrape_reader_libraries(db_path=None, list_ids=None, force_all=False):
                         list_id,
                         email,
                         password,
-                        metadata_only=metadata_only,
+                        force_seed=force_seed,
                     )
                 except Exception as e:
                     print(f"  Failed list {list_id}: {e}")

@@ -173,14 +173,12 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
         all_inputs = build_embedding_inputs(db_conn)
         if not all_inputs:
             print("  No books found. Run crawler first.")
-            db_conn.close()
             return
 
         missing_ids = find_books_needing_embeddings(db_conn, all_inputs, model)
 
         if not missing_ids:
             print(f"  Nothing to embed: all books have valid embeddings for model '{model}'.")
-            db_conn.close()
             return
 
         import hashlib
