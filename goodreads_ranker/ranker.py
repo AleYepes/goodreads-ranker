@@ -59,18 +59,18 @@ def normalize_model_params(params):
     return params
 
 
-def get_or_create_model_params(conn, name, defaults):
-    params = db.load_model_params(conn, name)
+def get_or_create_model_params(db_conn, name, defaults):
+    params = db.load_model_params(db_conn, name)
     if params is None:
         params = dict(defaults)
-        db.save_model_params(conn, name, params)
+        db.save_model_params(db_conn, name, params)
         return params
     params = normalize_model_params(params)
-    db.save_model_params(conn, name, params)
+    db.save_model_params(db_conn, name, params)
     return params
 
 
-def load_valid_embeddings_for_books(conn, books_df, model=None):
+def load_valid_embeddings_for_books(db_conn, books_df, model=None):
     import hashlib
     import os
 
@@ -79,13 +79,13 @@ def load_valid_embeddings_for_books(conn, books_df, model=None):
     if not model:
         model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
 
-    all_inputs = embedder.build_embedding_inputs(conn)
+    all_inputs = embedder.build_embedding_inputs(db_conn)
     input_hashes = {
         book_id: hashlib.md5(text.encode("utf-8")).hexdigest()
         for book_id, text in all_inputs.items()
     }
 
-    rows = conn.execute(
+    rows = db_conn.execute(
         """
         SELECT book_id, dim, vector, text_hash
         FROM embeddings
@@ -245,10 +245,10 @@ def compute_continuous(elo_df):
     return results
 
 
-def refine_ratings(target_df, rating_col, conn, interactive=False, title_col="title"):
+def refine_ratings(target_df, rating_col, db_conn, interactive=False, title_col="title"):
     target_clean = target_df.dropna(subset=[rating_col]).copy()
 
-    cursor = conn.execute(
+    cursor = db_conn.execute(
         "SELECT book_id, original_rating, elo_score, matches_played FROM elo_ratings"
     )
     rows = cursor.fetchall()
@@ -300,7 +300,7 @@ def refine_ratings(target_df, rating_col, conn, interactive=False, title_col="ti
             )
         )
     db.upsert_rows(
-        conn,
+        db_conn,
         "elo_ratings",
         db_rows,
         ["book_id", "original_rating", "elo_score", "matches_played"],
@@ -339,13 +339,13 @@ def calibrate_friend_ratings(overlap_df, clip_min, shrink_after=10):
 
 def get_similar_friend_ratings(
     books_df,
-    conn,
+    db_conn,
     embeddings,
     min_overlap=5,
     min_correlation=0.3,
     min_similar_friends=2,
 ):
-    cursor = conn.execute("SELECT list_id, book_id, rating FROM friend_ratings")
+    cursor = db_conn.execute("SELECT list_id, book_id, rating FROM friend_ratings")
     rows = cursor.fetchall()
     friends = pd.DataFrame([dict(r) for r in rows])
 
@@ -772,15 +772,15 @@ def run_optimized(best_params, books_df, precomputed_embeddings, training_col):
 
 def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     db.init_db(db_path)
-    conn = db.get_connection(db_path)
-    conn.execute("DELETE FROM predictions")
-    conn.commit()
+    db_conn = db.get_connection(db_path)
+    db_conn.execute("DELETE FROM predictions")
+    db_conn.commit()
 
-    cursor = conn.execute("SELECT * FROM books ORDER BY book_id")
+    cursor = db_conn.execute("SELECT * FROM books ORDER BY book_id")
     books_rows = cursor.fetchall()
     if not books_rows:
         print("No book records found in the books table. Run crawler first.")
-        conn.close()
+        db_conn.close()
         return
     books_df = pd.DataFrame([dict(r) for r in books_rows])
     books_df["description"] = (
@@ -791,11 +791,11 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         .str.strip()
     )
 
-    cursor = conn.execute("SELECT book_id, title, my_rating FROM user_library")
+    cursor = db_conn.execute("SELECT book_id, title, my_rating FROM user_library")
     library_rows = cursor.fetchall()
     if not library_rows:
         print("No user library records found. Run seeder first.")
-        conn.close()
+        db_conn.close()
         return
     gr_export = pd.DataFrame([dict(r) for r in library_rows])
     my_rating_series = cast(
@@ -804,7 +804,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     gr_export["my_rating"] = my_rating_series.replace(0, np.nan)
 
     print("  Running ELO ratings refinement...")
-    my_refined = refine_ratings(gr_export, "my_rating", conn, interactive=interactive)
+    my_refined = refine_ratings(gr_export, "my_rating", db_conn, interactive=interactive)
 
     books_df = books_df.merge(
         gr_export[["book_id", "my_rating"]], on="book_id", how="left"
@@ -813,7 +813,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
 
     print("  Loading valid embeddings...")
     has_embedding, embedded_embeddings, invalid_counts = (
-        load_valid_embeddings_for_books(conn, books_df, model=model)
+        load_valid_embeddings_for_books(db_conn, books_df, model=model)
     )
     excluded_count = int((~has_embedding).sum())
     if excluded_count:
@@ -827,7 +827,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         )
     if embedded_embeddings.size == 0:
         print("  No valid embeddings found. Run embedder before ranking.")
-        conn.close()
+        db_conn.close()
         return
 
     print("  Calibrating friend ratings...")
@@ -835,7 +835,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     embedded_books_df = books_df[has_embedding].copy().reset_index(drop=True)
 
     similar_friend_ratings, similar_friends, friend_scores = get_similar_friend_ratings(
-        embedded_books_df, conn, embedded_embeddings, min_correlation=0.3
+        embedded_books_df, db_conn, embedded_embeddings, min_correlation=0.3
     )
     friend_ratings_series = pd.Series(similar_friend_ratings)
     friend_ratings_dict = friend_ratings_series.to_dict()
@@ -850,7 +850,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     print("  Taste calibration")
     print(f"    My ratings ({my_rating_count})")
 
-    friend_meta = conn.execute("SELECT list_id, username FROM friend_lists").fetchall()
+    friend_meta = db_conn.execute("SELECT list_id, username FROM friend_lists").fetchall() ##
     list_to_user = {
         int(row["list_id"]): row["username"] or str(row["list_id"])
         for row in friend_meta
@@ -882,7 +882,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             "  Not enough rated books with valid embeddings to train ranking models "
             f"(training={train_size}, personal={solo_train_size})."
         )
-        conn.close()
+        db_conn.close()
         return
     mrl_dimensions = 32
     while mrl_dimensions * 2 < train_size:
@@ -926,15 +926,15 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         )
         friend_params = normalize_model_params(friend_params)
         solo_params = normalize_model_params(solo_params)
-        db.save_model_params(conn, "friend_params", friend_params)
-        db.save_model_params(conn, "solo_params", solo_params)
+        db.save_model_params(db_conn, "friend_params", friend_params)
+        db.save_model_params(db_conn, "solo_params", solo_params)
     else:
         print("  Using stored/default hyperparameters...")
         friend_params = get_or_create_model_params(
-            conn, "friend_params", DEFAULT_FRIEND_PARAMS
+            db_conn, "friend_params", DEFAULT_FRIEND_PARAMS
         )
         solo_params = get_or_create_model_params(
-            conn, "solo_params", DEFAULT_SOLO_PARAMS
+            db_conn, "solo_params", DEFAULT_SOLO_PARAMS
         )
 
     print("  Running ensemble models...")
@@ -1016,7 +1016,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         )
 
     db.upsert_rows(
-        conn,
+        db_conn,
         "predictions",
         predictions_data,
         [
@@ -1031,4 +1031,4 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     )
 
     print(f"  Saved predictions for {len(predictions_data)} books.")
-    conn.close()
+    db_conn.close()

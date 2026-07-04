@@ -115,47 +115,47 @@ CREATE TABLE IF NOT EXISTS model_params (
 def get_connection(db_path=None):
     path = Path(db_path) if db_path is not None else DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.row_factory = sqlite3.Row
-    return conn
+    db_conn = sqlite3.connect(str(path))
+    db_conn.execute("PRAGMA journal_mode=WAL")
+    db_conn.execute("PRAGMA synchronous=NORMAL")
+    db_conn.execute("PRAGMA foreign_keys=ON")
+    db_conn.row_factory = sqlite3.Row
+    return db_conn
 
 
 def init_db(db_path=None):
-    conn = get_connection(db_path)
-    ensure_schema_compat(conn)
-    conn.executescript(SCHEMA)
-    conn.commit()
-    conn.close()
+    db_conn = get_connection(db_path)
+    ensure_schema_compat(db_conn)
+    db_conn.executescript(SCHEMA)
+    db_conn.commit()
+    db_conn.close()
 
 
-def ensure_schema_compat(conn):
+def ensure_schema_compat(db_conn):
     existing = {
         row["name"]
-        for row in conn.execute(
+        for row in db_conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
     }
 
     if "books" in existing:
-        ensure_column(conn, "books", "date_last_scraped", "TEXT")
+        ensure_column(db_conn, "books", "date_last_scraped", "TEXT")
     if "friend_lists" in existing:
-        ensure_column(conn, "friend_lists", "username", "TEXT")
-        ensure_column(conn, "friend_lists", "href", "TEXT")
-        ensure_column(conn, "friend_lists", "scrape_error", "TEXT")
+        ensure_column(db_conn, "friend_lists", "username", "TEXT")
+        ensure_column(db_conn, "friend_lists", "href", "TEXT")
+        ensure_column(db_conn, "friend_lists", "scrape_error", "TEXT")
     if "embeddings" in existing:
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(embeddings)")}
+        columns = {row["name"] for row in db_conn.execute("PRAGMA table_info(embeddings)")}
         if "embedding_model" not in columns:
             print("Recreating empty embeddings table for new schema...")
-            conn.execute("DROP TABLE embeddings")
+            db_conn.execute("DROP TABLE embeddings")
 
 
-def ensure_column(conn, table, column, definition):
-    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+def ensure_column(db_conn, table, column, definition):
+    columns = {row["name"] for row in db_conn.execute(f"PRAGMA table_info({table})")}
     if column not in columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        db_conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def vector_to_blob(vec):
@@ -172,19 +172,19 @@ def is_valid_embedding_blob(blob, dim):
     return bool(vector.size and np.any(vector != 0))
 
 
-def save_model_params(conn, name, params):
-    conn.execute(
+def save_model_params(db_conn, name, params):
+    db_conn.execute(
         """
         INSERT OR REPLACE INTO model_params (name, params_json, updated_at)
         VALUES (?, ?, ?)
         """,
         (name, json.dumps(params, sort_keys=True), datetime.now().isoformat()),
     )
-    conn.commit()
+    db_conn.commit()
 
 
-def load_model_params(conn, name):
-    row = conn.execute(
+def load_model_params(db_conn, name):
+    row = db_conn.execute(
         "SELECT params_json FROM model_params WHERE name = ?", (name,)
     ).fetchone()
     if not row:
@@ -195,7 +195,7 @@ def load_model_params(conn, name):
         return None
 
 
-def save_embeddings(conn, book_ids, vectors, model, text_hashes):
+def save_embeddings(db_conn, book_ids, vectors, model, text_hashes):
     dim = vectors.shape[1]
     rows = []
     for i, bid in enumerate(book_ids):
@@ -207,26 +207,26 @@ def save_embeddings(conn, book_ids, vectors, model, text_hashes):
         )
         rows.append((bid_int, model, dim, vector_to_blob(vectors[i]), h))
 
-    conn.executemany(
+    db_conn.executemany(
         """
         INSERT OR REPLACE INTO embeddings (book_id, embedding_model, dim, vector, text_hash)
         VALUES (?, ?, ?, ?, ?)
         """,
         rows,
     )
-    conn.commit()
+    db_conn.commit()
 
 
-def upsert_rows(conn, table, rows, columns):
+def upsert_rows(db_conn, table, rows, columns):
     if not rows:
         return
     placeholders = ",".join("?" for _ in columns)
     col_names = ",".join(columns)
-    conn.executemany(
+    db_conn.executemany(
         f"INSERT OR REPLACE INTO {table} ({col_names}) VALUES ({placeholders})",
         rows,
     )
-    conn.commit()
+    db_conn.commit()
 
 
 def normalise_library_columns(df):

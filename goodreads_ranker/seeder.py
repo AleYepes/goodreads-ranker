@@ -188,16 +188,16 @@ async def extract_friend_row(row, list_id):
 
 async def download_user_library(email, password, db_path=None, force=False):
     db.init_db(db_path)
-    conn = db.get_connection(db_path)
+    db_conn = db.get_connection(db_path)
 
     if not force:
-        cursor = conn.execute("SELECT COUNT(*) FROM user_library")
+        cursor = db_conn.execute("SELECT COUNT(*) FROM user_library")
         count = cursor.fetchone()[0]
         if count > 0:
             print(
                 f"  Library already seeded ({count} books). Use --force to re-download."
             )
-            conn.close()
+            db_conn.close()
             return
 
     if not email or not password:
@@ -297,7 +297,7 @@ async def download_user_library(email, password, db_path=None, force=False):
         row_tuple = tuple(row.get(col) for col in columns)
         rows.append(row_tuple)
 
-    db.upsert_rows(conn, "user_library", rows, columns)
+    db.upsert_rows(db_conn, "user_library", rows, columns)
 
     print(f"  Imported {len(rows)} books into library.")
 
@@ -307,7 +307,7 @@ async def download_user_library(email, password, db_path=None, force=False):
     except OSError:
         pass
 
-    conn.close()
+    db_conn.close()
 
 
 async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=False):
@@ -315,22 +315,22 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
     db.init_db(db_path)
     email = os.getenv("GOODREADS_EMAIL")
     password = os.getenv("GOODREADS_PASSWORD")
-    conn = db.get_connection(db_path)
+    db_conn = db.get_connection(db_path)
 
     if friend_list_ids is None:
         friend_list_ids = DEFAULT_FRIEND_LIST_IDS
 
     for lid in friend_list_ids:
-        conn.execute(
+        db_conn.execute(
             "INSERT OR IGNORE INTO friend_lists (list_id, scrape_complete) VALUES (?, 0)",
             (lid,),
         )
-    conn.commit()
+    db_conn.commit()
 
     if force_all:
-        cursor = conn.execute("SELECT list_id, 0 as metadata_only FROM friend_lists")
+        cursor = db_conn.execute("SELECT list_id, 0 as metadata_only FROM friend_lists")
     else:
-        cursor = conn.execute(
+        cursor = db_conn.execute(
             """
             SELECT list_id,
                    (scrape_complete = 1 AND (username IS NULL OR href IS NULL)) as metadata_only
@@ -342,7 +342,7 @@ async def scrape_friend_ratings(db_path=None, friend_list_ids=None, force_all=Fa
     to_scrape = [
         (row["list_id"], bool(row["metadata_only"])) for row in cursor.fetchall()
     ]
-    conn.close()
+    db_conn.close()
 
     if not to_scrape:
         print("  Friend lists already scraped. Use --force-all to re-scrape.")

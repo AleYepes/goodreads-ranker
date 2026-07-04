@@ -26,10 +26,7 @@ MODAL_WATCH_SECONDS = 4
 MODAL_DISMISSED_WATCH_SECONDS = 1
 MODAL_POLL_MS = 250
 MODAL_CLOSE_ATTEMPTS = 3
-# MODAL_DISMISSED is intentionally a module-level flag: the Goodreads sign-in
-# modal only appears once per browser session, so once dismissed we can afford
-# a much shorter watch window for every subsequent book.
-MODAL_DISMISSED = False
+MODAL_DISMISSED = False # The modal appears once per session. Once dismissed, we can use a shorter watch window for subsequent books.
 
 SCORING_FUNCTIONS = {
     "Rating": lambda avg_rating, rating_count: (
@@ -74,19 +71,19 @@ def is_stale_scrape(value, now=None):
 
 
 def prep_crawl_heapq(scoring_func, limit=None, force_recrawl=False, db_path=None):
-    conn = db.get_connection(db_path)
+    db_conn = db.get_connection(db_path)
 
-    cursor = conn.execute("SELECT book_id FROM user_library WHERE book_id IS NOT NULL")
+    cursor = db_conn.execute("SELECT book_id FROM user_library WHERE book_id IS NOT NULL")
     seed_ids = {int(row["book_id"]) for row in cursor.fetchall()}
 
-    cursor = conn.execute(
+    cursor = db_conn.execute(
         "SELECT book_id FROM friend_ratings WHERE book_id IS NOT NULL"
     )
     seed_ids.update(int(row["book_id"]) for row in cursor.fetchall())
 
     include_expansion = limit is not None
 
-    cursor = conn.execute(
+    cursor = db_conn.execute(
         """
         SELECT book_id, similar_books, date_last_scraped
         FROM books
@@ -121,7 +118,7 @@ def prep_crawl_heapq(scoring_func, limit=None, force_recrawl=False, db_path=None
                         if existing is None or priority < existing:
                             crawl_queue[book_id] = priority
 
-    conn.close()
+    db_conn.close()
 
     crawl_queue = [
         (group, sort_score, book_id)
@@ -504,8 +501,7 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
         )
 
         async with async_playwright() as p:
-            # Goodreads only triggers the similar-books GraphQL request in headed Chromium.
-            browser = await p.chromium.launch(headless=False)
+            browser = await p.chromium.launch(headless=False) # Goodreads only triggers the similar-books GraphQL request in headed Chromium.
             context = await browser.new_context(user_agent=USER_AGENT)
             await context.route("**/*", block_media)
 
@@ -617,11 +613,7 @@ async def run_crawler(limit=None, concurrency=2, force_recrawl=False, db_path=No
                     task.cancel()
                 if active_tasks:
                     await asyncio.gather(*active_tasks, return_exceptions=True)
-                # Yield to the event loop so Playwright's internal abort futures
-                # (e.g. ERR_ABORTED from in-flight navigations that were cancelled)
-                # are retrieved before the browser tears down, preventing the
-                # "Future exception was never retrieved" asyncio warning.
-                await asyncio.sleep(0)
+                await asyncio.sleep(0) # Yield to event loop to clear Playwright abort futures and avoid asyncio warnings
                 await browser.close()
                 await asyncio.sleep(1)
 

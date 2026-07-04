@@ -129,12 +129,12 @@ class GoodreadsRankerCLI:
             print(f"Database not found at {path}.")
             return
 
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
+        db_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        db_conn.row_factory = sqlite3.Row
         try:
             tables = {
                 row["name"]
-                for row in conn.execute(
+                for row in db_conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
@@ -142,13 +142,13 @@ class GoodreadsRankerCLI:
             def table_count(table):
                 if table not in tables:
                     return 0
-                return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                return db_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
             def table_columns(table):
                 if table not in tables:
                     return set()
                 return {
-                    row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+                    row["name"] for row in db_conn.execute(f"PRAGMA table_info({table})")
                 }
 
             print("Row counts:")
@@ -167,7 +167,7 @@ class GoodreadsRankerCLI:
             incomplete_friends = 0
             friend_errors = 0
             if "friend_lists" in tables:
-                incomplete_friends = conn.execute(
+                incomplete_friends = db_conn.execute(
                     """
                     SELECT COUNT(*)
                     FROM friend_lists
@@ -175,7 +175,7 @@ class GoodreadsRankerCLI:
                     """
                 ).fetchone()[0]
                 if "scrape_error" in table_columns("friend_lists"):
-                    friend_errors = conn.execute(
+                    friend_errors = db_conn.execute(
                         """
                         SELECT COUNT(*)
                         FROM friend_lists
@@ -187,14 +187,14 @@ class GoodreadsRankerCLI:
             if "user_library" in tables:
                 seed_ids.update(
                     int(row["book_id"])
-                    for row in conn.execute(
+                    for row in db_conn.execute(
                         "SELECT book_id FROM user_library WHERE book_id IS NOT NULL"
                     )
                 )
             if "friend_ratings" in tables:
                 seed_ids.update(
                     int(row["book_id"])
-                    for row in conn.execute(
+                    for row in db_conn.execute(
                         "SELECT book_id FROM friend_ratings WHERE book_id IS NOT NULL"
                     )
                 )
@@ -202,7 +202,7 @@ class GoodreadsRankerCLI:
             if "books" in tables:
                 scraped_ids.update(
                     int(row["book_id"])
-                    for row in conn.execute(
+                    for row in db_conn.execute(
                         "SELECT book_id FROM books WHERE book_id IS NOT NULL"
                     )
                 )
@@ -212,7 +212,7 @@ class GoodreadsRankerCLI:
             invalid_embeddings = 0
             outdated_embeddings = 0
             if {"books", "embeddings"}.issubset(tables):
-                scraped_missing_embeddings = conn.execute(
+                scraped_missing_embeddings = db_conn.execute(
                     """
                     SELECT COUNT(*)
                     FROM books b
@@ -223,7 +223,7 @@ class GoodreadsRankerCLI:
                     (model,),
                 ).fetchone()[0]
                 # Invalid blob embeddings for this model
-                for row in conn.execute(
+                for row in db_conn.execute(
                     "SELECT dim, vector FROM embeddings WHERE embedding_model = ?",
                     (model,),
                 ):
@@ -238,7 +238,7 @@ class GoodreadsRankerCLI:
                     bid: hashlib.md5(text.encode("utf-8")).hexdigest()
                     for bid, text in all_inputs.items()
                 }
-                for row in conn.execute(
+                for row in db_conn.execute(
                     "SELECT book_id, text_hash FROM embeddings WHERE embedding_model = ?",
                     (model,),
                 ):
@@ -250,7 +250,7 @@ class GoodreadsRankerCLI:
             null_prediction_fields = 0
             unread_scored = 0
             if "predictions" in tables:
-                null_prediction_fields = conn.execute(
+                null_prediction_fields = db_conn.execute(
                     """
                     SELECT COUNT(*)
                     FROM predictions
@@ -261,7 +261,7 @@ class GoodreadsRankerCLI:
                     """
                 ).fetchone()[0]
                 if "user_library" in tables:
-                    unread_scored = conn.execute(
+                    unread_scored = db_conn.execute(
                         """
                         SELECT COUNT(*)
                         FROM predictions p
@@ -284,7 +284,7 @@ class GoodreadsRankerCLI:
             print(f"  null prediction-field rows: {null_prediction_fields}")
             print(f"  unread scored count: {unread_scored}")
         finally:
-            conn.close()
+            db_conn.close()
 
 
 def main():

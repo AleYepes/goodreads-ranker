@@ -89,8 +89,8 @@ def join_embedding_parts(title, authors, genres, desc):
     return text
 
 
-def build_embedding_inputs(conn):
-    cursor = conn.execute(
+def build_embedding_inputs(db_conn):
+    cursor = db_conn.execute(
         "SELECT book_id, title, authors, genres, description FROM books"
         " ORDER BY book_id"
     )
@@ -122,7 +122,7 @@ def build_embedding_inputs(conn):
     return inputs
 
 
-def find_books_needing_embeddings(conn, all_inputs, model):
+def find_books_needing_embeddings(db_conn, all_inputs, model):
     if not all_inputs:
         return []
 
@@ -133,7 +133,7 @@ def find_books_needing_embeddings(conn, all_inputs, model):
         for book_id, text in all_inputs.items()
     }
 
-    cursor = conn.execute(
+    cursor = db_conn.execute(
         """
         SELECT b.book_id,
                e.dim,
@@ -176,24 +176,24 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
     load_dotenv()
     db.init_db(db_path)
 
-    conn = db.get_connection(db_path)
+    db_conn = db.get_connection(db_path)
 
     if not model:
         model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
 
-    all_inputs = build_embedding_inputs(conn)
+    all_inputs = build_embedding_inputs(db_conn)
     if not all_inputs:
         print("  No books found. Run crawler first.")
-        conn.close()
+        db_conn.close()
         return
 
-    missing_ids = find_books_needing_embeddings(conn, all_inputs, model)
+    missing_ids = find_books_needing_embeddings(db_conn, all_inputs, model)
 
     if not missing_ids:
         print(
             f"  Nothing to embed: all books have valid embeddings for model '{model}'."
         )
-        conn.close()
+        db_conn.close()
         return
 
     import hashlib
@@ -215,11 +215,11 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
                     bid: hashlib.md5(all_inputs[bid].encode("utf-8")).hexdigest()
                     for bid in batch_ids
                 }
-                db.save_embeddings(conn, batch_ids, vectors, model, batch_hashes)
+                db.save_embeddings(db_conn, batch_ids, vectors, model, batch_hashes)
             except Exception as e:
                 print(
                     f"\n  Error generating embeddings for batch starting with book_id {batch_ids[0]}: {e}"
                 )
                 continue
 
-    conn.close()
+    db_conn.close()
