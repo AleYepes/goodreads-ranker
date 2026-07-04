@@ -2,13 +2,10 @@ import asyncio
 import contextlib
 import os
 import re
-import tempfile
 from datetime import datetime
-from pathlib import Path
+import select
 from urllib.parse import urljoin
 
-import numpy as np
-import pandas as pd
 from dotenv import load_dotenv
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -36,14 +33,6 @@ def clean_text(text):
     return text.strip().replace("\n", "") if text else ""
 
 
-def clean_isbn(val):
-    if isinstance(val, str):
-        if val.startswith('="') and val.endswith('"'):
-            return val[2:-1]
-        return val.strip()
-    return val
-
-
 def parse_id_from_slug(slug: str) -> int:
     match = re.search(r"(\d+)", slug.strip("/").split("/")[-1])
     if not match:
@@ -63,13 +52,13 @@ async def login_to_goodreads(page, email, password):
 
     async def wait_for_post_login(page):
         for selector in (
-            ".HeaderPrimaryNav",
             ".homePrimaryColumn",
         ):
             try:
                 await page.wait_for_selector(selector, timeout=15000)
                 return
             except PlaywrightTimeoutError:
+                print(f'wait_for_post_login - {selector}')
                 continue
 
         if await is_login_page(page):
@@ -166,6 +155,10 @@ async def fetch_friends(page, user_id: int) -> list[dict]:
 
 
 def upsert_readers(db_conn, main_user: dict, friends: list[dict]):
+    db_conn.execute(
+        "UPDATE readers SET is_self = 0 WHERE is_self = 1 AND list_id != ?",
+        (main_user["list_id"],),
+    )
     db_conn.execute(
         """
         INSERT OR REPLACE INTO readers (list_id, user_id, username, is_self)
@@ -321,117 +314,6 @@ async def extract_friend_row(row, list_id):
     }
 
 
-async def download_my_library(email, password, db_path=None, force=False):
-    db.init_db(db_path)
-
-    if not force:
-        with db.get_connection(db_path) as db_conn:
-            count = db_conn.execute("SELECT COUNT(*) FROM my_library").fetchone()[0]
-        if count > 0:
-            print(f"  Library already seeded ({count} books). Use --force to re-download.")
-            return
-
-    if not email or not password:
-        raise RuntimeError("GOODREADS_EMAIL and GOODREADS_PASSWORD must be set to download user library.")
-
-    print("  Logging into Goodreads to download library export...")
-
-    temp_dir = tempfile.mkdtemp()
-    temp_csv_path = Path(temp_dir) / "library_export.csv"
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent=USER_AGENT,
-            accept_downloads=True,
-        )
-        page = await context.new_page()
-
-        await page.goto(SIGNIN_URL)
-        await page.fill('input[type="email"]', email)
-        await page.fill('input[type="password"]', password)
-        await page.click('input[type="submit"]')
-
-        await page.wait_for_selector(".homePrimaryColumn", timeout=60000)
-        await page.goto("https://www.goodreads.com/review/import", wait_until="domcontentloaded")
-        await page.wait_for_selector(".js-LibraryExport", timeout=10000)
-
-        export_button = page.locator(".js-LibraryExport").first
-        while True:
-            if await export_button.is_visible():
-                await export_button.click()
-                break
-            await page.wait_for_timeout(500)
-
-        prepped_export_list = page.locator(".fileList")
-        for _ in range(240):
-            if await prepped_export_list.count() > 0 and await prepped_export_list.locator("a").count() > 0:
-                break
-            await page.wait_for_timeout(500)
-
-        async with page.expect_download() as download_info:
-            list_link = prepped_export_list.locator("a").first
-            await list_link.click()
-
-        download = await download_info.value
-        await download.save_as(str(temp_csv_path))
-        await browser.close()
-
-    print("  Export downloaded. Importing into database...")
-
-    df = pd.read_csv(temp_csv_path)
-    df = db.normalise_library_columns(df)
-
-    if "isbn" in df.columns:
-        df["isbn"] = df["isbn"].apply(clean_isbn)
-    if "isbn13" in df.columns:
-        df["isbn13"] = df["isbn13"].apply(clean_isbn)
-
-    df = df.replace({np.nan: None})
-
-    columns = [
-        "book_id",
-        "title",
-        "author",
-        "author_lf",
-        "additional_authors",
-        "isbn",
-        "isbn13",
-        "my_rating",
-        "publisher",
-        "binding",
-        "number_of_pages",
-        "year_published",
-        "original_publication_year",
-        "date_read",
-        "date_added",
-        "bookshelves",
-        "bookshelves_with_positions",
-        "exclusive_shelf",
-        "my_review",
-        "spoiler",
-        "private_notes",
-        "read_count",
-        "owned_copies",
-    ]
-
-    rows = []
-    for row in df.to_dict(orient="records"):
-        row_tuple = tuple(row.get(col) for col in columns)
-        rows.append(row_tuple)
-
-    with db.get_connection(db_path) as db_conn:
-        db.upsert_rows(db_conn, "my_library", rows, columns)
-        print(f"  Imported {len(rows)} books into library.")
-
-    try:
-        os.remove(temp_csv_path)
-        os.rmdir(temp_dir)
-    except OSError:
-        pass
-
-
 async def process_list(db_conn, page, list_id, email, password, metadata_only=False):
     print(f"  Scraping list {list_id} (metadata_only={metadata_only})...")
     page_num = 1
@@ -522,14 +404,14 @@ async def process_list(db_conn, page, list_id, email, password, metadata_only=Fa
 
 def get_lists_to_scrape(db_conn, force_all):
     if force_all:
-        cursor = db_conn.execute("SELECT list_id, 0 as metadata_only FROM readers WHERE is_self = 0")
+        cursor = db_conn.execute("SELECT list_id, 0 as metadata_only FROM readers")
     else:
         cursor = db_conn.execute(
             """
             SELECT list_id,
                    (scrape_complete = 1 AND (username IS NULL OR user_id IS NULL)) as metadata_only
             FROM readers
-            WHERE is_self = 0 AND (scrape_complete != 1 OR username IS NULL OR user_id IS NULL)
+            WHERE scrape_complete != 1 OR username IS NULL OR user_id IS NULL
             """
         )
     return [(row["list_id"], bool(row["metadata_only"])) for row in cursor.fetchall()]

@@ -173,8 +173,8 @@ def run_interactive_ranking(elo_df, titles, star_rating):
                 if index_a == index_b:
                     continue
 
-            title_a = titles.get(elo_df.at[index_a, "book_id"])
-            title_b = titles.get(elo_df.at[index_b, "book_id"])
+            title_a = titles.get(elo_df.at[index_a, "book_id"]) or f"Book {elo_df.at[index_a, 'book_id']}"
+            title_b = titles.get(elo_df.at[index_b, "book_id"]) or f"Book {elo_df.at[index_b, 'book_id']}"
 
             user_choice = input(f"[1] {title_a}\n[2] {title_b}\nChoose (1 or 2, 'q' to quit): ").strip().lower()
 
@@ -183,7 +183,6 @@ def run_interactive_ranking(elo_df, titles, star_rating):
             if user_choice not in ["1", "2"]:
                 continue
 
-            # Update Matches Played
             elo_df.loc[[index_a, index_b], "matches_played"] += 1
             current_min_matches = elo_df.loc[bucket_indices, "matches_played"].min()
             if current_min_matches > previous_min_matches:
@@ -219,7 +218,7 @@ def compute_continuous(elo_df):
     return results
 
 
-def refine_ratings(target_df, rating_col, db_conn, interactive=False, title_col="title"):
+def refine_ratings(target_df, rating_col, db_conn, interactive=False):
     target_clean = target_df.dropna(subset=[rating_col]).copy()
 
     cursor = db_conn.execute("SELECT book_id, original_rating, elo_score, matches_played FROM elo_ratings")
@@ -250,7 +249,7 @@ def refine_ratings(target_df, rating_col, db_conn, interactive=False, title_col=
     elo_df = elo_df.reset_index().rename(columns={"index": "book_id"})
 
     if interactive:
-        titles = dict(zip(target_df["book_id"], target_df[title_col], strict=False))
+        titles = dict(zip(target_df["book_id"], target_df["title"], strict=True))
         for star in sorted(target_clean[rating_col].unique(), reverse=True):
             elo_df = run_interactive_ranking(elo_df, titles, star)
 
@@ -312,7 +311,14 @@ def get_similar_friend_ratings(
     min_correlation=0.3,
     min_similar_friends=2,
 ):
-    cursor = db_conn.execute("SELECT list_id, book_id, rating FROM reader_libraries")
+    cursor = db_conn.execute(
+        """
+        SELECT rl.list_id, rl.book_id, rl.rating
+        FROM reader_libraries rl
+        JOIN readers r ON rl.list_id = r.list_id
+        WHERE r.is_self = 0
+        """
+    )
     rows = cursor.fetchall()
     friends = pd.DataFrame([dict(r) for r in rows])
 
@@ -579,7 +585,7 @@ def prep_optimization(
                 compute_score=True,
             )
             brr.fit(train_fold_embeddings, y_train)
-            brr_mu, brr_std = brr.predict(test_fold_embeddings, return_std=True)
+            brr_mu, brr_std = cast(tuple[np.ndarray, np.ndarray], brr.predict(test_fold_embeddings, return_std=True))
             brr_pred = brr_mu - (brr_uncertainty_penalty * brr_std)
 
             svr = SVR(kernel="rbf", gamma="scale", C=svr_regularization, epsilon=svr_epsilon)
@@ -598,7 +604,7 @@ def prep_optimization(
         y_preds = np.concatenate(y_preds)
 
         mse = mean_squared_error(y_reals, y_preds)
-        ndcg = ndcg_score([y_reals], [y_preds])
+        ndcg = ndcg_score(np.vstack([y_reals]), np.vstack([y_preds]))
         if np.std(y_preds) < 1e-9:
             spearman = 0
         else:
@@ -666,7 +672,7 @@ def run_optimized(best_params, books_df, precomputed_embeddings, training_col):
         compute_score=True,
     )
     brr.fit(train_embeddings, y_train)
-    brr_mu, brr_std = brr.predict(all_embeddings, return_std=True)
+    brr_mu, brr_std = cast(tuple[np.ndarray, np.ndarray], brr.predict(all_embeddings, return_std=True))
     brr_pred = brr_mu - (best_params["brr_uncertainty_penalty"] * brr_std)
 
     svr = SVR(
@@ -699,31 +705,45 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         db_conn.execute("DELETE FROM predictions")
         db_conn.commit()
 
+        try:
+            self_list_id = db.get_self_list_id(db_conn)
+        except RuntimeError:
+            print("No self reader found. Run seed first.")
+            return
+
         cursor = db_conn.execute("SELECT * FROM books ORDER BY book_id")
         books_rows = cursor.fetchall()
         if not books_rows:
             print("No book records found in the books table. Run crawler first.")
-            db_conn.close()
             return
-        books_df = pd.DataFrame([dict(r) for r in books_rows])
+
+        cursor = db_conn.execute(
+            """
+            SELECT b.*, l.rating AS my_rating
+            FROM books b
+            LEFT JOIN reader_libraries l
+                ON b.book_id = l.book_id AND l.list_id = ?
+            ORDER BY b.book_id
+            """,
+            (self_list_id,),
+        )
+        books_df = pd.DataFrame([dict(r) for r in cursor.fetchall()])
+        books_df["my_rating"] = pd.Series(
+            pd.to_numeric(books_df["my_rating"], errors="coerce"),
+            index=books_df.index,
+            name="my_rating",
+        ).replace(0, np.nan)
         books_df["description"] = (
             books_df["description"].fillna("").astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
         )
 
-        cursor = db_conn.execute("SELECT book_id, title, my_rating FROM my_library")
-        library_rows = cursor.fetchall()
-        if not library_rows:
-            print("No user library records found. Run seeder first.")
-            db_conn.close()
+        if books_df["my_rating"].notna().sum() == 0:
+            print("No self rating records found. Run seed first.")
             return
-        gr_export = pd.DataFrame([dict(r) for r in library_rows])
-        my_rating_series = cast(pd.Series, pd.to_numeric(gr_export["my_rating"], errors="coerce"))
-        gr_export["my_rating"] = my_rating_series.replace(0, np.nan)
 
         print("  Running ELO ratings refinement...")
-        my_refined = refine_ratings(gr_export, "my_rating", db_conn, interactive=interactive)
+        my_refined = refine_ratings(books_df, "my_rating", db_conn, interactive=interactive)
 
-        books_df = books_df.merge(gr_export[["book_id", "my_rating"]], on="book_id", how="left")
         books_df = books_df.merge(my_refined.rename("my_refined"), on="book_id", how="left")
 
         print("  Loading valid embeddings...")
@@ -742,7 +762,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             )
         if embedded_embeddings.size == 0:
             print("  No valid embeddings found. Run embedder before ranking.")
-            db_conn.close()
             return
 
         print("  Calibrating friend ratings...")
@@ -765,7 +784,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         print("  Taste calibration")
         print(f"    My ratings ({my_rating_count})")
 
-        friend_meta = db_conn.execute("SELECT list_id, username FROM readers WHERE is_self != 1").fetchall()  ##
+        friend_meta = db_conn.execute("SELECT list_id, username FROM readers WHERE is_self != 1").fetchall()
         list_to_user = {int(row["list_id"]): row["username"] or str(row["list_id"]) for row in friend_meta}
 
         if not friend_scores.empty:
@@ -790,7 +809,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                 "  Not enough rated books with valid embeddings to train ranking models "
                 f"(training={train_size}, personal={solo_train_size})."
             )
-            db_conn.close()
             return
         mrl_dimensions = 32
         while mrl_dimensions * 2 < train_size:

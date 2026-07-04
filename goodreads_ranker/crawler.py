@@ -74,11 +74,8 @@ def is_stale_scrape(value, now=None):
 
 def prep_crawl_heapq(scoring_func, limit=None, force_recrawl=False, db_path=None):
     with db.get_connection(db_path) as db_conn:
-        cursor = db_conn.execute("SELECT book_id FROM my_library WHERE book_id IS NOT NULL")
+        cursor = db_conn.execute("SELECT DISTINCT book_id FROM reader_libraries WHERE book_id IS NOT NULL")
         seed_ids = {int(row["book_id"]) for row in cursor.fetchall()}
-
-        cursor = db_conn.execute("SELECT book_id FROM reader_libraries WHERE book_id IS NOT NULL")
-        seed_ids.update(int(row["book_id"]) for row in cursor.fetchall())
 
         include_expansion = limit is not None
 
@@ -147,10 +144,7 @@ async def fetch_book(page, book_id, bad_book_ids):
         title = html.unescape(ld.get("name", ""))
         authors = "|".join(a["name"] for a in ld.get("author", []) if "name" in a)
         langs = ld.get("inLanguage")
-        if isinstance(langs, str):
-            langs = "|".join(lang.strip() for lang in langs.split(";"))
-        else:
-            langs = ""
+        langs = "|".join(lang.strip() for lang in langs.split(";")) if isinstance(langs, str) else ""
         return {
             "book_id": book_id,
             "title": title,

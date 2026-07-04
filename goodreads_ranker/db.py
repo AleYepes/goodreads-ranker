@@ -9,32 +9,6 @@ import numpy as np
 DB_PATH = Path("data/goodreads.db")
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS my_library (
-    book_id       INTEGER PRIMARY KEY,
-    title         TEXT,
-    author        TEXT,
-    author_lf     TEXT,
-    additional_authors TEXT,
-    isbn          TEXT,
-    isbn13        TEXT,
-    my_rating     REAL,
-    publisher     TEXT,
-    binding       TEXT,
-    number_of_pages INTEGER,
-    year_published INTEGER,
-    original_publication_year INTEGER,
-    date_read     TEXT,
-    date_added    TEXT,
-    bookshelves   TEXT,
-    bookshelves_with_positions TEXT,
-    exclusive_shelf TEXT,
-    my_review     TEXT,
-    spoiler       TEXT,
-    private_notes TEXT,
-    read_count    INTEGER,
-    owned_copies  INTEGER
-);
-
 CREATE TABLE IF NOT EXISTS readers (
     list_id            INTEGER PRIMARY KEY,
     username           TEXT,
@@ -111,6 +85,9 @@ CREATE TABLE IF NOT EXISTS model_params (
     params_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_readers_single_self
+ON readers(is_self) WHERE is_self = 1;
 """
 
 
@@ -137,10 +114,11 @@ def init_db(db_path=None):
 
 
 def ensure_schema_compat(db_conn):
+    db_conn.execute("DROP TABLE IF EXISTS my_library")
+    db_conn.execute("DROP TABLE IF EXISTS user_library")
+
     existing = {row["name"] for row in db_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 
-    if "user_library" in existing and "my_library" not in existing:
-        db_conn.execute("ALTER TABLE user_library RENAME TO my_library")
     if "friend_lists" in existing and "readers" not in existing:
         db_conn.execute("ALTER TABLE friend_lists RENAME TO readers")
     if "friend_ratings" in existing and "reader_libraries" not in existing:
@@ -236,12 +214,8 @@ def upsert_rows(db_conn, table, rows, columns):
     db_conn.commit()
 
 
-def normalise_library_columns(df):
-    rename = {}
-    for col in df.columns:
-        normalised = col.lower().replace(" ", "_")
-        if normalised == "author_l-f":
-            normalised = "author_lf"
-        rename[col] = normalised
-    df = df.rename(columns=rename)
-    return df
+def get_self_list_id(db_conn):
+    row = db_conn.execute("SELECT list_id FROM readers WHERE is_self = 1").fetchone()
+    if row is None:
+        raise RuntimeError("No self reader found. Run seeding first.")
+    return row["list_id"]
