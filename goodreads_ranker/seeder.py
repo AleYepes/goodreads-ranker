@@ -118,55 +118,47 @@ async def fetch_friends(page, user_id: int) -> list[dict]:
     page_num = 1
     target_url = f"https://www.goodreads.com/friend/user/{user_id}"
 
-    await page.goto(f"{target_url}?page={page_num}", wait_until="domcontentloaded")
-    total_pages = await get_total_pages(page)
+    while True:
+        await page.goto(f"{target_url}?page={page_num}", wait_until="domcontentloaded")
+        rows = await page.locator("#friendTable tbody tr").all()
+        if not rows:
+            break
 
-    with tqdm(total=total_pages, desc="  Fetching friends", unit="page") as pbar:
-        while True:
-            if page_num > 1:
-                await page.goto(f"{target_url}?page={page_num}", wait_until="domcontentloaded")
+        for row in rows:
+            user_anchor = row.locator('td a[href^="/user/show/"]').first
+            list_anchor = row.locator('a[href^="/review/list/"]').first
 
-            rows = await page.locator("#friendTable tbody tr").all()
-            if not rows:
-                pbar.update(total_pages - pbar.n)
-                break
+            if await user_anchor.count() == 0 or await list_anchor.count() == 0:
+                continue
 
-            for row in rows:
-                user_anchor = row.locator('td a[href^="/user/show/"]').first
-                list_anchor = row.locator('a[href^="/review/list/"]').first
+            user_href = await user_anchor.get_attribute("href")
+            list_href = await list_anchor.get_attribute("href")
+            username = await user_anchor.get_attribute("rel")
 
-                if await user_anchor.count() == 0 or await list_anchor.count() == 0:
-                    continue
+            if not user_href or not list_href:
+                continue
 
-                user_href = await user_anchor.get_attribute("href")
-                list_href = await list_anchor.get_attribute("href")
-                username = await user_anchor.get_attribute("rel")
+            book_text = await list_anchor.inner_text()
+            book_match = re.search(r"(\d+)\s+books?", book_text, re.IGNORECASE)
+            book_count = int(book_match.group(1)) if book_match else 0
 
-                if not user_href or not list_href:
-                    continue
+            if book_count == 0:
+                continue
 
-                book_text = await list_anchor.inner_text()
-                book_match = re.search(r"(\d+)\s+books?", book_text, re.IGNORECASE)
-                book_count = int(book_match.group(1)) if book_match else 0
+            friends.append(
+                {
+                    "user_id": parse_id_from_slug(user_href),
+                    "list_id": parse_id_from_slug(list_href),
+                    "username": username or "",
+                }
+            )
 
-                if book_count == 0:
-                    continue
-
-                friends.append(
-                    {
-                        "user_id": parse_id_from_slug(user_href),
-                        "list_id": parse_id_from_slug(list_href),
-                        "username": username or "",
-                    }
-                )
-
-            pbar.update(1)
-            next_btn = page.locator("a.next_page").first
-            if await next_btn.count() > 0 and "disabled" not in (await next_btn.get_attribute("class") or ""):
-                page_num += 1
-                await asyncio.sleep(1)
-            else:
-                break
+        next_btn = page.locator("a.next_page").first
+        if await next_btn.count() > 0 and "disabled" not in (await next_btn.get_attribute("class") or ""):
+            page_num += 1
+            await asyncio.sleep(1)
+        else:
+            break
 
     return friends
 
@@ -176,13 +168,23 @@ def upsert_readers(db_conn, main_user: dict, friends: list[dict]):
         "UPDATE readers SET is_self = 0 WHERE is_self = 1 AND list_id != ?",
         (main_user["list_id"],),
     )
+
     db_conn.execute(
         """
-        INSERT OR REPLACE INTO readers (list_id, user_id, username, is_self)
-        VALUES (?, ?, ?, 1)
+        INSERT OR IGNORE INTO readers (list_id, user_id, username, is_self, scrape_complete)
+        VALUES (?, ?, ?, 1, 0)
         """,
         (main_user["list_id"], main_user["user_id"], main_user["username"]),
     )
+    db_conn.execute(
+        """
+        UPDATE readers
+        SET user_id = ?, username = ?, is_self = 1
+        WHERE list_id = ?
+        """,
+        (main_user["user_id"], main_user["username"], main_user["list_id"]),
+    )
+
     db_conn.executemany(
         """
         INSERT OR IGNORE INTO readers (list_id, user_id, username, is_self, scrape_complete)
@@ -393,6 +395,7 @@ async def process_list(db_conn, page, list_id, email, password, force_seed=False
             pbar.update(1)
 
             if page_all_known and not force_seed:
+                pbar.leave = False
                 tqdm.write("  P1 unchanged, stopping early")
                 break
 

@@ -152,7 +152,7 @@ async def fetch_book(page, book_id, bad_book_ids):
             "avg_rating": agg_rating.get("ratingValue"),
             "review_count": agg_rating.get("reviewCount"),
             "num_pages": ld.get("numberOfPages"),
-            "style": langs,
+            "lang": langs,
         }
 
     async def extract_dom_data(page, book_data):
