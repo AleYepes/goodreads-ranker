@@ -1,11 +1,14 @@
 import asyncio
 import contextlib
 import os
+import random
 import re
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urljoin
 
 from dotenv import load_dotenv
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 from tqdm import tqdm
@@ -28,6 +31,19 @@ RATING_MAP = {
 LIST_SORT = "date_added"
 LIST_ORDER = "d"
 
+DATA_DIR = Path("data")
+STORAGE_STATE_PATH = DATA_DIR / "storage_state.json"
+
+CONCURRENCY = 3
+
+NAV_RETRY_ATTEMPTS = 3
+NAV_RETRY_BASE_DELAY = 2.0  # seconds; multiplied by attempt number
+
+JITTER_MIN = 0.5  # seconds
+JITTER_MAX = 2.0  # seconds
+
+BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
+
 
 def clean_text(text):
     return text.strip().replace("\n", "") if text else ""
@@ -38,6 +54,35 @@ def parse_id_from_slug(slug: str) -> int:
     if not match:
         raise ValueError(f"Could not parse numeric ID from slug: {slug}")
     return int(match.group(1))
+
+
+async def goto_with_retry(page, url, wait_until="domcontentloaded", retries=NAV_RETRY_ATTEMPTS):
+    """Navigate to url, retrying on transient failures with linear backoff."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            await page.goto(url, wait_until=wait_until)
+            return
+        except (PlaywrightTimeoutError, PlaywrightError) as exc:
+            last_exc = exc
+            delay = NAV_RETRY_BASE_DELAY * (attempt + 1)
+            tqdm.write(
+                f"  goto_with_retry: attempt {attempt + 1}/{retries} failed for {url!r}: {exc}. Retrying in {delay:.1f}s..."
+            )
+            await asyncio.sleep(delay)
+    raise last_exc
+
+
+async def save_storage_state(context):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    await context.storage_state(path=str(STORAGE_STATE_PATH))
+
+
+async def _block_heavy_resources(route):
+    if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+        await route.abort()
+    else:
+        await route.continue_()
 
 
 async def is_login_page(page):
@@ -69,7 +114,7 @@ async def login_to_goodreads(page, email, password):
         async with page.expect_navigation(wait_until="domcontentloaded"):
             await page.locator("button.authPortalSignInButton").click()
     elif await page.locator('input[type="email"]').count() == 0:
-        await page.goto(SIGNIN_URL, wait_until="domcontentloaded")
+        await goto_with_retry(page, SIGNIN_URL)
 
     await page.wait_for_selector('input[type="email"]', timeout=30000)
     await page.fill('input[type="email"]', email)
@@ -77,6 +122,8 @@ async def login_to_goodreads(page, email, password):
     await page.click('input[type="submit"]')
     await page.wait_for_load_state("domcontentloaded")
     await wait_for_post_login(page)
+
+    await save_storage_state(page.context)
 
 
 async def extract_main_user(page):
@@ -113,19 +160,42 @@ async def get_total_pages(page) -> int:
     return 1
 
 
-async def fetch_friends(page, user_id: int) -> list[dict]:
+async def fetch_friends(page, user_id: int, email: str = None, password: str = None) -> list[dict]:
     friends = []
     page_num = 1
     target_url = f"https://www.goodreads.com/friend/user/{user_id}"
 
     while True:
-        await page.goto(f"{target_url}?page={page_num}", wait_until="domcontentloaded")
+        url = f"{target_url}?page={page_num}"
+        await goto_with_retry(page, url)
+
+        # The friends page may redirect to a login/signup page in headless mode
+        # even when the session appears active. Re-authenticate and retry.
+        if await is_login_page(page):
+            print("  fetch_friends: redirected to login page — re-authenticating...")
+            if not email or not password:
+                raise RuntimeError("Session lost on friends page and no credentials available to re-login.")
+            await login_to_goodreads(page, email, password)
+            await goto_with_retry(page, url)
+
+        # Wait explicitly for the friend table; surface a clear error if absent.
+        try:
+            await page.wait_for_selector("#friendTable", timeout=10000)
+        except PlaywrightTimeoutError:
+            print(
+                f"  fetch_friends: #friendTable not found on page {page_num} "
+                f"(current URL: {page.url}). Stopping pagination."
+            )
+            break
+
         rows = await page.locator("#friendTable tbody tr").all()
         if not rows:
             break
 
         for row in rows:
-            user_anchor = row.locator('td a[href^="/user/show/"]').first
+            # Use rel="acquaintance" to target the text link (not the image link,
+            # which also matches 'td a[href^="/user/show/"]' and appears first).
+            user_anchor = row.locator('a[href^="/user/show/"][rel="acquaintance"]').first
             list_anchor = row.locator('a[href^="/review/list/"]').first
 
             if await user_anchor.count() == 0 or await list_anchor.count() == 0:
@@ -133,13 +203,16 @@ async def fetch_friends(page, user_id: int) -> list[dict]:
 
             user_href = await user_anchor.get_attribute("href")
             list_href = await list_anchor.get_attribute("href")
-            username = await user_anchor.get_attribute("rel")
+            # Username is the anchor's inner text, not its rel attribute.
+            username = clean_text(await user_anchor.inner_text())
 
             if not user_href or not list_href:
                 continue
 
             book_text = await list_anchor.inner_text()
-            book_match = re.search(r"(\d+)\s+books?", book_text, re.IGNORECASE)
+            # Strip commas so "1,283 books" is parsed as 1283, not 283.
+            book_text_clean = book_text.replace(",", "")
+            book_match = re.search(r"(\d+)\s+books?", book_text_clean, re.IGNORECASE)
             book_count = int(book_match.group(1)) if book_match else 0
 
             if book_count == 0:
@@ -149,17 +222,18 @@ async def fetch_friends(page, user_id: int) -> list[dict]:
                 {
                     "user_id": parse_id_from_slug(user_href),
                     "list_id": parse_id_from_slug(list_href),
-                    "username": username or "",
+                    "username": username,
                 }
             )
 
         next_btn = page.locator("a.next_page").first
         if await next_btn.count() > 0 and "disabled" not in (await next_btn.get_attribute("class") or ""):
             page_num += 1
-            await asyncio.sleep(1)
+            await asyncio.sleep(random.uniform(JITTER_MIN, JITTER_MAX))
         else:
             break
 
+    print(f"  fetch_friends: found {len(friends)} friend(s) with books.")
     return friends
 
 
@@ -285,12 +359,12 @@ def upsert_extracted(db_conn, rows):
 
 async def open_list_page(page, list_id, email, password):
     url = f"https://www.goodreads.com/review/list/{list_id}?print=true&sort={LIST_SORT}&order={LIST_ORDER}&view=reviews"
-    await page.goto(url, wait_until="domcontentloaded")
+    await goto_with_retry(page, url)
 
     if await is_login_page(page):
         print("Login required. Authenticating session...")
         await login_to_goodreads(page, email, password)
-        await page.goto(url, wait_until="domcontentloaded")
+        await goto_with_retry(page, url)
 
     return url
 
@@ -299,7 +373,7 @@ async def ensure_list_page(page, target_url, email, password):
     if await is_login_page(page):
         print("Login required. Authenticating session...")
         await login_to_goodreads(page, email, password)
-        await page.goto(target_url, wait_until="domcontentloaded")
+        await goto_with_retry(page, target_url)
 
 
 async def extract_friend_row(row, list_id):
@@ -359,58 +433,55 @@ async def process_list(db_conn, page, list_id, email, password, force_seed=False
         update_friend_info(db_conn, list_id, username, user_id)
 
     existing_rows = load_existing_rows(db_conn, list_id)
-    total_pages = await get_total_pages(page)
 
-    with tqdm(total=total_pages, desc=f"  Scraping list {list_id}", unit="page") as pbar:
-        while True:
-            await ensure_list_page(page, target_url, email, password)
-            await page.wait_for_selector("#booksBody", timeout=10000)
+    while True:
+        await ensure_list_page(page, target_url, email, password)
+        await page.wait_for_selector("#booksBody", timeout=10000)
 
-            rows = await page.query_selector_all("tr.bookalike.review")
-            page_rows = []
-            page_all_known = bool(rows)
-            for row in rows:
-                try:
-                    extracted = await extract_friend_row(row, list_id)
-                    if not extracted:
-                        page_all_known = False
-                        continue
-
-                    key = (extracted["list_id"], extracted["book_id"])
-                    if existing_rows.get(key) != extracted:
-                        page_all_known = False
-                    existing_rows[key] = extracted
-                    page_rows.append(extracted)
-                except Exception as e:
+        rows = await page.query_selector_all("tr.bookalike.review")
+        page_rows = []
+        page_all_known = bool(rows)
+        for row in rows:
+            try:
+                extracted = await extract_friend_row(row, list_id)
+                if not extracted:
                     page_all_known = False
-                    tqdm.write(f"    Error parsing book in list {list_id}: {e}")
+                    continue
 
-            if not page_rows:
-                raise RuntimeError(f"No valid rows parsed on page {page_num}")
+                key = (extracted["list_id"], extracted["book_id"])
+                if existing_rows.get(key) != extracted:
+                    page_all_known = False
+                existing_rows[key] = extracted
+                page_rows.append(extracted)
+            except Exception as e:
+                page_all_known = False
+                tqdm.write(f"    Error parsing book in list {list_id}: {e}")
 
-            valid_page_parsed = True
-            total_rows += len(page_rows)
-            upsert_extracted(db_conn, page_rows)
+        if not page_rows:
+            raise RuntimeError(f"No valid rows parsed on page {page_num}")
 
-            pbar.update(1)
+        valid_page_parsed = True
+        total_rows += len(page_rows)
+        upsert_extracted(db_conn, page_rows)
 
-            if page_all_known and not force_seed:
-                pbar.leave = False
-                tqdm.write("  P1 unchanged, stopping early")
-                break
+        tqdm.write(f"  [{list_id}] page {page_num} done ({len(page_rows)} rows)")
 
-            next_button = await page.query_selector("a.next_page")
-            next_class = await next_button.get_attribute("class") if next_button else ""
-            next_href = await next_button.get_attribute("href") if next_button else None
-            if next_button and next_href and "disabled" not in next_class:
-                target_url = urljoin(page.url, next_href)
-                async with page.expect_navigation():
-                    await next_button.click()
-                page_num += 1
-                await asyncio.sleep(1)
-                continue
-
+        if page_all_known and not force_seed:
+            tqdm.write("  P1 unchanged, stopping early")
             break
+
+        next_button = await page.query_selector("a.next_page")
+        next_class = await next_button.get_attribute("class") if next_button else ""
+        next_href = await next_button.get_attribute("href") if next_button else None
+        if next_button and next_href and "disabled" not in next_class:
+            target_url = urljoin(page.url, next_href)
+            async with page.expect_navigation():
+                await next_button.click()
+            page_num += 1
+            await asyncio.sleep(random.uniform(JITTER_MIN, JITTER_MAX))
+            continue
+
+        break
 
     if not valid_page_parsed:
         raise RuntimeError("No valid list page was parsed")
@@ -441,8 +512,14 @@ async def scrape_reader_libraries(db_path=None, list_ids=None, force_seed=False)
     with db.get_connection(db_path) as db_conn:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(user_agent=USER_AGENT)
-            page = await context.new_page()
+
+            context_kwargs = {"user_agent": USER_AGENT}
+            if STORAGE_STATE_PATH.exists():
+                context_kwargs["storage_state"] = str(STORAGE_STATE_PATH)
+            context = await browser.new_context(**context_kwargs)
+            await context.route("**/*", _block_heavy_resources)
+
+            setup_page = await context.new_page()
 
             if list_ids is not None:
                 for lid in list_ids:
@@ -455,36 +532,50 @@ async def scrape_reader_libraries(db_path=None, list_ids=None, force_seed=False)
                         (lid,),
                     )
                 db_conn.commit()
-                to_scrape = list_ids
             else:
-                await page.goto(SIGNIN_URL)
-                await login_to_goodreads(page, email, password)
-                main_user = await extract_main_user(page)
-                friends = await fetch_friends(page, main_user["user_id"])
+                await goto_with_retry(setup_page, SIGNIN_URL)
+                await login_to_goodreads(setup_page, email, password)
+                main_user = await extract_main_user(setup_page)
+                friends = await fetch_friends(setup_page, main_user["user_id"], email=email, password=password)
                 upsert_readers(db_conn, main_user, friends)
-                to_scrape = get_lists_to_scrape(db_conn, force_seed)
+
+            to_scrape = get_lists_to_scrape(db_conn, force_seed)
 
             if not to_scrape:
                 print("  No new friends or incomplete lists to scrape. Use --force_seed to re-scrape.")
                 await browser.close()
                 return
 
-            print(f"  Scraping {len(to_scrape)} list(s)...")
+            worker_count = min(CONCURRENCY, len(to_scrape))
 
+            # setup_page is reused as worker #1 — do not close/discard it.
+            worker_pages = [setup_page]
+            for _ in range(worker_count - 1):
+                worker_pages.append(await context.new_page())
+
+            queue = asyncio.Queue()
             for list_id in to_scrape:
-                try:
-                    await process_list(
-                        db_conn,
-                        page,
-                        list_id,
-                        email,
-                        password,
-                        force_seed=force_seed,
-                    )
-                except Exception as e:
-                    print(f"  Failed list {list_id}: {e}")
-                    mark_list_failed(db_conn, list_id, e)
-                    with contextlib.suppress(Exception):
-                        await page.goto("about:blank")
+                queue.put_nowait(list_id)
+
+            pbar = tqdm(total=len(to_scrape), desc="Scraping friend libraries", unit="list")
+
+            async def list_worker(page):
+                while True:
+                    try:
+                        list_id = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        await process_list(db_conn, page, list_id, email, password, force_seed=force_seed)
+                    except Exception as e:
+                        tqdm.write(f"  Failed list {list_id}: {e}")
+                        mark_list_failed(db_conn, list_id, e)
+                        with contextlib.suppress(Exception):
+                            await page.goto("about:blank")
+                    finally:
+                        pbar.update(1)
+
+            await asyncio.gather(*(list_worker(wp) for wp in worker_pages))
+            pbar.close()
 
             await browser.close()
