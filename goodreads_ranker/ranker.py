@@ -77,17 +77,17 @@ def load_valid_embeddings_for_books(db_conn, books_df, model=None):
         model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
 
     all_inputs = embedder.build_embedding_inputs(db_conn)
-    input_hashes = {book_id: hashlib.md5(text.encode("utf-8")).hexdigest() for book_id, text in all_inputs.items()}
+    input_hashes = {legacy_id: hashlib.md5(text.encode("utf-8")).hexdigest() for legacy_id, text in all_inputs.items()}
 
     rows = db_conn.execute(
         """
-        SELECT book_id, dim, vector, text_hash
+        SELECT legacy_id, dim, vector, text_hash
         FROM embeddings
         WHERE embedding_model = ?
         """,
         (model,),
     ).fetchall()
-    embedding_rows = {int(row["book_id"]): row for row in rows}
+    embedding_rows = {int(row["legacy_id"]): row for row in rows}
 
     counts = {
         "missing": 0,
@@ -99,8 +99,8 @@ def load_valid_embeddings_for_books(db_conn, books_df, model=None):
     valid_mask = []
     expected_dim = None
 
-    for book_id in books_df["book_id"]:
-        bid = int(book_id)
+    for legacy_id in books_df["legacy_id"]:
+        bid = int(legacy_id)
         row = embedding_rows.get(bid)
         if not row or row["vector"] is None:
             counts["missing"] += 1
@@ -173,8 +173,8 @@ def run_interactive_ranking(elo_df, titles, star_rating):
                 if index_a == index_b:
                     continue
 
-            title_a = titles.get(elo_df.at[index_a, "book_id"]) or f"Book {elo_df.at[index_a, 'book_id']}"
-            title_b = titles.get(elo_df.at[index_b, "book_id"]) or f"Book {elo_df.at[index_b, 'book_id']}"
+            title_a = titles.get(elo_df.at[index_a, "legacy_id"]) or f"Book {elo_df.at[index_a, 'legacy_id']}"
+            title_b = titles.get(elo_df.at[index_b, "legacy_id"]) or f"Book {elo_df.at[index_b, 'legacy_id']}"
 
             user_choice = input(f"[1] {title_a}\n[2] {title_b}\nChoose (1 or 2, 'q' to quit): ").strip().lower()
 
@@ -214,27 +214,27 @@ def compute_continuous(elo_df):
             results.loc[mask] = (stars + (norm * 0.99) - 0.5).to_numpy(copy=True)
         else:
             results.loc[mask] = float(stars)
-    results.index = elo_df["book_id"]
+    results.index = elo_df["legacy_id"]
     return results
 
 
 def refine_ratings(target_df, rating_col, db_conn, interactive=False):
     target_clean = target_df.dropna(subset=[rating_col]).copy()
 
-    cursor = db_conn.execute("SELECT book_id, original_rating, elo_score, matches_played FROM elo_ratings")
+    cursor = db_conn.execute("SELECT legacy_id, original_rating, elo_score, matches_played FROM elo_ratings")
     rows = cursor.fetchall()
 
     if rows:
         elo_df = pd.DataFrame([dict(r) for r in rows])
     else:
-        elo_df = pd.DataFrame(columns=["book_id", "original_rating", "elo_score", "matches_played"])
+        elo_df = pd.DataFrame(columns=["legacy_id", "original_rating", "elo_score", "matches_played"])
 
-    elo_df = elo_df.set_index("book_id")
+    elo_df = elo_df.set_index("legacy_id")
 
-    common_books = elo_df.index.intersection(target_clean["book_id"])
-    elo_df.loc[common_books, "original_rating"] = target_clean.set_index("book_id").loc[common_books, rating_col]
+    common_books = elo_df.index.intersection(target_clean["legacy_id"])
+    elo_df.loc[common_books, "original_rating"] = target_clean.set_index("legacy_id").loc[common_books, rating_col]
 
-    new_books = target_clean[~target_clean["book_id"].isin(elo_df.index)]
+    new_books = target_clean[~target_clean["legacy_id"].isin(elo_df.index)]
     if not new_books.empty:
         new_entries = pd.DataFrame(
             {
@@ -242,14 +242,14 @@ def refine_ratings(target_df, rating_col, db_conn, interactive=False):
                 "elo_score": 1200.0,
                 "matches_played": 0,
             },
-            index=new_books["book_id"],
+            index=new_books["legacy_id"],
         )
         elo_df = pd.concat([elo_df, new_entries])
 
-    elo_df = elo_df.reset_index().rename(columns={"index": "book_id"})
+    elo_df = elo_df.reset_index().rename(columns={"index": "legacy_id"})
 
     if interactive:
-        titles = dict(zip(target_df["book_id"], target_df["title"], strict=True))
+        titles = dict(zip(target_df["legacy_id"], target_df["title"], strict=True))
         for star in sorted(target_clean[rating_col].unique(), reverse=True):
             elo_df = run_interactive_ranking(elo_df, titles, star)
 
@@ -257,7 +257,7 @@ def refine_ratings(target_df, rating_col, db_conn, interactive=False):
     for row in elo_df.to_dict(orient="records"):
         db_rows.append(
             (
-                int(row["book_id"]),
+                int(row["legacy_id"]),
                 float(row["original_rating"])
                 if row["original_rating"] is not None and pd.notna(row["original_rating"])
                 else None,
@@ -269,7 +269,7 @@ def refine_ratings(target_df, rating_col, db_conn, interactive=False):
         db_conn,
         "elo_ratings",
         db_rows,
-        ["book_id", "original_rating", "elo_score", "matches_played"],
+        ["legacy_id", "original_rating", "elo_score", "matches_played"],
     )
 
     return compute_continuous(elo_df)
@@ -328,26 +328,26 @@ def get_similar_friend_ratings(
     friends["rating"] = friends["rating"].astype("UInt8").replace(0, np.nan)
     friends["list_id"] = friends["list_id"].astype(str)
 
-    current_book_ids = books_df["book_id"].to_numpy()
+    current_book_ids = books_df["legacy_id"].to_numpy()
     current_book_id_set = set(current_book_ids.tolist())
-    friends_df = cast(pd.DataFrame, friends[friends["book_id"].isin(list(current_book_id_set))])
+    friends_df = cast(pd.DataFrame, friends[friends["legacy_id"].isin(list(current_book_id_set))])
     friends = cast(pd.DataFrame, friends_df.dropna(subset=["rating"]).copy())
     friends = cast(
         pd.DataFrame,
-        friends.groupby(["list_id", "book_id"], as_index=False)["rating"].mean(),
+        friends.groupby(["list_id", "legacy_id"], as_index=False)["rating"].mean(),
     )
 
-    my_books = books_df[["book_id", "my_refined"]].dropna().copy()
-    my_book_id_set = set(my_books["book_id"].tolist())
-    my_lookup = my_books.set_index("book_id")["my_refined"]
+    my_books = books_df[["legacy_id", "my_refined"]].dropna().copy()
+    my_legacy_id_set = set(my_books["legacy_id"].tolist())
+    my_lookup = my_books.set_index("legacy_id")["my_refined"]
     clip_min = float(my_lookup.min())
     clip_max = float(my_lookup.max())
 
     embedding_matrix = np.asarray(embeddings)
-    book_id_to_idx = {book_id: i for i, book_id in enumerate(current_book_ids)}
+    legacy_id_to_idx = {legacy_id: i for i, legacy_id in enumerate(current_book_ids)}
 
-    my_train_ids = my_books["book_id"].to_numpy()
-    embeddings_me = embedding_matrix[[book_id_to_idx[bid] for bid in my_train_ids]]
+    my_train_ids = my_books["legacy_id"].to_numpy()
+    embeddings_me = embedding_matrix[[legacy_id_to_idx[bid] for bid in my_train_ids]]
     y_me = my_lookup.loc[my_train_ids].to_numpy(copy=True)
     knn_me_k = min(max(2, int(np.sqrt(len(my_books)))), len(my_books))
     knn_me = KNeighborsRegressor(n_neighbors=knn_me_k, metric="cosine", weights="distance", n_jobs=-1)
@@ -357,7 +357,7 @@ def get_similar_friend_ratings(
     calibrated_friend_rows = []
 
     for list_id, friend_df in friends.groupby("list_id"):
-        overlap = friend_df.merge(my_books, on="book_id", how="inner").dropna(subset=["rating", "my_refined"]).copy()
+        overlap = friend_df.merge(my_books, on="legacy_id", how="inner").dropna(subset=["rating", "my_refined"]).copy()
         overlap_count = len(overlap)
         if overlap_count < min_overlap:
             continue
@@ -373,10 +373,10 @@ def get_similar_friend_ratings(
         )
         calibrated_friend_rows.append(friend_df)
 
-        overlap_ids = set(overlap["book_id"].tolist())
-        friend_book_id_set = set(friend_df["book_id"].tolist())
-        my_only_ids = sorted(my_book_id_set - overlap_ids)
-        friend_only_ids = sorted(friend_book_id_set - overlap_ids)
+        overlap_ids = set(overlap["legacy_id"].tolist())
+        friend_legacy_id_set = set(friend_df["legacy_id"].tolist())
+        my_only_ids = sorted(my_legacy_id_set - overlap_ids)
+        friend_only_ids = sorted(friend_legacy_id_set - overlap_ids)
 
         calibrated_overlap = np.clip(
             slope * overlap["rating"].astype(float).to_numpy(copy=True) + intercept,
@@ -389,25 +389,25 @@ def get_similar_friend_ratings(
         raw_corr = safe_spearman(my_union[0], friend_union[0])
 
         if my_only_ids and len(friend_df) >= 2:
-            friend_indexed = friend_df.set_index("book_id")
-            embeddings_friend = embedding_matrix[[book_id_to_idx[bid] for bid in friend_df["book_id"]]]
-            y_friend = friend_indexed.loc[friend_df["book_id"], "calibrated_rating"].to_numpy(copy=True)
+            friend_indexed = friend_df.set_index("legacy_id")
+            embeddings_friend = embedding_matrix[[legacy_id_to_idx[bid] for bid in friend_df["legacy_id"]]]
+            y_friend = friend_indexed.loc[friend_df["legacy_id"], "calibrated_rating"].to_numpy(copy=True)
 
             knn_friend_k = min(max(2, int(np.sqrt(len(friend_df)))), len(friend_df))
             knn_friend = KNeighborsRegressor(n_neighbors=knn_friend_k, metric="cosine", weights="distance", n_jobs=-1)
             knn_friend.fit(embeddings_friend, y_friend)
 
-            embeddings_my_only = embedding_matrix[[book_id_to_idx[bid] for bid in my_only_ids]]
+            embeddings_my_only = embedding_matrix[[legacy_id_to_idx[bid] for bid in my_only_ids]]
             predicted_friend = knn_friend.predict(embeddings_my_only)
 
             my_union.append(my_lookup.loc[my_only_ids].to_numpy(copy=True))
             friend_union.append(predicted_friend)
 
         if friend_only_ids:
-            embeddings_friend_only = embedding_matrix[[book_id_to_idx[bid] for bid in friend_only_ids]]
+            embeddings_friend_only = embedding_matrix[[legacy_id_to_idx[bid] for bid in friend_only_ids]]
             predicted_me = knn_me.predict(embeddings_friend_only)
 
-            friend_indexed = friend_df.set_index("book_id")
+            friend_indexed = friend_df.set_index("legacy_id")
             real_friend = friend_indexed.loc[friend_only_ids, "calibrated_rating"].to_numpy(copy=True)
 
             my_union.append(predicted_me)
@@ -462,7 +462,7 @@ def get_similar_friend_ratings(
         how="inner",
     )
     similar_friend_ratings = similar_friend_ratings[
-        ~similar_friend_ratings["book_id"].isin(list(my_book_id_set))
+        ~similar_friend_ratings["legacy_id"].isin(list(my_legacy_id_set))
     ].copy()
     if similar_friend_ratings.empty:
         return pd.Series(dtype=float), similar_friends, friend_scores
@@ -471,7 +471,7 @@ def get_similar_friend_ratings(
         similar_friend_ratings["calibrated_rating"] * similar_friend_ratings["friend_weight"]
     )
     similar_friend_ratings = pd.DataFrame(
-        similar_friend_ratings.groupby("book_id").agg(
+        similar_friend_ratings.groupby("legacy_id").agg(
             weighted_rating=("weighted_rating", "sum"),
             total_weight=("friend_weight", "sum"),
             supporting_friends=("list_id", "nunique"),
@@ -486,12 +486,12 @@ def get_similar_friend_ratings(
 
 
 def build_adjacency_matrix(books_df, num_nodes):
-    id_to_idx = {int(bid): i for i, bid in enumerate(books_df["book_id"])}
+    id_to_idx = {int(bid): i for i, bid in enumerate(books_df["legacy_id"])}
     book_ids_set = set(id_to_idx.keys())
 
     edge_indices = []
     for row in books_df.to_dict(orient="records"):
-        current_idx = id_to_idx[int(row["book_id"])]
+        current_idx = id_to_idx[int(row["legacy_id"])]
         similar_books_str = row["similar_books"]
         if not isinstance(similar_books_str, str) or not similar_books_str:
             continue
@@ -711,7 +711,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             print("No self reader found. Run seed first.")
             return
 
-        cursor = db_conn.execute("SELECT * FROM books ORDER BY book_id")
+        cursor = db_conn.execute("SELECT * FROM books ORDER BY legacy_id")
         books_rows = cursor.fetchall()
         if not books_rows:
             print("No book records found in the books table. Run crawler first.")
@@ -722,8 +722,8 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             SELECT b.*, l.rating AS my_rating
             FROM books b
             LEFT JOIN reader_libraries l
-                ON b.book_id = l.book_id AND l.list_id = ?
-            ORDER BY b.book_id
+                ON b.legacy_id = l.legacy_id AND l.list_id = ?
+            ORDER BY b.legacy_id
             """,
             (self_list_id,),
         )
@@ -744,7 +744,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         print("  Running ELO ratings refinement...")
         my_refined = refine_ratings(books_df, "my_rating", db_conn, interactive=interactive)
 
-        books_df = books_df.merge(my_refined.rename("my_refined"), on="book_id", how="left")
+        books_df = books_df.merge(my_refined.rename("my_refined"), on="legacy_id", how="left")
 
         print("  Loading valid embeddings...")
         has_embedding, embedded_embeddings, invalid_counts = load_valid_embeddings_for_books(
@@ -774,10 +774,10 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         friend_ratings_series = pd.Series(similar_friend_ratings)
         friend_ratings_dict = friend_ratings_series.to_dict()
         books_df["training_ratings"] = pd.Series(books_df["my_refined"]).fillna(
-            pd.Series(books_df["book_id"]).map(friend_ratings_dict)
+            pd.Series(books_df["legacy_id"]).map(friend_ratings_dict)
         )
         embedded_books_df["training_ratings"] = pd.Series(embedded_books_df["my_refined"]).fillna(
-            pd.Series(embedded_books_df["book_id"]).map(friend_ratings_dict)
+            pd.Series(embedded_books_df["legacy_id"]).map(friend_ratings_dict)
         )
 
         my_rating_count = len(books_df[books_df["my_rating"].notna()])
@@ -913,7 +913,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                 continue
             predictions_data.append(
                 (
-                    int(row["book_id"]),
+                    int(row["legacy_id"]),
                     float(row["solo_pred_rating"]),
                     float(row["friend_pred_rating"]),
                     float(row["count_adjusted_rating"]),
@@ -928,7 +928,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             "predictions",
             predictions_data,
             [
-                "book_id",
+                "legacy_id",
                 "solo_pred_rating",
                 "friend_pred_rating",
                 "count_adjusted_rating",

@@ -9,6 +9,10 @@ import numpy as np
 DB_PATH = Path("data/goodreads.db")
 
 SCHEMA = """
+-- =========================================================================
+-- 1. UNTOUCHED COMPATIBILITY TABLES
+-- =========================================================================
+
 CREATE TABLE IF NOT EXISTS readers (
     list_id            INTEGER PRIMARY KEY,
     username           TEXT,
@@ -21,57 +25,31 @@ CREATE TABLE IF NOT EXISTS readers (
 
 CREATE TABLE IF NOT EXISTS reader_libraries (
     list_id    INTEGER NOT NULL,
-    book_id    INTEGER NOT NULL,
+    legacy_id  INTEGER NOT NULL,
     rating     INTEGER,
     date_read  TEXT,
     date_added TEXT,
-    PRIMARY KEY (list_id, book_id)
-);
-
-CREATE TABLE IF NOT EXISTS books (
-    book_id           INTEGER PRIMARY KEY,
-    title             TEXT,
-    authors           TEXT,
-    avg_rating        REAL,
-    review_count      INTEGER,
-    num_pages         INTEGER,
-    lang              TEXT,
-    star_1            INTEGER DEFAULT 0,
-    star_2            INTEGER DEFAULT 0,
-    star_3            INTEGER DEFAULT 0,
-    star_4            INTEGER DEFAULT 0,
-    star_5            INTEGER DEFAULT 0,
-    genres            TEXT,
-    series            TEXT,
-    year              INTEGER,
-    description       TEXT,
-    similar_books     TEXT,
-    primary_author    TEXT,
-    author_followers  INTEGER DEFAULT 0,
-    want_to_read      INTEGER DEFAULT 0,
-    author_num_books  INTEGER DEFAULT 0,
-    currently_reading INTEGER DEFAULT 0,
-    date_last_scraped TEXT
+    PRIMARY KEY (list_id, legacy_id)
 );
 
 CREATE TABLE IF NOT EXISTS elo_ratings (
-    book_id          INTEGER PRIMARY KEY,
+    legacy_id        INTEGER PRIMARY KEY,
     original_rating  REAL,
     elo_score        REAL DEFAULT 1200.0,
     matches_played   INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS embeddings (
-    book_id           INTEGER,
+    legacy_id         INTEGER,
     embedding_model   TEXT,
     dim               INTEGER NOT NULL,
     vector            BLOB NOT NULL,
     text_hash         TEXT NOT NULL,
-    PRIMARY KEY (book_id, embedding_model)
+    PRIMARY KEY (legacy_id, embedding_model)
 );
 
 CREATE TABLE IF NOT EXISTS predictions (
-    book_id                INTEGER PRIMARY KEY,
+    legacy_id              INTEGER PRIMARY KEY,
     solo_pred_rating       REAL,
     friend_pred_rating     REAL,
     count_adjusted_rating  REAL,
@@ -88,6 +66,151 @@ CREATE TABLE IF NOT EXISTS model_params (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_readers_single_self
 ON readers(is_self) WHERE is_self = 1;
+
+-- =========================================================================
+-- 2. PERSISTENT CRAWL QUEUE
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS crawl_queue (
+    legacy_id INTEGER PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'done' | 'mapped_to_canonical' | 'skipped_known_edition' | 'error'
+    priority REAL NOT NULL DEFAULT 0.0,     -- rating-based prioritization score
+    error_count INTEGER DEFAULT 0,
+    last_error_message TEXT,
+    discovered_via TEXT,                    -- 'seed' | 'similar'
+    enqueued_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    processed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_crawl_queue_priority ON crawl_queue(status, discovered_via, priority DESC);
+
+-- =========================================================================
+-- 3. CORE ENTITIES
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS works (
+    legacy_id INTEGER PRIMARY KEY,
+    original_title TEXT,
+    publication_time INTEGER,
+    web_url TEXT,
+    shelves_url TEXT,
+    average_rating REAL,
+    ratings_count INTEGER,
+    star_1 INTEGER DEFAULT 0,
+    star_2 INTEGER DEFAULT 0,
+    star_3 INTEGER DEFAULT 0,
+    star_4 INTEGER DEFAULT 0,
+    star_5 INTEGER DEFAULT 0,
+    text_reviews_count INTEGER,
+    text_reviews_language_counts TEXT,          -- serialized JSON
+    editions_total_count INTEGER,
+    editions_coverage_complete INTEGER DEFAULT 1,
+    updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS books (
+    legacy_id INTEGER PRIMARY KEY,               -- always the canonical (bestBook) edition
+    work_id INTEGER REFERENCES works(legacy_id) ON DELETE SET NULL,
+    title TEXT,
+    title_complete TEXT,
+    description TEXT,
+    image_url TEXT,
+    web_url TEXT,
+    asin TEXT,
+    isbn TEXT,
+    isbn13 TEXT,
+    format TEXT,
+    num_pages INTEGER,
+    publisher TEXT,
+    publication_time INTEGER,
+    language_name TEXT,
+    fetched_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS contributors (
+    legacy_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    web_url TEXT,
+    is_gr_author INTEGER DEFAULT 0,
+    works_count INTEGER DEFAULT 0,
+    followers_count INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS series (
+    id INTEGER PRIMARY KEY,   -- surrogate
+    title TEXT NOT NULL,
+    web_url TEXT
+);
+
+CREATE TABLE IF NOT EXISTS genres (
+    name TEXT PRIMARY KEY,
+    web_url TEXT
+);
+
+-- =========================================================================
+-- 4. JUNCTIONS
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS work_series (
+    work_id INTEGER REFERENCES works(legacy_id) ON DELETE CASCADE,
+    series_id INTEGER REFERENCES series(id) ON DELETE CASCADE,
+    user_position TEXT,
+    PRIMARY KEY (work_id, series_id)
+);
+
+CREATE TABLE IF NOT EXISTS work_genres (
+    work_id INTEGER REFERENCES works(legacy_id) ON DELETE CASCADE,
+    genre_name TEXT REFERENCES genres(name) ON DELETE CASCADE,
+    PRIMARY KEY (work_id, genre_name)
+);
+
+CREATE TABLE IF NOT EXISTS book_contributors (
+    legacy_id INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
+    contributor_id INTEGER REFERENCES contributors(legacy_id) ON DELETE CASCADE,
+    role TEXT,
+    PRIMARY KEY (legacy_id, contributor_id, role)
+);
+
+-- =========================================================================
+-- 5. AUXILIARY DATA
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS work_awards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    work_id INTEGER REFERENCES works(legacy_id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    category TEXT,
+    designation TEXT,
+    awarded_at INTEGER,
+    web_url TEXT
+);
+
+CREATE TABLE IF NOT EXISTS known_editions (
+    work_id INTEGER REFERENCES works(legacy_id) ON DELETE CASCADE,
+    legacy_id INTEGER NOT NULL,
+    title TEXT,
+    discovered_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (work_id, legacy_id)
+);
+
+CREATE TABLE IF NOT EXISTS social_signals (
+    work_id INTEGER REFERENCES works(legacy_id) ON DELETE CASCADE,
+    signal_name TEXT NOT NULL,   -- CURRENTLY_READING | TO_READ
+    count INTEGER NOT NULL,
+    updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (work_id, signal_name)
+);
+
+CREATE TABLE IF NOT EXISTS similar_books (
+    work_id INTEGER REFERENCES works(legacy_id) ON DELETE CASCADE,
+    similar_legacy_id INTEGER NOT NULL,
+    rank INTEGER,
+    title TEXT,
+    average_rating REAL,
+    ratings_count INTEGER,
+    fetched_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (work_id, similar_legacy_id)
+);
 """
 
 
@@ -114,33 +237,7 @@ def init_db(db_path=None):
 
 
 def ensure_schema_compat(db_conn):
-    db_conn.execute("DROP TABLE IF EXISTS my_library")
-    db_conn.execute("DROP TABLE IF EXISTS user_library")
-
-    existing = {row["name"] for row in db_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-
-    if "friend_lists" in existing and "readers" not in existing:
-        db_conn.execute("ALTER TABLE friend_lists RENAME TO readers")
-    if "friend_ratings" in existing and "reader_libraries" not in existing:
-        db_conn.execute("ALTER TABLE friend_ratings RENAME TO reader_libraries")
-
-    existing_after_renaming = {
-        row["name"] for row in db_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-    }
-
-    if "books" in existing_after_renaming:
-        ensure_column(db_conn, "books", "date_last_scraped", "TEXT")
-
-    if "readers" in existing_after_renaming:
-        ensure_column(db_conn, "readers", "username", "TEXT")
-        ensure_column(db_conn, "readers", "user_id", "INTEGER")
-        ensure_column(db_conn, "readers", "is_self", "INTEGER DEFAULT 0")
-        ensure_column(db_conn, "readers", "scrape_error", "TEXT")
-
-    if "embeddings" in existing_after_renaming:
-        columns = {row["name"] for row in db_conn.execute("PRAGMA table_info(embeddings)")}
-        if "embedding_model" not in columns:
-            db_conn.execute("DROP TABLE embeddings")
+    pass
 
 
 def ensure_column(db_conn, table, column, definition):
@@ -184,17 +281,17 @@ def load_model_params(db_conn, name):
         return None
 
 
-def save_embeddings(db_conn, book_ids, vectors, model, text_hashes):
+def save_embeddings(db_conn, legacy_ids, vectors, model, text_hashes):
     dim = vectors.shape[1]
     rows = []
-    for i, bid in enumerate(book_ids):
+    for i, bid in enumerate(legacy_ids):
         bid_int = int(bid)
         h = text_hashes.get(bid_int) if isinstance(text_hashes, dict) else text_hashes[i]
         rows.append((bid_int, model, dim, vector_to_blob(vectors[i]), h))
 
     db_conn.executemany(
         """
-        INSERT OR REPLACE INTO embeddings (book_id, embedding_model, dim, vector, text_hash)
+        INSERT OR REPLACE INTO embeddings (legacy_id, embedding_model, dim, vector, text_hash)
         VALUES (?, ?, ?, ?, ?)
         """,
         rows,

@@ -88,12 +88,12 @@ def join_embedding_parts(title, authors, genres, desc):
 
 
 def build_embedding_inputs(db_conn):
-    cursor = db_conn.execute("SELECT book_id, title, authors, genres, description FROM books ORDER BY book_id")
+    cursor = db_conn.execute("SELECT legacy_id, title, authors, genres, description FROM books ORDER BY legacy_id")
     rows = cursor.fetchall()
 
     inputs = {}
     for row in rows:
-        book_id = int(row["book_id"])
+        legacy_id = int(row["legacy_id"])
         title = row["title"] or ""
 
         authors_raw = row["authors"] or ""
@@ -110,7 +110,7 @@ def build_embedding_inputs(db_conn):
         desc_post = format_string_for_embedding(desc_list, kind="description")
 
         embedding_input = join_embedding_parts(title, authors_post, genres_post, desc_post)
-        inputs[book_id] = embedding_input
+        inputs[legacy_id] = embedding_input
 
     return inputs
 
@@ -121,17 +121,17 @@ def find_books_needing_embeddings(db_conn, all_inputs, model):
 
     import hashlib
 
-    input_hashes = {book_id: hashlib.md5(text.encode("utf-8")).hexdigest() for book_id, text in all_inputs.items()}
+    input_hashes = {legacy_id: hashlib.md5(text.encode("utf-8")).hexdigest() for legacy_id, text in all_inputs.items()}
 
     cursor = db_conn.execute(
         """
-        SELECT b.book_id,
+        SELECT b.legacy_id,
                e.dim,
                e.vector,
                e.text_hash
         FROM books b
-        LEFT JOIN embeddings e ON e.book_id = b.book_id AND e.embedding_model = ?
-        ORDER BY b.book_id
+        LEFT JOIN embeddings e ON e.legacy_id = b.legacy_id AND e.embedding_model = ?
+        ORDER BY b.legacy_id
         """,
         (model,),
     )
@@ -139,25 +139,25 @@ def find_books_needing_embeddings(db_conn, all_inputs, model):
     queued = []
     expected_dim = None
     for row in cursor.fetchall():
-        book_id = int(row["book_id"])
-        if book_id not in all_inputs:
+        legacy_id = int(row["legacy_id"])
+        if legacy_id not in all_inputs:
             continue
         if row["vector"] is None:
-            queued.append(book_id)
+            queued.append(legacy_id)
             continue
         if not db.is_valid_embedding_blob(row["vector"], row["dim"]):
-            queued.append(book_id)
+            queued.append(legacy_id)
             continue
         dim = int(row["dim"])
         if expected_dim is None:
             expected_dim = dim
         elif dim != expected_dim:
-            queued.append(book_id)
+            queued.append(legacy_id)
             continue
 
-        current_hash = input_hashes.get(book_id, "")
+        current_hash = input_hashes.get(legacy_id, "")
         if not current_hash or row["text_hash"] != current_hash:
-            queued.append(book_id)
+            queued.append(legacy_id)
 
     return queued
 
@@ -199,5 +199,5 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
                     batch_hashes = {bid: hashlib.md5(all_inputs[bid].encode("utf-8")).hexdigest() for bid in batch_ids}
                     db.save_embeddings(db_conn, batch_ids, vectors, model, batch_hashes)
                 except Exception as e:
-                    print(f"\n  Error generating embeddings for batch starting with book_id {batch_ids[0]}: {e}")
+                    print(f"\n  Error generating embeddings for batch starting with legacy_id {batch_ids[0]}: {e}")
                     continue
