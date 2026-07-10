@@ -12,7 +12,7 @@ HEADERS = {
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 }
 
-MAX_EDITION_PAGES = 10   # hard cap discovered during exploration (200 editions max)
+MAX_EDITION_PAGES = 10  # hard cap discovered during exploration (200 editions max)
 EDITIONS_PAGE_SIZE = 20  # hard cap, cannot be raised
 
 BOOK_QUERY = """
@@ -198,9 +198,7 @@ async def resolve_book(client: httpx.AsyncClient, seed_legacy_id: int) -> dict:
 
     page1_edges = editions_conn.get("edges") or []
     page1_editions = [edge["node"] for edge in page1_edges if edge and edge.get("node")]
-    remaining_editions = await fetch_remaining_edition_pages(
-        client, canonical_book.get("legacyId"), total_editions
-    )
+    remaining_editions = await fetch_remaining_edition_pages(client, canonical_book.get("legacyId"), total_editions)
     all_known_editions = page1_editions + remaining_editions
 
     similar, social = await asyncio.gather(
@@ -217,19 +215,13 @@ async def resolve_book(client: httpx.AsyncClient, seed_legacy_id: int) -> dict:
 
     primary_edge = canonical_book.get("primaryContributorEdge")
     secondary_edges = canonical_book.get("secondaryContributorEdges") or []
-    
+
     book_contributors = []
     if primary_edge and primary_edge.get("node"):
-        book_contributors.append({
-            "contributor": primary_edge["node"],
-            "role": primary_edge.get("role")
-        })
+        book_contributors.append({"contributor": primary_edge["node"], "role": primary_edge.get("role")})
     for edge in secondary_edges:
         if edge and edge.get("node"):
-            book_contributors.append({
-                "contributor": edge["node"],
-                "role": edge.get("role")
-            })
+            book_contributors.append({"contributor": edge["node"], "role": edge.get("role")})
 
     book_series = [
         {"series": bs["series"], "user_position": bs.get("userPosition")}

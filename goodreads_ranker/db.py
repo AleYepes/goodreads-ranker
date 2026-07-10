@@ -9,9 +9,7 @@ import numpy as np
 DB_PATH = Path("data/goodreads.db")
 
 SCHEMA = """
--- =========================================================================
--- 1. UNTOUCHED COMPATIBILITY TABLES
--- =========================================================================
+-- 1. COMPATIBILITY TABLES (legacy_id → book_id rename throughout)
 
 CREATE TABLE IF NOT EXISTS readers (
     list_id            INTEGER PRIMARY KEY,
@@ -24,32 +22,32 @@ CREATE TABLE IF NOT EXISTS readers (
 );
 
 CREATE TABLE IF NOT EXISTS reader_libraries (
-    list_id    INTEGER NOT NULL,
-    legacy_id  INTEGER NOT NULL,
-    rating     INTEGER,
+    list_id  INTEGER NOT NULL,
+    book_id  INTEGER NOT NULL,   -- renamed from legacy_id
+    rating   INTEGER,
     date_read  TEXT,
     date_added TEXT,
-    PRIMARY KEY (list_id, legacy_id)
+    PRIMARY KEY (list_id, book_id)
 );
 
 CREATE TABLE IF NOT EXISTS elo_ratings (
-    legacy_id        INTEGER PRIMARY KEY,
+    book_id          INTEGER PRIMARY KEY,   -- renamed from legacy_id
     original_rating  REAL,
     elo_score        REAL DEFAULT 1200.0,
     matches_played   INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS embeddings (
-    legacy_id         INTEGER,
-    embedding_model   TEXT,
-    dim               INTEGER NOT NULL,
-    vector            BLOB NOT NULL,
-    text_hash         TEXT NOT NULL,
-    PRIMARY KEY (legacy_id, embedding_model)
+    book_id          INTEGER,              -- renamed from legacy_id
+    embedding_model  TEXT,
+    dim              INTEGER NOT NULL,
+    vector           BLOB NOT NULL,
+    text_hash        TEXT NOT NULL,
+    PRIMARY KEY (book_id, embedding_model)
 );
 
 CREATE TABLE IF NOT EXISTS predictions (
-    legacy_id              INTEGER PRIMARY KEY,
+    book_id                INTEGER PRIMARY KEY,   -- renamed from legacy_id
     solo_pred_rating       REAL,
     friend_pred_rating     REAL,
     count_adjusted_rating  REAL,
@@ -59,157 +57,123 @@ CREATE TABLE IF NOT EXISTS predictions (
 );
 
 CREATE TABLE IF NOT EXISTS model_params (
-    name TEXT PRIMARY KEY,
+    name       TEXT PRIMARY KEY,
     params_json TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at  TEXT NOT NULL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_readers_single_self
 ON readers(is_self) WHERE is_self = 1;
 
--- =========================================================================
 -- 2. PERSISTENT CRAWL QUEUE
--- =========================================================================
 
 CREATE TABLE IF NOT EXISTS crawl_queue (
-    legacy_id INTEGER PRIMARY KEY,
-    status TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'done' | 'mapped_to_canonical' | 'skipped_known_edition' | 'error'
-    priority REAL NOT NULL DEFAULT 0.0,     -- rating-based prioritization score
-    error_count INTEGER DEFAULT 0,
+    book_id           INTEGER PRIMARY KEY,   -- renamed from legacy_id
+    status            TEXT NOT NULL DEFAULT 'pending',
+    priority          REAL NOT NULL DEFAULT 0.0,
+    error_count       INTEGER DEFAULT 0,
     last_error_message TEXT,
-    discovered_via TEXT,                    -- 'seed' | 'similar'
-    enqueued_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    processed_at TEXT
+    discovered_via    TEXT,
+    enqueued_at       TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    processed_at      TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_crawl_queue_priority ON crawl_queue(status, discovered_via, priority DESC);
+CREATE INDEX IF NOT EXISTS idx_crawl_queue_priority
+ON crawl_queue(status, discovered_via, priority DESC);
 
--- =========================================================================
--- 3. CORE ENTITIES
--- =========================================================================
+-- 3. AUTHORS
 
-CREATE TABLE IF NOT EXISTS works (
-    legacy_id INTEGER PRIMARY KEY,
-    original_title TEXT,
-    publication_time INTEGER,
-    web_url TEXT,
-    shelves_url TEXT,
-    average_rating REAL,
-    ratings_count INTEGER,
-    star_1 INTEGER DEFAULT 0,
-    star_2 INTEGER DEFAULT 0,
-    star_3 INTEGER DEFAULT 0,
-    star_4 INTEGER DEFAULT 0,
-    star_5 INTEGER DEFAULT 0,
-    text_reviews_count INTEGER,
-    text_reviews_language_counts TEXT,          -- serialized JSON
-    editions_total_count INTEGER,
-    editions_coverage_complete INTEGER DEFAULT 1,
-    updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
-CREATE TABLE IF NOT EXISTS books (
-    legacy_id INTEGER PRIMARY KEY,               -- always the canonical (bestBook) edition
-    work_id INTEGER REFERENCES works(legacy_id) ON DELETE SET NULL,
-    title TEXT,
-    title_complete TEXT,
-    description TEXT,
-    image_url TEXT,
-    web_url TEXT,
-    asin TEXT,
-    isbn TEXT,
-    isbn13 TEXT,
-    format TEXT,
-    num_pages INTEGER,
-    publisher TEXT,
-    publication_time INTEGER,
-    language_name TEXT,
-    fetched_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
-CREATE TABLE IF NOT EXISTS contributors (
-    legacy_id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    web_url TEXT,
-    is_gr_author INTEGER DEFAULT 0,
-    works_count INTEGER DEFAULT 0,
+CREATE TABLE IF NOT EXISTS authors (
+    legacy_id       INTEGER PRIMARY KEY,   -- author's own GR legacy_id
+    name            TEXT NOT NULL,
+    web_url         TEXT,
+    is_gr_author    INTEGER DEFAULT 0,
+    works_count     INTEGER DEFAULT 0,
     followers_count INTEGER DEFAULT 0
 );
 
+-- 4. CORE ENTITY: BOOKS (merged books + works)
+
+CREATE TABLE IF NOT EXISTS books (
+    legacy_id                INTEGER PRIMARY KEY,   -- always the canonical (bestBook) edition
+    kca_id                   TEXT,                  -- "kca://book/..." for API calls
+    author_id                INTEGER REFERENCES authors(legacy_id),
+    author_role              TEXT,
+    title                    TEXT,
+    title_complete           TEXT,
+    description              TEXT,
+    web_url                  TEXT,
+    asin                     TEXT,
+    isbn                     TEXT,
+    isbn13                   TEXT,
+    format                   TEXT,
+    num_pages                INTEGER,
+    language_name            TEXT,
+    publisher                TEXT,
+    publication_time         INTEGER,               -- this edition's publication date
+    original_publication_time INTEGER,              -- work-level original publication date
+    star_1                   INTEGER DEFAULT 0,
+    star_2                   INTEGER DEFAULT 0,
+    star_3                   INTEGER DEFAULT 0,
+    star_4                   INTEGER DEFAULT 0,
+    star_5                   INTEGER DEFAULT 0,
+    currently_reading_count  INTEGER DEFAULT 0,
+    to_read_count            INTEGER DEFAULT 0,
+    fetched_at               TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- 5. SERIES (entity + junction)
+
 CREATE TABLE IF NOT EXISTS series (
-    id INTEGER PRIMARY KEY,   -- surrogate
-    title TEXT NOT NULL,
+    id      INTEGER PRIMARY KEY,
+    title   TEXT NOT NULL,
     web_url TEXT
 );
+
+CREATE TABLE IF NOT EXISTS book_series (
+    book_id   INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
+    series_id INTEGER REFERENCES series(id) ON DELETE CASCADE,
+    position  TEXT,
+    PRIMARY KEY (book_id, series_id)
+);
+
+-- 6. GENRES (flat child table, no entity table)
 
 CREATE TABLE IF NOT EXISTS genres (
-    name TEXT PRIMARY KEY,
-    web_url TEXT
+    book_id INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
+    name    TEXT NOT NULL,
+    PRIMARY KEY (book_id, name)
 );
 
--- =========================================================================
--- 4. JUNCTIONS
--- =========================================================================
+-- 7. AUXILIARY DATA
 
-CREATE TABLE IF NOT EXISTS work_series (
-    work_id INTEGER REFERENCES works(legacy_id) ON DELETE CASCADE,
-    series_id INTEGER REFERENCES series(id) ON DELETE CASCADE,
-    user_position TEXT,
-    PRIMARY KEY (work_id, series_id)
-);
-
-CREATE TABLE IF NOT EXISTS work_genres (
-    work_id INTEGER REFERENCES works(legacy_id) ON DELETE CASCADE,
-    genre_name TEXT REFERENCES genres(name) ON DELETE CASCADE,
-    PRIMARY KEY (work_id, genre_name)
-);
-
-CREATE TABLE IF NOT EXISTS book_contributors (
-    legacy_id INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
-    contributor_id INTEGER REFERENCES contributors(legacy_id) ON DELETE CASCADE,
-    role TEXT,
-    PRIMARY KEY (legacy_id, contributor_id, role)
-);
-
--- =========================================================================
--- 5. AUXILIARY DATA
--- =========================================================================
-
-CREATE TABLE IF NOT EXISTS work_awards (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    work_id INTEGER REFERENCES works(legacy_id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    category TEXT,
+CREATE TABLE IF NOT EXISTS awards (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id     INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    category    TEXT,
     designation TEXT,
-    awarded_at INTEGER,
-    web_url TEXT
+    awarded_at  INTEGER,
+    web_url     TEXT
 );
 
-CREATE TABLE IF NOT EXISTS known_editions (
-    work_id INTEGER REFERENCES works(legacy_id) ON DELETE CASCADE,
-    legacy_id INTEGER NOT NULL,
-    title TEXT,
-    discovered_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    PRIMARY KEY (work_id, legacy_id)
-);
-
-CREATE TABLE IF NOT EXISTS social_signals (
-    work_id INTEGER REFERENCES works(legacy_id) ON DELETE CASCADE,
-    signal_name TEXT NOT NULL,   -- CURRENTLY_READING | TO_READ
-    count INTEGER NOT NULL,
-    updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    PRIMARY KEY (work_id, signal_name)
+CREATE TABLE IF NOT EXISTS book_editions (
+    book_id           INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
+    edition_legacy_id INTEGER NOT NULL,   -- sibling edition's GR legacy_id, not a FK
+    title             TEXT,
+    discovered_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (book_id, edition_legacy_id)
 );
 
 CREATE TABLE IF NOT EXISTS similar_books (
-    work_id INTEGER REFERENCES works(legacy_id) ON DELETE CASCADE,
-    similar_legacy_id INTEGER NOT NULL,
-    rank INTEGER,
-    title TEXT,
-    average_rating REAL,
-    ratings_count INTEGER,
-    fetched_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    PRIMARY KEY (work_id, similar_legacy_id)
+    book_id           INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
+    similar_legacy_id INTEGER NOT NULL,   -- similar book's GR legacy_id, not a FK
+    rank              INTEGER,
+    title             TEXT,
+    average_rating    REAL,
+    ratings_count     INTEGER,
+    fetched_at        TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (book_id, similar_legacy_id)
 );
 """
 
@@ -291,7 +255,7 @@ def save_embeddings(db_conn, legacy_ids, vectors, model, text_hashes):
 
     db_conn.executemany(
         """
-        INSERT OR REPLACE INTO embeddings (legacy_id, embedding_model, dim, vector, text_hash)
+        INSERT OR REPLACE INTO embeddings (book_id, embedding_model, dim, vector, text_hash)
         VALUES (?, ?, ?, ?, ?)
         """,
         rows,

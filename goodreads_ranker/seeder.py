@@ -211,16 +211,16 @@ def update_friend_info(db_conn, list_id, username, user_id):
 def load_existing_rows(db_conn, list_id):
     rows = db_conn.execute(
         """
-        SELECT list_id, legacy_id, rating, date_read, date_added
+        SELECT list_id, book_id, rating, date_read, date_added
         FROM reader_libraries
         WHERE list_id = ?
         """,
         (list_id,),
     ).fetchall()
     return {
-        (int(row["list_id"]), int(row["legacy_id"])): {
+        (int(row["list_id"]), int(row["book_id"])): {
             "list_id": int(row["list_id"]),
-            "legacy_id": int(row["legacy_id"]),
+            "book_id": int(row["book_id"]),
             "rating": int(row["rating"] or 0),
             "date_read": row["date_read"] or "",
             "date_added": row["date_added"] or "",
@@ -266,7 +266,7 @@ def upsert_extracted(db_conn, rows):
         [
             (
                 row["list_id"],
-                row["legacy_id"],
+                row["book_id"],
                 row["rating"],
                 row["date_read"],
                 row["date_added"],
@@ -275,7 +275,7 @@ def upsert_extracted(db_conn, rows):
         ],
         [
             "list_id",
-            "legacy_id",
+            "book_id",
             "rating",
             "date_read",
             "date_added",
@@ -326,7 +326,7 @@ async def extract_friend_row(row, list_id):
 
     return {
         "list_id": int(list_id),
-        "legacy_id": legacy_id,
+        "book_id": legacy_id,
         "rating": rating,
         "date_read": date_read,
         "date_added": date_added,
@@ -376,7 +376,7 @@ async def process_list(db_conn, page, list_id, email, password, force_seed=False
                         page_all_known = False
                         continue
 
-                    key = (extracted["list_id"], extracted["legacy_id"])
+                    key = (extracted["list_id"], extracted["book_id"])
                     if existing_rows.get(key) != extracted:
                         page_all_known = False
                     existing_rows[key] = extracted

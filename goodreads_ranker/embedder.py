@@ -88,20 +88,32 @@ def join_embedding_parts(title, authors, genres, desc):
 
 
 def build_embedding_inputs(db_conn):
-    cursor = db_conn.execute("SELECT legacy_id, title, authors, genres, description FROM books ORDER BY legacy_id")
+    cursor = db_conn.execute(
+        """
+        SELECT b.legacy_id, b.title, a.name AS author_name, b.description
+        FROM books b
+        LEFT JOIN authors a ON b.author_id = a.legacy_id
+        ORDER BY b.legacy_id
+        """
+    )
     rows = cursor.fetchall()
+
+    cursor_genres = db_conn.execute("SELECT book_id, name FROM genres")
+    genres_by_book = {}
+    for r in cursor_genres.fetchall():
+        bid = int(r["book_id"])
+        genres_by_book.setdefault(bid, []).append(r["name"])
 
     inputs = {}
     for row in rows:
         legacy_id = int(row["legacy_id"])
         title = row["title"] or ""
 
-        authors_raw = row["authors"] or ""
-        authors_list = [a.strip() for a in authors_raw.split("|") if a.strip()]
+        author_name = row["author_name"]
+        authors_list = [author_name.strip()] if author_name and author_name.strip() else []
         authors_post = format_string_for_embedding(authors_list, truncate=4)
 
-        genres_raw = row["genres"] or ""
-        genres_list = [g.strip() for g in genres_raw.split("|") if g.strip()]
+        genres_list = genres_by_book.get(legacy_id, [])
         genres_post = format_string_for_embedding(genres_list, kind="genre")
 
         desc_raw = row["description"] or ""
@@ -130,7 +142,7 @@ def find_books_needing_embeddings(db_conn, all_inputs, model):
                e.vector,
                e.text_hash
         FROM books b
-        LEFT JOIN embeddings e ON e.legacy_id = b.legacy_id AND e.embedding_model = ?
+        LEFT JOIN embeddings e ON e.book_id = b.legacy_id AND e.embedding_model = ?
         ORDER BY b.legacy_id
         """,
         (model,),

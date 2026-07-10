@@ -81,7 +81,7 @@ def load_valid_embeddings_for_books(db_conn, books_df, model=None):
 
     rows = db_conn.execute(
         """
-        SELECT legacy_id, dim, vector, text_hash
+        SELECT book_id AS legacy_id, dim, vector, text_hash
         FROM embeddings
         WHERE embedding_model = ?
         """,
@@ -221,7 +221,7 @@ def compute_continuous(elo_df):
 def refine_ratings(target_df, rating_col, db_conn, interactive=False):
     target_clean = target_df.dropna(subset=[rating_col]).copy()
 
-    cursor = db_conn.execute("SELECT legacy_id, original_rating, elo_score, matches_played FROM elo_ratings")
+    cursor = db_conn.execute("SELECT book_id AS legacy_id, original_rating, elo_score, matches_played FROM elo_ratings")
     rows = cursor.fetchall()
 
     if rows:
@@ -269,7 +269,7 @@ def refine_ratings(target_df, rating_col, db_conn, interactive=False):
         db_conn,
         "elo_ratings",
         db_rows,
-        ["legacy_id", "original_rating", "elo_score", "matches_played"],
+        ["book_id", "original_rating", "elo_score", "matches_played"],
     )
 
     return compute_continuous(elo_df)
@@ -313,7 +313,7 @@ def get_similar_friend_ratings(
 ):
     cursor = db_conn.execute(
         """
-        SELECT rl.list_id, rl.book_id, rl.rating
+        SELECT rl.list_id, rl.book_id AS legacy_id, rl.rating
         FROM reader_libraries rl
         JOIN readers r ON rl.list_id = r.list_id
         WHERE r.is_self = 0
@@ -485,25 +485,20 @@ def get_similar_friend_ratings(
     return rating_series, similar_friends, friend_scores
 
 
-def build_adjacency_matrix(books_df, num_nodes):
+def build_adjacency_matrix(books_df, num_nodes, db_conn):
     id_to_idx = {int(bid): i for i, bid in enumerate(books_df["legacy_id"])}
     book_ids_set = set(id_to_idx.keys())
 
+    cursor = db_conn.execute("SELECT book_id, similar_legacy_id FROM similar_books")
     edge_indices = []
-    for row in books_df.to_dict(orient="records"):
-        current_idx = id_to_idx[int(row["legacy_id"])]
-        similar_books_str = row["similar_books"]
-        if not isinstance(similar_books_str, str) or not similar_books_str:
-            continue
-        for item in similar_books_str.split("|"):
-            try:
-                target_id = int(item.split(":")[0])
-                if target_id in book_ids_set:
-                    target_idx = id_to_idx[target_id]
-                    edge_indices.append([current_idx, target_idx])
-                    edge_indices.append([target_idx, current_idx])
-            except ValueError, IndexError:
-                continue
+    for row in cursor.fetchall():
+        bid = int(row["book_id"])
+        sim_id = int(row["similar_legacy_id"])
+        if bid in book_ids_set and sim_id in book_ids_set:
+            idx_a = id_to_idx[bid]
+            idx_b = id_to_idx[sim_id]
+            edge_indices.append([idx_a, idx_b])
+            edge_indices.append([idx_b, idx_a])
 
     if not edge_indices:
         edge_index = torch.tensor([[], []], dtype=torch.long)
@@ -722,7 +717,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             SELECT b.*, l.rating AS my_rating
             FROM books b
             LEFT JOIN reader_libraries l
-                ON b.legacy_id = l.legacy_id AND l.list_id = ?
+                ON b.legacy_id = l.book_id AND l.list_id = ?
             ORDER BY b.legacy_id
             """,
             (self_list_id,),
@@ -815,7 +810,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             mrl_dimensions *= 2
 
         embeddings_tensor = torch.tensor(embedded_embeddings, dtype=torch.float32, device=device)
-        adj_matrix = build_adjacency_matrix(embedded_books_df, len(embedded_books_df)).to(device)
+        adj_matrix = build_adjacency_matrix(embedded_books_df, len(embedded_books_df), db_conn).to(device)
 
         propagated = embeddings_tensor.clone()
         norm_l2 = Normalizer(norm="l2")
@@ -870,6 +865,15 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         print("  Formulating final recommendations...")
         star_cols = ["star_1", "star_2", "star_3", "star_4", "star_5"]
         books_df["rating_count"] = books_df[star_cols].sum(axis=1)
+
+        def get_avg_rating(row):
+            total_stars = (
+                row["star_1"] * 1 + row["star_2"] * 2 + row["star_3"] * 3 + row["star_4"] * 4 + row["star_5"] * 5
+            )
+            count = row["rating_count"]
+            return total_stars / count if count > 0 else np.nan
+
+        books_df["avg_rating"] = books_df.apply(get_avg_rating, axis=1)
 
         global_avg_rating = books_df["avg_rating"].mean()
         m = books_df["rating_count"].quantile(0.10)
@@ -928,7 +932,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             "predictions",
             predictions_data,
             [
-                "legacy_id",
+                "book_id",
                 "solo_pred_rating",
                 "friend_pred_rating",
                 "count_adjusted_rating",
