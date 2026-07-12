@@ -52,9 +52,7 @@ async def goto_with_retry(page, url, wait_until="domcontentloaded", retries=NAV_
         except (PlaywrightTimeoutError, PlaywrightError) as exc:
             last_exc = exc
             delay = NAV_RETRY_BASE_DELAY * (attempt + 1)
-            tqdm.write(
-                f"  goto_with_retry: attempt {attempt + 1}/{retries} failed for {url!r}: {exc}. Retrying in {delay:.1f}s..."
-            )
+            tqdm.write(f"Attempt {attempt + 1}/{retries} failed for {url!r}: {exc}. Retrying in {delay:.1f}s...")
             await asyncio.sleep(delay)
     if last_exc is not None:
         raise last_exc
@@ -145,7 +143,7 @@ async def fetch_friends(page, user_id: int, email: str | None = None, password: 
         await goto_with_retry(page, url)
 
         if await is_login_page(page):
-            print("  fetch_friends: redirected to login page — re-authenticating...")
+            print("Redirected to login page — re-authenticating...")
             if not email or not password:
                 raise RuntimeError("Session lost on friends page and no credentials available to re-login.")
             await login_to_goodreads(page, email, password)
@@ -154,10 +152,7 @@ async def fetch_friends(page, user_id: int, email: str | None = None, password: 
         try:
             await page.wait_for_selector("#friendTable", timeout=10000)
         except PlaywrightTimeoutError:
-            print(
-                f"  fetch_friends: #friendTable not found on page {page_num} "
-                f"(current URL: {page.url}). Stopping pagination."
-            )
+            print(f"#friendTable element not found on page {page_num} (current URL: {page.url}). Stopping pagination.")
             break
 
         rows = await page.locator("#friendTable tbody tr").all()
@@ -201,7 +196,7 @@ async def fetch_friends(page, user_id: int, email: str | None = None, password: 
         else:
             break
 
-    print(f"  fetch_friends: found {len(friends)} friend(s) with books.")
+    print(f"Found {len(friends)} friend(s) with books.")
     return friends
 
 
@@ -433,7 +428,7 @@ async def process_list(db_conn, page, list_id, email, password, force_seed=False
                 page_rows.append(extracted)
             except Exception as e:
                 page_all_known = False
-                tqdm.write(f"    Error parsing book in list {list_id}: {e}")
+                tqdm.write(f"Error parsing book in list {list_id}: {e}")
 
         if not page_rows:
             raise RuntimeError(f"No valid rows parsed on page {page_num}")
@@ -520,7 +515,7 @@ async def scrape_reader_libraries(db_path=None, list_ids=None, force_seed=False)
             to_scrape = get_lists_to_scrape(db_conn, force_seed)
 
             if not to_scrape:
-                print("  No new friends or incomplete lists to scrape. Use --force_seed to re-scrape.")
+                print("No new friends or incomplete lists to scrape. Use --force_seed to re-scrape.")
                 await browser.close()
                 return
 
@@ -545,7 +540,7 @@ async def scrape_reader_libraries(db_path=None, list_ids=None, force_seed=False)
                     try:
                         await process_list(db_conn, page, list_id, email, password, force_seed=force_seed)
                     except Exception as e:
-                        tqdm.write(f"  Failed list {list_id}: {e}")
+                        tqdm.write(f"Failed list {list_id}: {e}")
                         mark_list_failed(db_conn, list_id, e)
                         with contextlib.suppress(Exception):
                             await page.goto("about:blank")

@@ -112,7 +112,7 @@ async def gql(client: httpx.AsyncClient, headers: dict, operation_name: str, que
                 cooldown_delay = 30.0 * (attempt + 1)
                 _cooldown_until = max(_cooldown_until, time.monotonic() + cooldown_delay)
                 tqdm.write(
-                    f"  Rate limited (status {resp.status_code}) on {operation_name}, attempt {attempt + 1}/3 — backing off {cooldown_delay:.1f}s"
+                    f"Rate limited (status {resp.status_code}) on {operation_name}, attempt {attempt + 1}/3 — backing off {cooldown_delay:.1f}s"
                 )
                 await asyncio.sleep(cooldown_delay)
                 continue
@@ -177,8 +177,13 @@ async def resolve_and_save_book(
         if not book_node:
             db_conn.execute(
                 """
-                INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
+                INSERT INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
                 VALUES (?, 'error', 1, 'Book not found (data is null)', ?)
+                ON CONFLICT(book_id) DO UPDATE SET
+                    status = 'error',
+                    error_count = 1,
+                    last_error_message = excluded.last_error_message,
+                    date_processed = excluded.date_processed
                 """,
                 (legacy_id, now),
             )
@@ -192,8 +197,13 @@ async def resolve_and_save_book(
         if not best_book_legacy_id:
             db_conn.execute(
                 """
-                INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
+                INSERT INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
                 VALUES (?, 'error', 1, 'No best book legacy ID resolved', ?)
+                ON CONFLICT(book_id) DO UPDATE SET
+                    status = 'error',
+                    error_count = 1,
+                    last_error_message = excluded.last_error_message,
+                    date_processed = excluded.date_processed
                 """,
                 (legacy_id, now),
             )
@@ -208,8 +218,12 @@ async def resolve_and_save_book(
         if legacy_id != best_book_legacy_id:
             db_conn.execute(
                 """
-                INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, date_processed)
+                INSERT INTO crawl_queue (book_id, status, error_count, date_processed)
                 VALUES (?, 'mapped_to_canonical', 0, ?)
+                ON CONFLICT(book_id) DO UPDATE SET
+                    status = 'mapped_to_canonical',
+                    error_count = 0,
+                    date_processed = excluded.date_processed
                 """,
                 (legacy_id, now),
             )
@@ -235,17 +249,18 @@ async def resolve_and_save_book(
                         (best_book_legacy_id, edition.get("legacyId"), edition.get("id"), edition.get("title")),
                     )
 
+                db_conn.execute(
+                    """
+                    UPDATE crawl_queue
+                    SET status = 'skipped_known_edition', date_processed = ?
+                    WHERE book_id IN (SELECT edition_legacy_id FROM book_editions WHERE book_id = ?)
+                      AND status = 'pending'
+                    """,
+                    (now, best_book_legacy_id),
+                )
+
                 db_conn.commit()
                 return True
-
-            db_conn.execute(
-                """
-                INSERT OR IGNORE INTO crawl_queue (book_id, status, priority, discovered_via)
-                VALUES (?, 'pending', 0.0, 'seed')
-                """,
-                (best_book_legacy_id,),
-            )
-            db_conn.commit()
 
             result = await resolve_and_save_book(
                 client,
@@ -288,9 +303,10 @@ async def resolve_and_save_book(
         )
 
         tqdm.write(
-            f"[Editions] {book_node.get('title')[:50]!r} "
+            f"{book_node.get('title')[:50]!r} "
+            f"legacy_id={book_node.get('legacyId')} "
             f"total={total_editions} "
-            f"page1_editions={len(current_page_editions)} "
+            f"all_editions={len(all_editions)} "
             f"pending_skipped={pending_before}"
         )
 
@@ -436,7 +452,7 @@ async def resolve_and_save_book(
                                 (book_node.get("legacyId"), series_legacy_id, pos_int),
                             )
                         except Exception as e:
-                            tqdm.write(f"    Failed parsing series {series_web_url}: {e}")
+                            tqdm.write(f"Failed parsing series {series_web_url}: {e}")
 
             book_genres = book_node.get("bookGenres") or []
             for bg in book_genres:
@@ -462,7 +478,7 @@ async def resolve_and_save_book(
                                 (book_node.get("legacyId"), genre_legacy_id),
                             )
                         except Exception as e:
-                            tqdm.write(f"    Failed parsing genre {genre_web_url}: {e}")
+                            tqdm.write(f"Failed parsing genre {genre_web_url}: {e}")
 
             awards = work_details.get("awardsWon") or []
             for award in awards:
@@ -505,7 +521,7 @@ async def resolve_and_save_book(
                             ),
                         )
                     except Exception as e:
-                        tqdm.write(f"    Failed parsing award {award_web_url}: {e}")
+                        tqdm.write(f"Failed parsing award {award_web_url}: {e}")
 
             for edition in all_editions:
                 db_conn.execute(
@@ -554,8 +570,12 @@ async def resolve_and_save_book(
 
             db_conn.execute(
                 """
-                INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, date_processed)
+                INSERT INTO crawl_queue (book_id, status, error_count, date_processed)
                 VALUES (?, 'done', 0, ?)
+                ON CONFLICT(book_id) DO UPDATE SET
+                    status = 'done',
+                    error_count = 0,
+                    date_processed = excluded.date_processed
                 """,
                 (legacy_id, now),
             )
@@ -573,8 +593,13 @@ async def resolve_and_save_book(
     except InvalidLegacyIdError as e:
         db_conn.execute(
             """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
+            INSERT INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
             VALUES (?, 'error', 1, ?, ?)
+            ON CONFLICT(book_id) DO UPDATE SET
+                status = 'error',
+                error_count = 1,
+                last_error_message = excluded.last_error_message,
+                date_processed = excluded.date_processed
             """,
             (legacy_id, str(e), now),
         )
@@ -586,8 +611,13 @@ async def resolve_and_save_book(
         status = "error" if error_count >= 3 else "pending"
         db_conn.execute(
             """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
+            INSERT INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
             VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(book_id) DO UPDATE SET
+                status = excluded.status,
+                error_count = excluded.error_count,
+                last_error_message = excluded.last_error_message,
+                date_processed = excluded.date_processed
             """,
             (legacy_id, status, error_count, str(e), now),
         )
@@ -658,14 +688,29 @@ async def run_crawler(limit=None, force_recrawl=False, db_path=None):
             already_scraped = db_conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
             if already_scraped >= effective_limit:
                 print(
-                    f"  Already have {already_scraped} scraped books (>= limit of {effective_limit}). Skipping crawler."
+                    f"Already have {already_scraped} scraped books (>= limit of {effective_limit}). Skipping crawler."
                 )
                 return
 
+        placeholders = ",".join("?" for _ in allowed_sources)
+
         completed_count = db_conn.execute(
-            "SELECT COUNT(*) FROM crawl_queue WHERE status IN ('done', 'error', 'mapped_to_canonical', 'skipped_known_edition')"
+            f"""
+            SELECT COUNT(*) FROM crawl_queue
+            WHERE status IN ('done', 'error', 'mapped_to_canonical', 'skipped_known_edition')
+              AND discovered_via IN ({placeholders})
+            """,
+            allowed_sources,
         ).fetchone()[0]
-        pending_count = db_conn.execute("SELECT COUNT(*) FROM crawl_queue WHERE status = 'pending'").fetchone()[0]
+
+        pending_count = db_conn.execute(
+            f"""
+            SELECT COUNT(*) FROM crawl_queue
+            WHERE status = 'pending'
+              AND discovered_via IN ({placeholders})
+            """,
+            allowed_sources,
+        ).fetchone()[0]
 
         pbar = tqdm(
             total=completed_count + pending_count,
@@ -680,11 +725,10 @@ async def run_crawler(limit=None, force_recrawl=False, db_path=None):
                     total_scraped = db_conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
                     if total_scraped >= effective_limit:
                         print(
-                            f"  Reached crawl target: {total_scraped} total scraped books (limit was {effective_limit}). Stopping."
+                            f"Reached crawl target: {total_scraped} total scraped books (limit was {effective_limit}). Stopping."
                         )
                         break
 
-                placeholders = ",".join("?" for _ in allowed_sources)
                 query = f"""
                     SELECT book_id FROM crawl_queue
                     WHERE status = 'pending'
@@ -701,10 +745,20 @@ async def run_crawler(limit=None, force_recrawl=False, db_path=None):
                 await resolve_and_save_book(client, headers, db_conn, legacy_id, allowed_sources)
 
                 completed_now = db_conn.execute(
-                    "SELECT COUNT(*) FROM crawl_queue WHERE status IN ('done', 'error', 'mapped_to_canonical', 'skipped_known_edition')"
+                    f"""
+                    SELECT COUNT(*) FROM crawl_queue
+                    WHERE status IN ('done', 'error', 'mapped_to_canonical', 'skipped_known_edition')
+                      AND discovered_via IN ({placeholders})
+                    """,
+                    allowed_sources,
                 ).fetchone()[0]
+
                 pending_now = db_conn.execute(
-                    f"SELECT COUNT(*) FROM crawl_queue WHERE status = 'pending' AND discovered_via IN ({placeholders})",
+                    f"""
+                    SELECT COUNT(*) FROM crawl_queue
+                    WHERE status = 'pending'
+                      AND discovered_via IN ({placeholders})
+                    """,
                     allowed_sources,
                 ).fetchone()[0]
 

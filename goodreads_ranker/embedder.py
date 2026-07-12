@@ -21,7 +21,7 @@ def _ensure_ollama(model: str):
     try:
         ollama.list()
     except Exception:
-        print("  Ollama server not detected — starting 'ollama serve'...")
+        print("Ollama server not detected — starting 'ollama serve'...")
         proc = subprocess.Popen(
             ["ollama", "serve"],
             stdout=subprocess.DEVNULL,
@@ -48,9 +48,9 @@ def _ensure_ollama(model: str):
         return name if ":" in name else f"{name}:latest"
 
     if _normalise(model) not in {_normalise(m) for m in available}:
-        print(f"  Model '{model}' not found locally — pulling...")
+        print(f"Model '{model}' not found locally — pulling...")
         ollama.pull(model)
-        print(f"  Model '{model}' ready.")
+        print(f"Model '{model}' ready.")
 
     try:
         yield
@@ -177,13 +177,13 @@ def generate_embeddings(batch_size=128, model=None, db_path=None):
     with db.get_connection(db_path) as db_conn:
         all_inputs = build_embedding_inputs(db_conn)
         if not all_inputs:
-            print("  No books found. Run crawler first.")
+            print("No books found. Run crawler first.")
             return
 
         missing_ids = find_books_needing_embeddings(db_conn, all_inputs, model)
 
         if not missing_ids:
-            print(f"  Nothing to embed: all books have valid embeddings for model '{model}'.")
+            print(f"Nothing to embed: all books have valid embeddings for model '{model}'.")
             return
 
         import hashlib

@@ -189,11 +189,6 @@ CREATE TABLE IF NOT EXISTS book_similar_books (
     date_fetched      TEXT DEFAULT (strftime('%Y-%m-%d', 'now')),
     PRIMARY KEY (book_id, similar_legacy_id)
 );
-
-CREATE VIEW IF NOT EXISTS book_id_resolved AS
-SELECT edition_legacy_id AS raw_id, book_id AS canonical_id FROM book_editions
-UNION
-SELECT legacy_id AS raw_id, legacy_id AS canonical_id FROM books;
 """
 
 
@@ -215,6 +210,7 @@ def get_connection(db_path=None):
 def init_db(db_path=None):
     with get_connection(db_path) as db_conn:
         db_conn.executescript(SCHEMA)
+        db_conn.execute("DROP VIEW IF EXISTS book_id_resolved")
         db_conn.commit()
 
 

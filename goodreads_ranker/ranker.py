@@ -186,7 +186,7 @@ def run_interactive_ranking(elo_df, titles, star_rating):
             elo_df.loc[[index_a, index_b], "matches_played"] += 1
             current_min_matches = elo_df.loc[bucket_indices, "matches_played"].min()
             if current_min_matches > previous_min_matches:
-                print(f"    All books have played at least {current_min_matches} match(es)")
+                print(f"All books have played at least {current_min_matches} match(es)")
                 previous_min_matches = current_min_matches
 
             rating_a = elo_df.at[index_a, "elo_score"]
@@ -742,21 +742,21 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             """
         ).fetchone()
         orphan_count = orphan_row[0] if orphan_row else 0
-        print(f"  Unresolved library books (orphans): {orphan_count}")
+        print(f"Unresolved library books (orphans): {orphan_count}")
 
-        print("  Running ELO ratings refinement...")
+        print("Running ELO ratings refinement...")
         my_refined = refine_ratings(books_df, "my_rating", db_conn, interactive=interactive)
 
         books_df = books_df.merge(my_refined.rename("my_refined"), on="legacy_id", how="left")
 
-        print("  Loading valid embeddings...")
+        print("Loading valid embeddings...")
         has_embedding, embedded_embeddings, invalid_counts = load_valid_embeddings_for_books(
             db_conn, books_df, model=model
         )
         excluded_count = int((~has_embedding).sum())
         if excluded_count:
             print(
-                "  Excluding "
+                "Excluding "
                 f"{excluded_count} books from model inputs "
                 f"(missing={invalid_counts['missing']}, "
                 f"invalid={invalid_counts['invalid']}, "
@@ -766,7 +766,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         if embedded_embeddings.size == 0:
             raise RuntimeError("No valid embeddings found. Run embedder before ranking.")
 
-        print("  Calibrating friend ratings...")
+        print("Calibrating friend ratings...")
 
         embedded_books_df = books_df[has_embedding].copy().reset_index(drop=True)
 
@@ -783,8 +783,8 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         )
 
         my_rating_count = len(books_df[books_df["my_rating"].notna()])
-        print("  Taste calibration")
-        print(f"    My ratings ({my_rating_count})")
+        print("Taste calibration")
+        print(f"My ratings ({my_rating_count})")
 
         friend_meta = db_conn.execute("SELECT list_id, username FROM readers WHERE is_self != 1").fetchall()
         list_to_user = {int(row["list_id"]): row["username"] or str(row["list_id"]) for row in friend_meta}
@@ -799,9 +799,9 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                 lid = int(row["list_id"])
                 username = list_to_user.get(lid, str(lid))
                 overlap_c = int(row["overlap_count"])
-                print(f"    {username} - {lid} ({overlap_c} books)")
+                print(f"{username} - {lid} ({overlap_c} books)")
 
-        print("  Running graph GCN propagation...")
+        print("Running graph GCN propagation...")
         device = torch.device(
             "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         )
@@ -832,7 +832,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         del propagated, adj_matrix, embeddings_tensor
 
         if optimize:
-            print("  Tuning hyperparameters via Nevergrad (budget=200)...")
+            print("Tuning hyperparameters via Nevergrad (budget=200)...")
             friend_params = prep_optimization(
                 embedded_books_df,
                 precomputed_embeddings,
@@ -854,11 +854,11 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             db.save_prediction_hyperparams(db_conn, "friend_params", friend_params)
             db.save_prediction_hyperparams(db_conn, "solo_params", solo_params)
         else:
-            print("  Using stored/default hyperparameters...")
+            print("Using stored/default hyperparameters...")
             friend_params = get_or_create_prediction_hyperparams(db_conn, "friend_params", DEFAULT_FRIEND_PARAMS)
             solo_params = get_or_create_prediction_hyperparams(db_conn, "solo_params", DEFAULT_SOLO_PARAMS)
 
-        print("  Running ensemble models...")
+        print("Running ensemble models...")
         friend_final_pred_embedded = run_optimized(
             friend_params, embedded_books_df, precomputed_embeddings, "training_ratings"
         )
@@ -870,7 +870,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         friend_final_pred[embedded_positions] = friend_final_pred_embedded
         solo_final_pred[embedded_positions] = solo_final_pred_embedded
 
-        print("  Formulating final recommendations...")
+        print("Formulating final recommendations...")
         star_cols = ["star_1", "star_2", "star_3", "star_4", "star_5"]
         books_df["rating_count"] = books_df[star_cols].sum(axis=1)
 
@@ -908,7 +908,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         books_df["pred_rating"] = friend_pred * solo_pred
         books_df["final_rating"] = count_adjusted_scaled * friend_pred * solo_pred
 
-        print("  Saving predictions to database...")
+        print("Saving predictions to database...")
         now_str = datetime.now().strftime("%Y-%m-%d")
         predictions_data = []
 
@@ -954,4 +954,4 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                 prune_ids = [x[0] for x in predictions_data]
                 db_conn.execute(f"DELETE FROM book_predictions WHERE book_id NOT IN ({placeholders})", prune_ids)
 
-        print(f"  Saved predictions for {len(predictions_data)} books.")
+        print(f"Saved predictions for {len(predictions_data)} books.")
