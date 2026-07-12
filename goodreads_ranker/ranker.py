@@ -81,7 +81,7 @@ def load_valid_embeddings_for_books(db_conn, books_df, model=None):
 
     rows = db_conn.execute(
         """
-        SELECT book_id AS legacy_id, dim, vector, text_hash
+        SELECT book_id AS legacy_id, vector, text_hash
         FROM embeddings
         WHERE embedding_model = ?
         """,
@@ -107,9 +107,8 @@ def load_valid_embeddings_for_books(db_conn, books_df, model=None):
             valid_mask.append(False)
             continue
 
-        dim = int(row["dim"])
         vector_blob = row["vector"]
-        if not db.is_valid_embedding_blob(vector_blob, dim):
+        if not db.is_valid_embedding_blob(vector_blob):
             counts["invalid"] += 1
             valid_mask.append(False)
             continue
@@ -120,6 +119,8 @@ def load_valid_embeddings_for_books(db_conn, books_df, model=None):
             valid_mask.append(False)
             continue
 
+        vector = np.frombuffer(vector_blob, dtype=np.float32).copy()
+        dim = len(vector)
         if expected_dim is None:
             expected_dim = dim
         elif dim != expected_dim:
@@ -127,7 +128,6 @@ def load_valid_embeddings_for_books(db_conn, books_df, model=None):
             valid_mask.append(False)
             continue
 
-        vector = np.frombuffer(vector_blob, dtype=np.float32).copy()
         valid_vectors.append(vector)
         valid_mask.append(True)
 
@@ -903,7 +903,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         books_df["final_rating"] = count_adjusted_scaled * friend_pred * solo_pred
 
         print("  Saving predictions to database...")
-        now_str = datetime.now().isoformat()
+        now_str = datetime.now().strftime("%Y-%m-%d")
         predictions_data = []
 
         for row in books_df.to_dict(orient="records"):
@@ -938,7 +938,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                 "count_adjusted_rating",
                 "pred_rating",
                 "final_rating",
-                "updated_at",
+                "date_updated",
             ],
         )
 

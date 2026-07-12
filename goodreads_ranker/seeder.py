@@ -309,7 +309,7 @@ def mark_list_complete(db_conn, list_id):
         """
         UPDATE readers
         SET scrape_complete = 1,
-            date_last_scraped = ?,
+            date_scraped = ?,
             scrape_error = NULL
         WHERE list_id = ?
         """,
@@ -398,12 +398,32 @@ async def extract_friend_row(row, list_id):
         if not date_added:
             date_added = clean_text(await date_added_el.inner_text())
 
+    # Standardize dates to %Y-%m-%d format if possible
+    def format_date(dt_str):
+        if not dt_str:
+            return ""
+        # Try parsing common formats
+        for fmt in ("%B %d, %Y", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%fZ", "%b %d, %Y"):
+            try:
+                # Strip leading/trailing space first
+                return datetime.strptime(dt_str.strip(), fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        # Fallback to try parsing as generic datetime
+        try:
+            from dateutil import parser
+
+            return parser.parse(dt_str).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        return dt_str
+
     return {
         "list_id": int(list_id),
         "book_id": legacy_id,
         "rating": rating,
-        "date_read": date_read,
-        "date_added": date_added,
+        "date_read": format_date(date_read),
+        "date_added": format_date(date_added),
     }
 
 
@@ -464,10 +484,7 @@ async def process_list(db_conn, page, list_id, email, password, force_seed=False
         total_rows += len(page_rows)
         upsert_extracted(db_conn, page_rows)
 
-        tqdm.write(f"  [{list_id}] page {page_num} done ({len(page_rows)} rows)")
-
         if page_all_known and not force_seed:
-            tqdm.write("  P1 unchanged, stopping early")
             break
 
         next_button = await page.query_selector("a.next_page")

@@ -138,7 +138,6 @@ def find_books_needing_embeddings(db_conn, all_inputs, model):
     cursor = db_conn.execute(
         """
         SELECT b.legacy_id,
-               e.dim,
                e.vector,
                e.text_hash
         FROM books b
@@ -149,7 +148,6 @@ def find_books_needing_embeddings(db_conn, all_inputs, model):
     )
 
     queued = []
-    expected_dim = None
     for row in cursor.fetchall():
         legacy_id = int(row["legacy_id"])
         if legacy_id not in all_inputs:
@@ -157,13 +155,7 @@ def find_books_needing_embeddings(db_conn, all_inputs, model):
         if row["vector"] is None:
             queued.append(legacy_id)
             continue
-        if not db.is_valid_embedding_blob(row["vector"], row["dim"]):
-            queued.append(legacy_id)
-            continue
-        dim = int(row["dim"])
-        if expected_dim is None:
-            expected_dim = dim
-        elif dim != expected_dim:
+        if not db.is_valid_embedding_blob(row["vector"]):
             queued.append(legacy_id)
             continue
 

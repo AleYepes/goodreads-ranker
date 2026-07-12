@@ -17,13 +17,13 @@ CREATE TABLE IF NOT EXISTS readers (
     user_id            INTEGER,
     is_self            INTEGER DEFAULT 0,
     scrape_complete    INTEGER DEFAULT 0,
-    date_last_scraped  TEXT,
+    date_scraped       TEXT,
     scrape_error       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS reader_libraries (
     list_id  INTEGER NOT NULL,
-    book_id  INTEGER NOT NULL,   -- renamed from legacy_id
+    book_id  INTEGER NOT NULL,
     rating   INTEGER,
     date_read  TEXT,
     date_added TEXT,
@@ -31,35 +31,34 @@ CREATE TABLE IF NOT EXISTS reader_libraries (
 );
 
 CREATE TABLE IF NOT EXISTS elo_ratings (
-    book_id          INTEGER PRIMARY KEY,   -- renamed from legacy_id
+    book_id          INTEGER PRIMARY KEY,
     original_rating  REAL,
     elo_score        REAL DEFAULT 1200.0,
     matches_played   INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS embeddings (
-    book_id          INTEGER,              -- renamed from legacy_id
+    book_id          INTEGER,           
     embedding_model  TEXT,
-    dim              INTEGER NOT NULL,
     vector           BLOB NOT NULL,
     text_hash        TEXT NOT NULL,
     PRIMARY KEY (book_id, embedding_model)
 );
 
 CREATE TABLE IF NOT EXISTS predictions (
-    book_id                INTEGER PRIMARY KEY,   -- renamed from legacy_id
+    book_id                INTEGER PRIMARY KEY,
     solo_pred_rating       REAL,
     friend_pred_rating     REAL,
     count_adjusted_rating  REAL,
     pred_rating            REAL,
     final_rating           REAL,
-    updated_at             TEXT
+    date_updated           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS model_params (
-    name       TEXT PRIMARY KEY,
+    name        TEXT PRIMARY KEY,
     params_json TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    date_updated TEXT NOT NULL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_readers_single_self
@@ -68,14 +67,14 @@ ON readers(is_self) WHERE is_self = 1;
 -- 2. PERSISTENT CRAWL QUEUE
 
 CREATE TABLE IF NOT EXISTS crawl_queue (
-    book_id           INTEGER PRIMARY KEY,   -- renamed from legacy_id
-    status            TEXT NOT NULL DEFAULT 'pending',
-    priority          REAL NOT NULL DEFAULT 0.0,
-    error_count       INTEGER DEFAULT 0,
+    book_id            INTEGER PRIMARY KEY,
+    status             TEXT NOT NULL DEFAULT 'pending',
+    priority           REAL NOT NULL DEFAULT 0.0,
+    error_count        INTEGER DEFAULT 0,
     last_error_message TEXT,
-    discovered_via    TEXT,
-    enqueued_at       TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    processed_at      TEXT
+    discovered_via     TEXT,
+    date_enqueued      TEXT DEFAULT (strftime('%Y-%m-%d', 'now')),
+    date_processed     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_crawl_queue_priority
@@ -119,7 +118,7 @@ CREATE TABLE IF NOT EXISTS books (
     star_5                   INTEGER DEFAULT 0,
     currently_reading_count  INTEGER DEFAULT 0,
     to_read_count            INTEGER DEFAULT 0,
-    fetched_at               TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    date_fetched             TEXT DEFAULT (strftime('%Y-%m-%d', 'now'))
 );
 
 -- 5. SERIES (entity + junction)
@@ -161,18 +160,17 @@ CREATE TABLE IF NOT EXISTS book_editions (
     book_id           INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
     edition_legacy_id INTEGER NOT NULL,   -- sibling edition's GR legacy_id, not a FK
     title             TEXT,
-    discovered_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    date_discovered   TEXT DEFAULT (strftime('%Y-%m-%d', 'now')),
     PRIMARY KEY (book_id, edition_legacy_id)
 );
 
 CREATE TABLE IF NOT EXISTS similar_books (
     book_id           INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
     similar_legacy_id INTEGER NOT NULL,   -- similar book's GR legacy_id, not a FK
-    rank              INTEGER,
     title             TEXT,
     average_rating    REAL,
     ratings_count     INTEGER,
-    fetched_at        TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    date_fetched      TEXT DEFAULT (strftime('%Y-%m-%d', 'now')),
     PRIMARY KEY (book_id, similar_legacy_id)
 );
 """
@@ -214,11 +212,17 @@ def vector_to_blob(vec):
     return vec.astype(np.float32).tobytes()
 
 
-def is_valid_embedding_blob(blob, dim):
-    if blob is None or dim is None:
+def infer_dim_from_blob(blob):
+    """Infer embedding dimension from blob size (float32 = 4 bytes each)."""
+    if blob is None:
+        return None
+    return len(blob) // np.dtype(np.float32).itemsize
+
+
+def is_valid_embedding_blob(blob):
+    if blob is None:
         return False
-    expected_bytes = int(dim) * np.dtype(np.float32).itemsize
-    if len(blob) != expected_bytes:
+    if len(blob) % np.dtype(np.float32).itemsize != 0:
         return False
     vector = np.frombuffer(blob, dtype=np.float32)
     return bool(vector.size and np.any(vector != 0))
@@ -227,10 +231,10 @@ def is_valid_embedding_blob(blob, dim):
 def save_model_params(db_conn, name, params):
     db_conn.execute(
         """
-        INSERT OR REPLACE INTO model_params (name, params_json, updated_at)
+        INSERT OR REPLACE INTO model_params (name, params_json, date_updated)
         VALUES (?, ?, ?)
         """,
-        (name, json.dumps(params, sort_keys=True), datetime.now().isoformat()),
+        (name, json.dumps(params, sort_keys=True), datetime.now().strftime("%Y-%m-%d")),
     )
     db_conn.commit()
 
@@ -246,17 +250,16 @@ def load_model_params(db_conn, name):
 
 
 def save_embeddings(db_conn, legacy_ids, vectors, model, text_hashes):
-    dim = vectors.shape[1]
     rows = []
     for i, bid in enumerate(legacy_ids):
         bid_int = int(bid)
         h = text_hashes.get(bid_int) if isinstance(text_hashes, dict) else text_hashes[i]
-        rows.append((bid_int, model, dim, vector_to_blob(vectors[i]), h))
+        rows.append((bid_int, model, vector_to_blob(vectors[i]), h))
 
     db_conn.executemany(
         """
-        INSERT OR REPLACE INTO embeddings (book_id, embedding_model, dim, vector, text_hash)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO embeddings (book_id, embedding_model, vector, text_hash)
+        VALUES (?, ?, ?, ?)
         """,
         rows,
     )

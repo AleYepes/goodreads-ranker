@@ -3,7 +3,7 @@ import base64
 import json
 import math
 import os
-from datetime import datetime
+from datetime import date
 
 import httpx
 from tqdm import tqdm
@@ -194,7 +194,7 @@ async def fetch_social_signals(client: httpx.AsyncClient, headers: dict, book_kc
 async def resolve_and_save_book(
     client: httpx.AsyncClient, headers: dict, db_conn, legacy_id: int, allowed_sources: list
 ) -> bool:
-    now = datetime.utcnow().isoformat() + "Z"
+    now = date.today().strftime("%Y-%m-%d")
 
     # 1. Probe fetch
     try:
@@ -202,7 +202,7 @@ async def resolve_and_save_book(
     except InvalidLegacyIdError as e:
         db_conn.execute(
             """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, processed_at)
+            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
             VALUES (?, 'error', 1, ?, ?)
             """,
             (legacy_id, str(e), now),
@@ -215,7 +215,7 @@ async def resolve_and_save_book(
         status = "error" if error_count >= 3 else "pending"
         db_conn.execute(
             """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, processed_at)
+            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
             VALUES (?, ?, ?, ?, ?)
             """,
             (legacy_id, status, error_count, str(e), now),
@@ -227,7 +227,7 @@ async def resolve_and_save_book(
     if not book_node:
         db_conn.execute(
             """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, processed_at)
+            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
             VALUES (?, 'error', 1, 'Book not found (data is null)', ?)
             """,
             (legacy_id, now),
@@ -254,7 +254,7 @@ async def resolve_and_save_book(
     if legacy_id != best_book_legacy_id:
         db_conn.execute(
             """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, processed_at)
+            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, date_processed)
             VALUES (?, 'mapped_to_canonical', 0, ?)
             """,
             (legacy_id, now),
@@ -282,7 +282,7 @@ async def resolve_and_save_book(
     except InvalidLegacyIdError as e:
         db_conn.execute(
             """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, processed_at)
+            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
             VALUES (?, 'error', 1, ?, ?)
             """,
             (legacy_id, str(e), now),
@@ -295,7 +295,7 @@ async def resolve_and_save_book(
         status = "error" if error_count >= 3 else "pending"
         db_conn.execute(
             """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, processed_at)
+            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
             VALUES (?, ?, ?, ?, ?)
             """,
             (legacy_id, status, error_count, str(e), now),
@@ -307,7 +307,7 @@ async def resolve_and_save_book(
     if not book_node:
         db_conn.execute(
             """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, processed_at)
+            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
             VALUES (?, 'error', 1, 'Book not found on full fetch', ?)
             """,
             (legacy_id, now),
@@ -399,7 +399,7 @@ async def resolve_and_save_book(
                     legacy_id, kca_id, author_id, author_role, title, title_complete, description, web_url,
                     asin, isbn, isbn13, format, num_pages, language_name, publisher, publication_time,
                     original_publication_time, star_1, star_2, star_3, star_4, star_5,
-                    currently_reading_count, to_read_count, fetched_at
+                    currently_reading_count, to_read_count, date_fetched
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -498,19 +498,18 @@ async def resolve_and_save_book(
                     (book_node.get("legacyId"), edition.get("legacyId"), edition.get("title")),
                 )
 
-            for rank_idx, sim in enumerate(similar_list):
+            for sim in similar_list:
                 sim_work = sim.get("work") or {}
                 sim_stats = sim_work.get("stats") or {}
                 db_conn.execute(
                     """
                     INSERT OR REPLACE INTO similar_books (
-                        book_id, similar_legacy_id, rank, title, average_rating, ratings_count, fetched_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        book_id, similar_legacy_id, title, average_rating, ratings_count, date_fetched
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         book_node.get("legacyId"),
                         sim.get("legacyId"),
-                        rank_idx + 1,
                         sim.get("title"),
                         sim_stats.get("averageRating"),
                         sim_stats.get("ratingsCount"),
@@ -536,7 +535,7 @@ async def resolve_and_save_book(
 
             db_conn.execute(
                 """
-                INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, processed_at)
+                INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, date_processed)
                 VALUES (?, 'done', 0, ?)
                 """,
                 (legacy_id, now),
@@ -546,7 +545,7 @@ async def resolve_and_save_book(
             db_conn.execute(
                 """
                 UPDATE crawl_queue
-                SET status = 'skipped_known_edition', processed_at = ?
+                SET status = 'skipped_known_edition', date_processed = ?
                 WHERE book_id IN (SELECT edition_legacy_id FROM book_editions WHERE book_id = ?)
                   AND status = 'pending'
                 """,
@@ -559,7 +558,7 @@ async def resolve_and_save_book(
         status = "error" if error_count >= 3 else "pending"
         db_conn.execute(
             """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, processed_at)
+            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
             VALUES (?, ?, ?, ?, ?)
             """,
             (legacy_id, status, error_count, str(e), now),
@@ -590,7 +589,7 @@ def handle_force_recrawl(db_conn):
         UPDATE crawl_queue
         SET status = 'pending'
         WHERE book_id IN (
-            SELECT legacy_id FROM books WHERE datetime(fetched_at) < datetime('now', '-30 days')
+            SELECT legacy_id FROM books WHERE date_fetched < date('now', '-30 days')
         )
         AND status = 'done'
         """
