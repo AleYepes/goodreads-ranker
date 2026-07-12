@@ -3,22 +3,7 @@ import asyncio
 import fire
 
 from goodreads_ranker import db
-
-
-def as_bool(value):
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() not in {"0", "false", "no", "off", ""}
-    return bool(value)
-
-
-def parse_optional_int(value):
-    if value is None:
-        return None
-    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
-        return None
-    return int(value)
+from goodreads_ranker.utils import as_bool, parse_optional_int
 
 
 class GoodreadsRankerCLI:
@@ -70,10 +55,6 @@ class GoodreadsRankerCLI:
         optimize=False,
         model=None,
     ):
-        db.init_db()
-        force_seed = as_bool(force_seed)
-        force_recrawl = as_bool(force_recrawl)
-        optimize = as_bool(optimize)
         limit = parse_optional_int(limit)
 
         print("\nSeeding database")

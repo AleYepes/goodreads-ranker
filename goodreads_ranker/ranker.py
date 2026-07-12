@@ -558,7 +558,6 @@ def prep_optimization(
         knn_weight,
         brr_weight,
     ):
-
         all_embeddings = precomputed_embeddings[num_propagations]
         train_embeddings = all_embeddings[training_mask]
         y = my_ratings_scaled
@@ -709,8 +708,8 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     with db.get_connection(db_path) as db_conn:
         try:
             self_list_id = db.get_self_list_id(db_conn)
-        except RuntimeError:
-            raise RuntimeError("No self reader found. Run seed first.")
+        except RuntimeError as err:
+            raise RuntimeError("No self reader found. Run seed first.") from err
 
         cursor = db_conn.execute("SELECT * FROM books ORDER BY legacy_id")
         books_rows = cursor.fetchall()
@@ -729,19 +728,11 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             (self_list_id,),
         )
         books_df = pd.DataFrame([dict(r) for r in cursor.fetchall()])
-        books_df["my_rating"] = pd.Series(
-            pd.to_numeric(books_df["my_rating"], errors="coerce"),
-            index=books_df.index,
-            name="my_rating",
-        ).replace(0, np.nan)
-        books_df["description"] = (
-            books_df["description"].fillna("").astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
-        )
+        books_df["my_rating"] = cast(Any, pd.to_numeric(books_df["my_rating"], errors="coerce")).replace(0, np.nan)
 
         if books_df["my_rating"].notna().sum() == 0:
             raise RuntimeError("No self rating records found. Run seed first.")
 
-        # Print orphan count
         orphan_row = db_conn.execute(
             """
             SELECT COUNT(DISTINCT l.book_id)
@@ -782,13 +773,13 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         similar_friend_ratings, similar_friends, friend_scores = get_similar_friend_ratings(
             embedded_books_df, db_conn, embedded_embeddings, min_correlation=0.3
         )
-        friend_ratings_series = pd.Series(similar_friend_ratings)
-        friend_ratings_dict = friend_ratings_series.to_dict()
-        books_df["training_ratings"] = pd.Series(books_df["my_refined"]).fillna(
-            pd.Series(books_df["legacy_id"]).map(friend_ratings_dict)
+        friend_ratings_dict = similar_friend_ratings.to_dict()
+
+        books_df["training_ratings"] = cast(Any, books_df["my_refined"]).fillna(
+            cast(Any, books_df["legacy_id"]).map(cast(Any, friend_ratings_dict))
         )
-        embedded_books_df["training_ratings"] = pd.Series(embedded_books_df["my_refined"]).fillna(
-            pd.Series(embedded_books_df["legacy_id"]).map(friend_ratings_dict)
+        embedded_books_df["training_ratings"] = cast(Any, embedded_books_df["my_refined"]).fillna(
+            cast(Any, embedded_books_df["legacy_id"]).map(cast(Any, friend_ratings_dict))
         )
 
         my_rating_count = len(books_df[books_df["my_rating"].notna()])
@@ -883,26 +874,24 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         star_cols = ["star_1", "star_2", "star_3", "star_4", "star_5"]
         books_df["rating_count"] = books_df[star_cols].sum(axis=1)
 
-        def get_avg_rating(row):
-            total_stars = (
-                row["star_1"] * 1 + row["star_2"] * 2 + row["star_3"] * 3 + row["star_4"] * 4 + row["star_5"] * 5
-            )
-            count = row["rating_count"]
-            return total_stars / count if count > 0 else np.nan
-
-        books_df["avg_rating"] = books_df.apply(get_avg_rating, axis=1)
+        total_stars = (
+            books_df["star_1"] * 1
+            + books_df["star_2"] * 2
+            + books_df["star_3"] * 3
+            + books_df["star_4"] * 4
+            + books_df["star_5"] * 5
+        )
+        books_df["avg_rating"] = np.where(books_df["rating_count"] > 0, total_stars / books_df["rating_count"], np.nan)
 
         global_avg_rating = books_df["avg_rating"].mean()
         m = books_df["rating_count"].quantile(0.10)
 
-        def weighted_rating(x, m=m, global_avg=global_avg_rating):
-            v = float(x["rating_count"])
-            book_avg_rating = float(x["avg_rating"]) if pd.notna(x["avg_rating"]) else global_avg
-            if v == 0:
-                return global_avg
-            return (v / (v + m) * book_avg_rating) + (m / (v + m) * global_avg)
-
-        count_adjusted = books_df.apply(weighted_rating, axis=1)
+        v = books_df["rating_count"].astype(float)
+        book_avg = books_df["avg_rating"].fillna(global_avg_rating).astype(float)
+        denom = v + m
+        count_adjusted = np.where(
+            denom > 0, (v / denom) * book_avg + (m / denom) * global_avg_rating, global_avg_rating
+        )
 
         scaler = MinMaxScaler()
         valid_mask = ~np.isnan(solo_final_pred)

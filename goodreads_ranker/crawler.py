@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import json
 import math
 import os
@@ -154,16 +155,16 @@ async def resolve_and_save_book(
     db_conn,
     legacy_id: int,
     allowed_sources: list,
-    previous_editions: list = None,
-    pagination_token: str = None,
+    previous_editions: list[dict] | None = None,
+    pagination_token: str | None = None,
 ) -> bool:
     now = date.today().strftime("%Y-%m-%d")
 
-    pagination_variables = {"limit": 20}
-    if pagination_token:
-        pagination_variables["after"] = pagination_token
-
     try:
+        pagination_variables: dict[str, int | str] = {"limit": 20}
+        if pagination_token:
+            pagination_variables["after"] = pagination_token
+
         full_data = await gql(
             client,
             headers,
@@ -171,160 +172,133 @@ async def resolve_and_save_book(
             BOOK_QUERY,
             {"legacyBookId": legacy_id, "pagination": pagination_variables},
         )
-    except InvalidLegacyIdError as e:
-        db_conn.execute(
-            """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
-            VALUES (?, 'error', 1, ?, ?)
-            """,
-            (legacy_id, str(e), now),
-        )
-        db_conn.commit()
-        return False
-    except Exception as e:
-        row = db_conn.execute("SELECT error_count FROM crawl_queue WHERE book_id = ?", (legacy_id,)).fetchone()
-        error_count = (row["error_count"] or 0) + 1 if row else 1
-        status = "error" if error_count >= 3 else "pending"
-        db_conn.execute(
-            """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (legacy_id, status, error_count, str(e), now),
-        )
-        db_conn.commit()
-        return False
 
-    book_node = full_data.get("getBookByLegacyId")
-    if not book_node:
-        db_conn.execute(
-            """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
-            VALUES (?, 'error', 1, 'Book not found (data is null)', ?)
-            """,
-            (legacy_id, now),
-        )
-        db_conn.commit()
-        return False
-
-    work_node = book_node.get("work") or {}
-    best_book = work_node.get("bestBook") or {}
-    best_book_legacy_id = best_book.get("legacyId") or book_node.get("legacyId")
-
-    if not best_book_legacy_id:
-        db_conn.execute(
-            """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
-            VALUES (?, 'error', 1, 'No best book legacy ID resolved', ?)
-            """,
-            (legacy_id, now),
-        )
-        db_conn.commit()
-        return False
-
-    # Extract current page editions early so we can safely pass them to the recursive call if needed
-    editions_conn = work_node.get("editions") or {}
-    total_editions = editions_conn.get("totalCount") or 0
-    page1_edges = editions_conn.get("edges") or []
-    current_page_editions = [edge["node"] for edge in page1_edges if edge and edge.get("node")]
-
-    if legacy_id != best_book_legacy_id:
-        db_conn.execute(
-            """
-            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, date_processed)
-            VALUES (?, 'mapped_to_canonical', 0, ?)
-            """,
-            (legacy_id, now),
-        )
-        db_conn.commit()
-
-        canonical_row = db_conn.execute("SELECT 1 FROM books WHERE legacy_id = ?", (best_book_legacy_id,)).fetchone()
-        if canonical_row:
+        book_node = full_data.get("getBookByLegacyId")
+        if not book_node:
             db_conn.execute(
-                "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id, title) "
-                "VALUES (?, ?, ?, ?)",
-                (best_book_legacy_id, legacy_id, book_node.get("id"), book_node.get("title")),
+                """
+                INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
+                VALUES (?, 'error', 1, 'Book not found (data is null)', ?)
+                """,
+                (legacy_id, now),
             )
+            db_conn.commit()
+            return False
 
-            for edition in current_page_editions:
+        work_node = book_node.get("work") or {}
+        best_book = work_node.get("bestBook") or {}
+        best_book_legacy_id = best_book.get("legacyId") or book_node.get("legacyId")
+
+        if not best_book_legacy_id:
+            db_conn.execute(
+                """
+                INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
+                VALUES (?, 'error', 1, 'No best book legacy ID resolved', ?)
+                """,
+                (legacy_id, now),
+            )
+            db_conn.commit()
+            return False
+
+        editions_conn = work_node.get("editions") or {}
+        total_editions = editions_conn.get("totalCount") or 0
+        page1_edges = editions_conn.get("edges") or []
+        current_page_editions = [edge["node"] for edge in page1_edges if edge and edge.get("node")]
+
+        if legacy_id != best_book_legacy_id:
+            db_conn.execute(
+                """
+                INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, date_processed)
+                VALUES (?, 'mapped_to_canonical', 0, ?)
+                """,
+                (legacy_id, now),
+            )
+            db_conn.commit()
+
+            canonical_row = db_conn.execute(
+                "SELECT 1 FROM books WHERE legacy_id = ?", (best_book_legacy_id,)
+            ).fetchone()
+            if canonical_row:
                 db_conn.execute(
-                    """
-                    INSERT OR REPLACE INTO book_editions (
-                        book_id, edition_legacy_id, edition_kca_id, title
-                    ) VALUES (?, ?, ?, ?)
-                    """,
-                    (best_book_legacy_id, edition.get("legacyId"), edition.get("id"), edition.get("title")),
+                    "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id, title) "
+                    "VALUES (?, ?, ?, ?)",
+                    (best_book_legacy_id, legacy_id, book_node.get("id"), book_node.get("title")),
                 )
 
-            db_conn.commit()
-            return True
+                for edition in current_page_editions:
+                    db_conn.execute(
+                        """
+                        INSERT OR REPLACE INTO book_editions (
+                            book_id, edition_legacy_id, edition_kca_id, title
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (best_book_legacy_id, edition.get("legacyId"), edition.get("id"), edition.get("title")),
+                    )
 
-        db_conn.execute(
-            """
-            INSERT OR IGNORE INTO crawl_queue (book_id, status, priority, discovered_via)
-            VALUES (?, 'pending', 0.0, 'seed')
-            """,
-            (best_book_legacy_id,),
-        )
-        db_conn.commit()
+                db_conn.commit()
+                return True
 
-        result = await resolve_and_save_book(
-            client,
-            headers,
-            db_conn,
-            best_book_legacy_id,
-            allowed_sources,
-            previous_editions=current_page_editions,
-            pagination_token=make_after_token(2),
-        )
-        if result:
             db_conn.execute(
-                "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id, title) "
-                "VALUES (?, ?, ?, ?)",
-                (best_book_legacy_id, legacy_id, book_node.get("id"), book_node.get("title")),
+                """
+                INSERT OR IGNORE INTO crawl_queue (book_id, status, priority, discovered_via)
+                VALUES (?, 'pending', 0.0, 'seed')
+                """,
+                (best_book_legacy_id,),
             )
             db_conn.commit()
-        return result
 
-    book_kca_id = book_node.get("id")
-    all_editions = current_page_editions + (previous_editions or [])
+            result = await resolve_and_save_book(
+                client,
+                headers,
+                db_conn,
+                best_book_legacy_id,
+                allowed_sources,
+                previous_editions=current_page_editions,
+                pagination_token=make_after_token(2),
+            )
+            if result:
+                db_conn.execute(
+                    "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id, title) "
+                    "VALUES (?, ?, ?, ?)",
+                    (best_book_legacy_id, legacy_id, book_node.get("id"), book_node.get("title")),
+                )
+                db_conn.commit()
+            return result
 
-    try:
-        similar_list = await fetch_similar_books(client, headers, book_kca_id)
-    except Exception:
-        similar_list = []
+        book_kca_id = book_node.get("id")
+        all_editions = current_page_editions + (previous_editions or [])
 
-    pending_before = (
-        db_conn.execute(
-            """
-        SELECT COUNT(*)
-        FROM crawl_queue
-        WHERE status='pending'
-        AND book_id IN ({})
-        """.format(",".join("?" * len(all_editions))),
-            [e["legacyId"] for e in all_editions],
-        ).fetchone()[0]
-        if all_editions
-        else 0
-    )
+        try:
+            similar_list = await fetch_similar_books(client, headers, book_kca_id)
+        except Exception:
+            similar_list = []
 
-    tqdm.write(
-        f"[Editions] {book_node.get('title')[:50]!r} "
-        f"total={total_editions} "
-        f"page1_editions={len(current_page_editions)} "
-        f"pending_skipped={pending_before}"
-    )
+        pending_before = (
+            db_conn.execute(
+                """
+            SELECT COUNT(*)
+            FROM crawl_queue
+            WHERE status='pending'
+            AND book_id IN ({})
+            """.format(",".join("?" * len(all_editions))),
+                [e["legacyId"] for e in all_editions],
+            ).fetchone()[0]
+            if all_editions
+            else 0
+        )
 
-    try:
+        tqdm.write(
+            f"[Editions] {book_node.get('title')[:50]!r} "
+            f"total={total_editions} "
+            f"page1_editions={len(current_page_editions)} "
+            f"pending_skipped={pending_before}"
+        )
+
         with db_conn:
             work_stats = work_node.get("stats") or {}
             work_details = work_node.get("details") or {}
             dist = work_stats.get("ratingsCountDist") or []
-            star_1 = dist[0] if len(dist) > 0 else 0
-            star_2 = dist[1] if len(dist) > 1 else 0
-            star_3 = dist[2] if len(dist) > 2 else 0
-            star_4 = dist[3] if len(dist) > 3 else 0
-            star_5 = dist[4] if len(dist) > 4 else 0
+            stars = [dist[i] if len(dist) > i else 0 for i in range(5)]
 
             details = book_node.get("details") or {}
             lang = details.get("language") or {}
@@ -355,11 +329,11 @@ async def resolve_and_save_book(
                     details.get("publisher"),
                     details.get("publicationTime"),
                     work_details.get("publicationTime"),
-                    star_1,
-                    star_2,
-                    star_3,
-                    star_4,
-                    star_5,
+                    stars[0],
+                    stars[1],
+                    stars[2],
+                    stars[3],
+                    stars[4],
                     now,
                 ),
             )
@@ -451,13 +425,8 @@ async def resolve_and_save_book(
                             pos = bs.get("userPosition")
                             pos_int = None
                             if pos is not None:
-                                try:
-                                    pos_int = int(pos)
-                                except ValueError:
-                                    try:
-                                        pos_int = int(float(pos))
-                                    except ValueError:
-                                        pass
+                                with contextlib.suppress(ValueError, TypeError):
+                                    pos_int = int(float(pos))
 
                             db_conn.execute(
                                 """
@@ -601,6 +570,16 @@ async def resolve_and_save_book(
                 (now, book_node.get("legacyId")),
             )
 
+    except InvalidLegacyIdError as e:
+        db_conn.execute(
+            """
+            INSERT OR REPLACE INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
+            VALUES (?, 'error', 1, ?, ?)
+            """,
+            (legacy_id, str(e), now),
+        )
+        db_conn.commit()
+        return False
     except Exception as e:
         row = db_conn.execute("SELECT error_count FROM crawl_queue WHERE book_id = ?", (legacy_id,)).fetchone()
         error_count = (row["error_count"] or 0) + 1 if row else 1

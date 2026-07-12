@@ -38,6 +38,7 @@ exclude = [
     "docs",
     ".agents",
     "venv",
+    "__pycache__",
 ]
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false

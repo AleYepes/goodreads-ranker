@@ -9,7 +9,7 @@ import numpy as np
 DB_PATH = Path("data/goodreads.db")
 
 SCHEMA = """
--- 1. COMPATIBILITY TABLES (legacy_id → book_id rename throughout)
+-- 1. COMPATIBILITY TABLES
 
 CREATE TABLE IF NOT EXISTS readers (
     list_id            INTEGER PRIMARY KEY,
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS book_elo_ratings (
 );
 
 CREATE TABLE IF NOT EXISTS book_embeddings (
-    book_id          INTEGER,           
+    book_id          INTEGER,
     embedding_model  TEXT,
     vector           BLOB NOT NULL,
     text_hash        TEXT NOT NULL,
@@ -91,10 +91,10 @@ CREATE TABLE IF NOT EXISTS contributors (
     followers_count INTEGER DEFAULT 0
 );
 
--- 4. CORE ENTITY: BOOKS (merged books + works)
+-- 4. CORE ENTITY: BOOKS
 CREATE TABLE IF NOT EXISTS books (
-    legacy_id                INTEGER PRIMARY KEY,   -- always the canonical (bestBook) edition
-    kca_id                   TEXT,                  -- "kca://book/..." for API calls
+    legacy_id                INTEGER PRIMARY KEY,
+    kca_id                   TEXT,
     title                    TEXT,
     title_complete           TEXT,
     description              TEXT,
@@ -106,8 +106,8 @@ CREATE TABLE IF NOT EXISTS books (
     num_pages                INTEGER,
     language_name            TEXT,
     publisher                TEXT,
-    publication_time         INTEGER,               -- this edition's publication date
-    original_publication_time INTEGER,              -- work-level original publication date
+    publication_time         INTEGER,
+    original_publication_time INTEGER,
     star_1                   INTEGER DEFAULT 0,
     star_2                   INTEGER DEFAULT 0,
     star_3                   INTEGER DEFAULT 0,
@@ -126,10 +126,10 @@ CREATE TABLE IF NOT EXISTS book_contributors (
     PRIMARY KEY (book_id, contributor_id, role)
 );
 
--- 5. SERIES (entity + junction)
+-- 5. SERIES
 CREATE TABLE IF NOT EXISTS series (
-    legacy_id INTEGER PRIMARY KEY,  -- natural key, extracted from web_url slug
-    kca_id    TEXT,                 -- "kca://series/..."
+    legacy_id INTEGER PRIMARY KEY,
+    kca_id    TEXT,
     title     TEXT NOT NULL,
     web_url   TEXT
 );
@@ -141,10 +141,10 @@ CREATE TABLE IF NOT EXISTS book_series (
     PRIMARY KEY (book_id, series_id)
 );
 
--- 6. GENRES (entity + junction)
+-- 6. GENRES
 CREATE TABLE IF NOT EXISTS genres (
-    legacy_id TEXT PRIMARY KEY,     -- natural key from web_url slug; TEXT because genre slugs
-    kca_id    TEXT,                 -- "kca://genre/..."
+    legacy_id TEXT PRIMARY KEY,
+    kca_id    TEXT,
     name      TEXT,
     web_url   TEXT
 );
@@ -157,7 +157,7 @@ CREATE TABLE IF NOT EXISTS book_genres (
 
 -- 7. AUXILIARY DATA
 CREATE TABLE IF NOT EXISTS awards (
-    legacy_id INTEGER PRIMARY KEY,  -- natural key, numeric prefix extracted from web_url slug
+    legacy_id INTEGER PRIMARY KEY,
     name      TEXT NOT NULL,
     web_url   TEXT
 );
@@ -173,7 +173,7 @@ CREATE TABLE IF NOT EXISTS book_awards (
 
 CREATE TABLE IF NOT EXISTS book_editions (
     book_id           INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
-    edition_legacy_id INTEGER NOT NULL,   -- sibling edition's GR legacy_id, not a FK
+    edition_legacy_id INTEGER NOT NULL,
     edition_kca_id    TEXT,
     title             TEXT,
     date_discovered   TEXT DEFAULT (strftime('%Y-%m-%d', 'now')),
@@ -182,7 +182,7 @@ CREATE TABLE IF NOT EXISTS book_editions (
 
 CREATE TABLE IF NOT EXISTS book_similar_books (
     book_id           INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
-    similar_legacy_id INTEGER NOT NULL,   -- similar book's GR legacy_id, not a FK
+    similar_legacy_id INTEGER NOT NULL,
     title             TEXT,
     average_rating    REAL,
     ratings_count     INTEGER,
@@ -214,30 +214,12 @@ def get_connection(db_path=None):
 
 def init_db(db_path=None):
     with get_connection(db_path) as db_conn:
-        ensure_schema_compat(db_conn)
         db_conn.executescript(SCHEMA)
         db_conn.commit()
 
 
-def ensure_schema_compat(db_conn):
-    pass
-
-
-def ensure_column(db_conn, table, column, definition):
-    columns = {row["name"] for row in db_conn.execute(f"PRAGMA table_info({table})")}
-    if column not in columns:
-        db_conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
 def vector_to_blob(vec):
     return vec.astype(np.float32).tobytes()
-
-
-def infer_dim_from_blob(blob):
-    """Infer embedding dimension from blob size (float32 = 4 bytes each)."""
-    if blob is None:
-        return None
-    return len(blob) // np.dtype(np.float32).itemsize
 
 
 def is_valid_embedding_blob(blob):

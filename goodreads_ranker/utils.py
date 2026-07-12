@@ -17,7 +17,22 @@ def parse_id_from_slug(slug: str) -> int:
 
 
 def parse_slug(slug: str) -> str:
-    """Extracts the last non-empty segment of a URL path as the slug."""
     if not slug:
         raise ValueError("Slug path cannot be empty")
     return slug.strip("/").split("/")[-1]
+
+
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
+
+
+def parse_optional_int(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    return int(value)

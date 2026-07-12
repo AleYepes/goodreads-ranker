@@ -35,17 +35,16 @@ STORAGE_STATE_PATH = DATA_DIR / "storage_state.json"
 CONCURRENCY = 3
 
 NAV_RETRY_ATTEMPTS = 3
-NAV_RETRY_BASE_DELAY = 2.0  # seconds; multiplied by attempt number
+NAV_RETRY_BASE_DELAY = 2.0
 
-JITTER_MIN = 0.5  # seconds
-JITTER_MAX = 2.0  # seconds
+JITTER_MIN = 0.5
+JITTER_MAX = 2.0
 
 BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
 
 
 async def goto_with_retry(page, url, wait_until="domcontentloaded", retries=NAV_RETRY_ATTEMPTS):
-    """Navigate to url, retrying on transient failures with linear backoff."""
-    last_exc = None
+    last_exc: Exception | None = None
     for attempt in range(retries):
         try:
             await page.goto(url, wait_until=wait_until)
@@ -57,7 +56,9 @@ async def goto_with_retry(page, url, wait_until="domcontentloaded", retries=NAV_
                 f"  goto_with_retry: attempt {attempt + 1}/{retries} failed for {url!r}: {exc}. Retrying in {delay:.1f}s..."
             )
             await asyncio.sleep(delay)
-    raise last_exc
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Navigation failed without an exception")
 
 
 async def save_storage_state(context):
@@ -81,14 +82,12 @@ async def is_login_page(page):
 
 
 async def login_to_goodreads(page, email, password):
-
     async def wait_for_post_login(page):
         for selector in (".homePrimaryColumn",):
             try:
                 await page.wait_for_selector(selector, timeout=15000)
                 return
             except PlaywrightTimeoutError:
-                print(f"wait_for_post_login - {selector}")
                 continue
 
         if await is_login_page(page):
@@ -122,10 +121,10 @@ async def extract_main_user(page):
     if await my_books_el.count() == 0:
         raise RuntimeError("Could not find book links on homepage.")
 
-    profile_href = await profile_el.get_attribute("href")
-    my_books_href = await my_books_el.get_attribute("href")
+    profile_href = await profile_el.get_attribute("href") or ""
+    my_books_href = await my_books_el.get_attribute("href") or ""
     img_el = profile_el.locator("img")
-    username = await img_el.get_attribute("alt") if await img_el.count() > 0 else None
+    username = await img_el.get_attribute("alt") if await img_el.count() > 0 else ""
 
     if not profile_href or not my_books_href or not username:
         raise RuntimeError("User profile metadata extraction failed.")
@@ -136,18 +135,7 @@ async def extract_main_user(page):
     return {"user_id": user_id, "list_id": list_id, "username": username}
 
 
-async def get_total_pages(page) -> int:
-    next_btn = page.locator("a.next_page").first
-    if await next_btn.count() > 0:
-        sibling = page.locator("a.next_page >> xpath=preceding-sibling::a[1]").first
-        if await sibling.count() > 0:
-            text = await sibling.inner_text()
-            with contextlib.suppress(ValueError):
-                return int(text.strip())
-    return 1
-
-
-async def fetch_friends(page, user_id: int, email: str = None, password: str = None) -> list[dict]:
+async def fetch_friends(page, user_id: int, email: str | None = None, password: str | None = None) -> list[dict]:
     friends = []
     page_num = 1
     target_url = f"https://www.goodreads.com/friend/user/{user_id}"
@@ -156,8 +144,6 @@ async def fetch_friends(page, user_id: int, email: str = None, password: str = N
         url = f"{target_url}?page={page_num}"
         await goto_with_retry(page, url)
 
-        # The friends page may redirect to a login/signup page in headless mode
-        # even when the session appears active. Re-authenticate and retry.
         if await is_login_page(page):
             print("  fetch_friends: redirected to login page — re-authenticating...")
             if not email or not password:
@@ -165,7 +151,6 @@ async def fetch_friends(page, user_id: int, email: str = None, password: str = N
             await login_to_goodreads(page, email, password)
             await goto_with_retry(page, url)
 
-        # Wait explicitly for the friend table; surface a clear error if absent.
         try:
             await page.wait_for_selector("#friendTable", timeout=10000)
         except PlaywrightTimeoutError:
@@ -180,8 +165,6 @@ async def fetch_friends(page, user_id: int, email: str = None, password: str = N
             break
 
         for row in rows:
-            # Use rel="acquaintance" to target the text link (not the image link,
-            # which also matches 'td a[href^="/user/show/"]' and appears first).
             user_anchor = row.locator('a[href^="/user/show/"][rel="acquaintance"]').first
             list_anchor = row.locator('a[href^="/review/list/"]').first
 
@@ -190,14 +173,12 @@ async def fetch_friends(page, user_id: int, email: str = None, password: str = N
 
             user_href = await user_anchor.get_attribute("href")
             list_href = await list_anchor.get_attribute("href")
-            # Username is the anchor's inner text, not its rel attribute.
             username = clean_text(await user_anchor.inner_text())
 
             if not user_href or not list_href:
                 continue
 
             book_text = await list_anchor.inner_text()
-            # Strip commas so "1,283 books" is parsed as 1283, not 283.
             book_text_clean = book_text.replace(",", "")
             book_match = re.search(r"(\d+)\s+books?", book_text_clean, re.IGNORECASE)
             book_count = int(book_match.group(1)) if book_match else 0
@@ -385,25 +366,15 @@ async def extract_friend_row(row, list_id):
         if not date_added:
             date_added = clean_text(await date_added_el.inner_text())
 
-    # Standardize dates to %Y-%m-%d format if possible
     def format_date(dt_str):
         if not dt_str:
             return ""
-        # Try parsing common formats
-        for fmt in ("%B %d, %Y", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%fZ", "%b %d, %Y"):
-            try:
-                # Strip leading/trailing space first
-                return datetime.strptime(dt_str.strip(), fmt).strftime("%Y-%m-%d")
-            except ValueError:
-                continue
-        # Fallback to try parsing as generic datetime
         try:
             from dateutil import parser
 
-            return parser.parse(dt_str).strftime("%Y-%m-%d")
+            return parser.parse(dt_str.strip()).strftime("%Y-%m-%d")
         except Exception:
-            pass
-        return dt_str
+            return dt_str.strip()
 
     return {
         "list_id": int(list_id),
@@ -517,10 +488,13 @@ async def scrape_reader_libraries(db_path=None, list_ids=None, force_seed=False)
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
 
-            context_kwargs = {"user_agent": USER_AGENT}
             if STORAGE_STATE_PATH.exists():
-                context_kwargs["storage_state"] = str(STORAGE_STATE_PATH)
-            context = await browser.new_context(**context_kwargs)
+                context = await browser.new_context(
+                    user_agent=USER_AGENT,
+                    storage_state=str(STORAGE_STATE_PATH),
+                )
+            else:
+                context = await browser.new_context(user_agent=USER_AGENT)
             await context.route("**/*", _block_heavy_resources)
 
             setup_page = await context.new_page()
@@ -552,7 +526,6 @@ async def scrape_reader_libraries(db_path=None, list_ids=None, force_seed=False)
 
             worker_count = min(CONCURRENCY, len(to_scrape))
 
-            # setup_page is reused as worker #1 — do not close/discard it.
             worker_pages = [setup_page]
             for _ in range(worker_count - 1):
                 worker_pages.append(await context.new_page())

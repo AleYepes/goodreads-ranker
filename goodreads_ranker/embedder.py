@@ -48,7 +48,7 @@ def _ensure_ollama(model: str):
         return name if ":" in name else f"{name}:latest"
 
     if _normalise(model) not in {_normalise(m) for m in available}:
-        print(f"  Model '{model}' not found locally — pulling (this may take a while)...")
+        print(f"  Model '{model}' not found locally — pulling...")
         ollama.pull(model)
         print(f"  Model '{model}' ready.")
 
@@ -65,10 +65,7 @@ def format_string_for_embedding(items, kind=None):
         return ""
 
     n = len(items)
-    if n == 1:
-        res = items[0]
-    else:
-        res = f"{', '.join(items[:-1])}{',' if n > 2 else ''} and {items[-1]}"
+    res = items[0] if n == 1 else f"{', '.join(items[:-1])}{',' if n > 2 else ''} and {items[-1]}"
 
     prefix = f"{kind.capitalize()}{'s' if n > 1 else ''}: " if kind else ""
     return f"{prefix}{res}"
