@@ -38,7 +38,7 @@ class GoodreadsRankerCLI:
                 parsed_ids = [int(x) for x in list_ids]
         asyncio.run(seeder.scrape_reader_libraries(list_ids=parsed_ids, force_seed=as_bool(force_seed)))
 
-    def crawl(self, limit=None, concurrency=2, force_recrawl=False):
+    def crawl(self, limit=None, force_recrawl=False):
         from goodreads_ranker import crawler
 
         db.init_db()
@@ -46,7 +46,6 @@ class GoodreadsRankerCLI:
         asyncio.run(
             crawler.run_crawler(
                 limit=limit,
-                concurrency=int(concurrency),
                 force_recrawl=as_bool(force_recrawl),
             )
         )

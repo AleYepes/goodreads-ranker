@@ -14,10 +14,8 @@ from playwright.async_api import async_playwright
 from tqdm import tqdm
 
 from . import db
+from .utils import USER_AGENT, clean_text, parse_id_from_slug
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
 SIGNIN_URL = "https://www.goodreads.com/ap/signin?language=en_US&openid.assoc_handle=amzn_goodreads_web_na&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.mode=checkid_setup&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.goodreads.com%2Fap-handler%2Fsign-in"
 
 RATING_MAP = {
@@ -43,17 +41,6 @@ JITTER_MIN = 0.5  # seconds
 JITTER_MAX = 2.0  # seconds
 
 BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
-
-
-def clean_text(text):
-    return text.strip().replace("\n", "") if text else ""
-
-
-def parse_id_from_slug(slug: str) -> int:
-    match = re.search(r"(\d+)", slug.strip("/").split("/")[-1])
-    if not match:
-        raise ValueError(f"Could not parse numeric ID from slug: {slug}")
-    return int(match.group(1))
 
 
 async def goto_with_retry(page, url, wait_until="domcontentloaded", retries=NAV_RETRY_ATTEMPTS):

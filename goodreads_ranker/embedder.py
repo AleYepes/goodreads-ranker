@@ -60,15 +60,13 @@ def _ensure_ollama(model: str):
             proc.wait(timeout=10)
 
 
-def format_string_for_embedding(items, kind=None, truncate=0):
+def format_string_for_embedding(items, kind=None):
     if not isinstance(items, list) or len(items) == 0:
         return ""
 
     n = len(items)
     if n == 1:
         res = items[0]
-    elif n > truncate > 1:
-        res = f"{', '.join(items[:truncate])}, and {items[truncate]}"
     else:
         res = f"{', '.join(items[:-1])}{',' if n > 2 else ''} and {items[-1]}"
 
@@ -90,15 +88,22 @@ def join_embedding_parts(title, authors, genres, desc):
 def build_embedding_inputs(db_conn):
     cursor = db_conn.execute(
         """
-        SELECT b.legacy_id, b.title, a.name AS author_name, b.description
+        SELECT b.legacy_id, b.title, c.name AS author_name, b.description
         FROM books b
-        LEFT JOIN authors a ON b.author_id = a.legacy_id
+        LEFT JOIN book_contributors bc ON bc.book_id = b.legacy_id AND bc.is_primary = 1
+        LEFT JOIN contributors c ON c.legacy_id = bc.contributor_id
         ORDER BY b.legacy_id
         """
     )
     rows = cursor.fetchall()
 
-    cursor_genres = db_conn.execute("SELECT book_id, name FROM genres")
+    cursor_genres = db_conn.execute(
+        """
+        SELECT bg.book_id, g.name
+        FROM book_genres bg
+        JOIN genres g ON bg.genre_id = g.legacy_id
+        """
+    )
     genres_by_book = {}
     for r in cursor_genres.fetchall():
         bid = int(r["book_id"])
@@ -110,8 +115,7 @@ def build_embedding_inputs(db_conn):
         title = row["title"] or ""
 
         author_name = row["author_name"]
-        authors_list = [author_name.strip()] if author_name and author_name.strip() else []
-        authors_post = format_string_for_embedding(authors_list, truncate=4)
+        authors_post = author_name.strip() if author_name and author_name.strip() else ""
 
         genres_list = genres_by_book.get(legacy_id, [])
         genres_post = format_string_for_embedding(genres_list, kind="genre")
@@ -141,7 +145,7 @@ def find_books_needing_embeddings(db_conn, all_inputs, model):
                e.vector,
                e.text_hash
         FROM books b
-        LEFT JOIN embeddings e ON e.book_id = b.legacy_id AND e.embedding_model = ?
+        LEFT JOIN book_embeddings e ON e.book_id = b.legacy_id AND e.embedding_model = ?
         ORDER BY b.legacy_id
         """,
         (model,),

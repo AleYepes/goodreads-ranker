@@ -56,14 +56,14 @@ def normalize_model_params(params):
     return params
 
 
-def get_or_create_model_params(db_conn, name, defaults):
-    params = db.load_model_params(db_conn, name)
+def get_or_create_prediction_hyperparams(db_conn, name, defaults):
+    params = db.load_prediction_hyperparams(db_conn, name)
     if params is None:
         params = dict(defaults)
-        db.save_model_params(db_conn, name, params)
+        db.save_prediction_hyperparams(db_conn, name, params)
         return params
     params = normalize_model_params(params)
-    db.save_model_params(db_conn, name, params)
+    db.save_prediction_hyperparams(db_conn, name, params)
     return params
 
 
@@ -82,7 +82,7 @@ def load_valid_embeddings_for_books(db_conn, books_df, model=None):
     rows = db_conn.execute(
         """
         SELECT book_id AS legacy_id, vector, text_hash
-        FROM embeddings
+        FROM book_embeddings
         WHERE embedding_model = ?
         """,
         (model,),
@@ -221,7 +221,9 @@ def compute_continuous(elo_df):
 def refine_ratings(target_df, rating_col, db_conn, interactive=False):
     target_clean = target_df.dropna(subset=[rating_col]).copy()
 
-    cursor = db_conn.execute("SELECT book_id AS legacy_id, original_rating, elo_score, matches_played FROM elo_ratings")
+    cursor = db_conn.execute(
+        "SELECT book_id AS legacy_id, original_rating, elo_score, matches_played FROM book_elo_ratings"
+    )
     rows = cursor.fetchall()
 
     if rows:
@@ -267,7 +269,7 @@ def refine_ratings(target_df, rating_col, db_conn, interactive=False):
         )
     db.upsert_rows(
         db_conn,
-        "elo_ratings",
+        "book_elo_ratings",
         db_rows,
         ["book_id", "original_rating", "elo_score", "matches_played"],
     )
@@ -313,10 +315,12 @@ def get_similar_friend_ratings(
 ):
     cursor = db_conn.execute(
         """
-        SELECT rl.list_id, rl.book_id AS legacy_id, rl.rating
+        SELECT rl.list_id, r_res.canonical_id AS legacy_id, MAX(rl.rating) AS rating
         FROM reader_libraries rl
         JOIN readers r ON rl.list_id = r.list_id
+        JOIN book_id_resolved r_res ON rl.book_id = r_res.raw_id
         WHERE r.is_self = 0
+        GROUP BY rl.list_id, r_res.canonical_id
         """
     )
     rows = cursor.fetchall()
@@ -489,7 +493,13 @@ def build_adjacency_matrix(books_df, num_nodes, db_conn):
     id_to_idx = {int(bid): i for i, bid in enumerate(books_df["legacy_id"])}
     book_ids_set = set(id_to_idx.keys())
 
-    cursor = db_conn.execute("SELECT book_id, similar_legacy_id FROM similar_books")
+    cursor = db_conn.execute(
+        """
+        SELECT sb.book_id, r.canonical_id AS similar_legacy_id
+        FROM book_similar_books sb
+        JOIN book_id_resolved r ON sb.similar_legacy_id = r.raw_id
+        """
+    )
     edge_indices = []
     for row in cursor.fetchall():
         bid = int(row["book_id"])
@@ -697,27 +707,23 @@ def run_optimized(best_params, books_df, precomputed_embeddings, training_col):
 def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     db.init_db(db_path)
     with db.get_connection(db_path) as db_conn:
-        db_conn.execute("DELETE FROM predictions")
-        db_conn.commit()
-
         try:
             self_list_id = db.get_self_list_id(db_conn)
         except RuntimeError:
-            print("No self reader found. Run seed first.")
-            return
+            raise RuntimeError("No self reader found. Run seed first.")
 
         cursor = db_conn.execute("SELECT * FROM books ORDER BY legacy_id")
         books_rows = cursor.fetchall()
         if not books_rows:
-            print("No book records found in the books table. Run crawler first.")
-            return
+            raise RuntimeError("No book records found in the books table. Run crawler first.")
 
         cursor = db_conn.execute(
             """
-            SELECT b.*, l.rating AS my_rating
+            SELECT b.*, MAX(l.rating) AS my_rating
             FROM books b
-            LEFT JOIN reader_libraries l
-                ON b.legacy_id = l.book_id AND l.list_id = ?
+            LEFT JOIN book_id_resolved r ON b.legacy_id = r.canonical_id
+            LEFT JOIN reader_libraries l ON r.raw_id = l.book_id AND l.list_id = ?
+            GROUP BY b.legacy_id
             ORDER BY b.legacy_id
             """,
             (self_list_id,),
@@ -733,8 +739,19 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         )
 
         if books_df["my_rating"].notna().sum() == 0:
-            print("No self rating records found. Run seed first.")
-            return
+            raise RuntimeError("No self rating records found. Run seed first.")
+
+        # Print orphan count
+        orphan_row = db_conn.execute(
+            """
+            SELECT COUNT(DISTINCT l.book_id)
+            FROM reader_libraries l
+            LEFT JOIN book_id_resolved r ON l.book_id = r.raw_id
+            WHERE r.raw_id IS NULL
+            """
+        ).fetchone()
+        orphan_count = orphan_row[0] if orphan_row else 0
+        print(f"  Unresolved library books (orphans): {orphan_count}")
 
         print("  Running ELO ratings refinement...")
         my_refined = refine_ratings(books_df, "my_rating", db_conn, interactive=interactive)
@@ -756,8 +773,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                 f"dimension_mismatch={invalid_counts['dimension_mismatch']})."
             )
         if embedded_embeddings.size == 0:
-            print("  No valid embeddings found. Run embedder before ranking.")
-            return
+            raise RuntimeError("No valid embeddings found. Run embedder before ranking.")
 
         print("  Calibrating friend ratings...")
 
@@ -795,16 +811,17 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                 print(f"    {username} - {lid} ({overlap_c} books)")
 
         print("  Running graph GCN propagation...")
-        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        )
 
         train_size = (~pd.isna(embedded_books_df["training_ratings"])).sum()
         solo_train_size = (~pd.isna(embedded_books_df["my_refined"])).sum()
         if train_size < 2 or solo_train_size < 2:
-            print(
-                "  Not enough rated books with valid embeddings to train ranking models "
+            raise RuntimeError(
+                "Not enough rated books with valid embeddings to train ranking models "
                 f"(training={train_size}, personal={solo_train_size})."
             )
-            return
         mrl_dimensions = 32
         while mrl_dimensions * 2 < train_size:
             mrl_dimensions *= 2
@@ -843,12 +860,12 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             )
             friend_params = normalize_model_params(friend_params)
             solo_params = normalize_model_params(solo_params)
-            db.save_model_params(db_conn, "friend_params", friend_params)
-            db.save_model_params(db_conn, "solo_params", solo_params)
+            db.save_prediction_hyperparams(db_conn, "friend_params", friend_params)
+            db.save_prediction_hyperparams(db_conn, "solo_params", solo_params)
         else:
             print("  Using stored/default hyperparameters...")
-            friend_params = get_or_create_model_params(db_conn, "friend_params", DEFAULT_FRIEND_PARAMS)
-            solo_params = get_or_create_model_params(db_conn, "solo_params", DEFAULT_SOLO_PARAMS)
+            friend_params = get_or_create_prediction_hyperparams(db_conn, "friend_params", DEFAULT_FRIEND_PARAMS)
+            solo_params = get_or_create_prediction_hyperparams(db_conn, "solo_params", DEFAULT_SOLO_PARAMS)
 
         print("  Running ensemble models...")
         friend_final_pred_embedded = run_optimized(
@@ -927,19 +944,25 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                 )
             )
 
-        db.upsert_rows(
-            db_conn,
-            "predictions",
-            predictions_data,
-            [
-                "book_id",
-                "solo_pred_rating",
-                "friend_pred_rating",
-                "count_adjusted_rating",
-                "pred_rating",
-                "final_rating",
-                "date_updated",
-            ],
-        )
+        if predictions_data:
+            with db_conn:
+                db.upsert_rows(
+                    db_conn,
+                    "book_predictions",
+                    predictions_data,
+                    [
+                        "book_id",
+                        "solo_pred_rating",
+                        "friend_pred_rating",
+                        "count_adjusted_rating",
+                        "pred_rating",
+                        "final_rating",
+                        "date_updated",
+                    ],
+                )
+
+                placeholders = ",".join("?" for _ in predictions_data)
+                prune_ids = [x[0] for x in predictions_data]
+                db_conn.execute(f"DELETE FROM book_predictions WHERE book_id NOT IN ({placeholders})", prune_ids)
 
         print(f"  Saved predictions for {len(predictions_data)} books.")

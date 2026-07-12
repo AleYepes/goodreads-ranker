@@ -30,14 +30,14 @@ CREATE TABLE IF NOT EXISTS reader_libraries (
     PRIMARY KEY (list_id, book_id)
 );
 
-CREATE TABLE IF NOT EXISTS elo_ratings (
+CREATE TABLE IF NOT EXISTS book_elo_ratings (
     book_id          INTEGER PRIMARY KEY,
     original_rating  REAL,
     elo_score        REAL DEFAULT 1200.0,
     matches_played   INTEGER DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS embeddings (
+CREATE TABLE IF NOT EXISTS book_embeddings (
     book_id          INTEGER,           
     embedding_model  TEXT,
     vector           BLOB NOT NULL,
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
     PRIMARY KEY (book_id, embedding_model)
 );
 
-CREATE TABLE IF NOT EXISTS predictions (
+CREATE TABLE IF NOT EXISTS book_predictions (
     book_id                INTEGER PRIMARY KEY,
     solo_pred_rating       REAL,
     friend_pred_rating     REAL,
@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     date_updated           TEXT
 );
 
-CREATE TABLE IF NOT EXISTS model_params (
+CREATE TABLE IF NOT EXISTS prediction_hyperparams (
     name        TEXT PRIMARY KEY,
     params_json TEXT NOT NULL,
     date_updated TEXT NOT NULL
@@ -80,10 +80,10 @@ CREATE TABLE IF NOT EXISTS crawl_queue (
 CREATE INDEX IF NOT EXISTS idx_crawl_queue_priority
 ON crawl_queue(status, discovered_via, priority DESC);
 
--- 3. AUTHORS
-
-CREATE TABLE IF NOT EXISTS authors (
-    legacy_id       INTEGER PRIMARY KEY,   -- author's own GR legacy_id
+-- 3. CONTRIBUTORS
+CREATE TABLE IF NOT EXISTS contributors (
+    legacy_id       INTEGER PRIMARY KEY,
+    kca_id          TEXT,
     name            TEXT NOT NULL,
     web_url         TEXT,
     is_gr_author    INTEGER DEFAULT 0,
@@ -92,12 +92,9 @@ CREATE TABLE IF NOT EXISTS authors (
 );
 
 -- 4. CORE ENTITY: BOOKS (merged books + works)
-
 CREATE TABLE IF NOT EXISTS books (
     legacy_id                INTEGER PRIMARY KEY,   -- always the canonical (bestBook) edition
     kca_id                   TEXT,                  -- "kca://book/..." for API calls
-    author_id                INTEGER REFERENCES authors(legacy_id),
-    author_role              TEXT,
     title                    TEXT,
     title_complete           TEXT,
     description              TEXT,
@@ -121,50 +118,69 @@ CREATE TABLE IF NOT EXISTS books (
     date_fetched             TEXT DEFAULT (strftime('%Y-%m-%d', 'now'))
 );
 
--- 5. SERIES (entity + junction)
+CREATE TABLE IF NOT EXISTS book_contributors (
+    book_id        INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
+    contributor_id INTEGER REFERENCES contributors(legacy_id) ON DELETE CASCADE,
+    role           TEXT,
+    is_primary     INTEGER DEFAULT 0,
+    PRIMARY KEY (book_id, contributor_id, role)
+);
 
+-- 5. SERIES (entity + junction)
 CREATE TABLE IF NOT EXISTS series (
-    id      INTEGER PRIMARY KEY,
-    title   TEXT NOT NULL,
-    web_url TEXT
+    legacy_id INTEGER PRIMARY KEY,  -- natural key, extracted from web_url slug
+    kca_id    TEXT,                 -- "kca://series/..."
+    title     TEXT NOT NULL,
+    web_url   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS book_series (
     book_id   INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
-    series_id INTEGER REFERENCES series(id) ON DELETE CASCADE,
-    position  TEXT,
+    series_id INTEGER REFERENCES series(legacy_id) ON DELETE CASCADE,
+    position  INTEGER,
     PRIMARY KEY (book_id, series_id)
 );
 
--- 6. GENRES (flat child table, no entity table)
-
+-- 6. GENRES (entity + junction)
 CREATE TABLE IF NOT EXISTS genres (
-    book_id INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
-    name    TEXT NOT NULL,
-    PRIMARY KEY (book_id, name)
+    legacy_id TEXT PRIMARY KEY,     -- natural key from web_url slug; TEXT because genre slugs
+    kca_id    TEXT,                 -- "kca://genre/..."
+    name      TEXT,
+    web_url   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS book_genres (
+    book_id   INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
+    genre_id  TEXT REFERENCES genres(legacy_id) ON DELETE CASCADE,
+    PRIMARY KEY (book_id, genre_id)
 );
 
 -- 7. AUXILIARY DATA
-
 CREATE TABLE IF NOT EXISTS awards (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    book_id     INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
-    name        TEXT NOT NULL,
-    category    TEXT,
-    designation TEXT,
-    awarded_at  INTEGER,
-    web_url     TEXT
+    legacy_id INTEGER PRIMARY KEY,  -- natural key, numeric prefix extracted from web_url slug
+    name      TEXT NOT NULL,
+    web_url   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS book_awards (
+    book_id      INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
+    award_id     INTEGER REFERENCES awards(legacy_id) ON DELETE CASCADE,
+    category     TEXT,
+    designation  TEXT,
+    date_awarded TEXT,
+    PRIMARY KEY (book_id, award_id)
 );
 
 CREATE TABLE IF NOT EXISTS book_editions (
     book_id           INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
     edition_legacy_id INTEGER NOT NULL,   -- sibling edition's GR legacy_id, not a FK
+    edition_kca_id    TEXT,
     title             TEXT,
     date_discovered   TEXT DEFAULT (strftime('%Y-%m-%d', 'now')),
     PRIMARY KEY (book_id, edition_legacy_id)
 );
 
-CREATE TABLE IF NOT EXISTS similar_books (
+CREATE TABLE IF NOT EXISTS book_similar_books (
     book_id           INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
     similar_legacy_id INTEGER NOT NULL,   -- similar book's GR legacy_id, not a FK
     title             TEXT,
@@ -173,6 +189,11 @@ CREATE TABLE IF NOT EXISTS similar_books (
     date_fetched      TEXT DEFAULT (strftime('%Y-%m-%d', 'now')),
     PRIMARY KEY (book_id, similar_legacy_id)
 );
+
+CREATE VIEW IF NOT EXISTS book_id_resolved AS
+SELECT edition_legacy_id AS raw_id, book_id AS canonical_id FROM book_editions
+UNION
+SELECT legacy_id AS raw_id, legacy_id AS canonical_id FROM books;
 """
 
 
@@ -228,10 +249,10 @@ def is_valid_embedding_blob(blob):
     return bool(vector.size and np.any(vector != 0))
 
 
-def save_model_params(db_conn, name, params):
+def save_prediction_hyperparams(db_conn, name, params):
     db_conn.execute(
         """
-        INSERT OR REPLACE INTO model_params (name, params_json, date_updated)
+        INSERT OR REPLACE INTO prediction_hyperparams (name, params_json, date_updated)
         VALUES (?, ?, ?)
         """,
         (name, json.dumps(params, sort_keys=True), datetime.now().strftime("%Y-%m-%d")),
@@ -239,8 +260,8 @@ def save_model_params(db_conn, name, params):
     db_conn.commit()
 
 
-def load_model_params(db_conn, name):
-    row = db_conn.execute("SELECT params_json FROM model_params WHERE name = ?", (name,)).fetchone()
+def load_prediction_hyperparams(db_conn, name):
+    row = db_conn.execute("SELECT params_json FROM prediction_hyperparams WHERE name = ?", (name,)).fetchone()
     if not row:
         return None
     try:
@@ -258,7 +279,7 @@ def save_embeddings(db_conn, legacy_ids, vectors, model, text_hashes):
 
     db_conn.executemany(
         """
-        INSERT OR REPLACE INTO embeddings (book_id, embedding_model, vector, text_hash)
+        INSERT OR REPLACE INTO book_embeddings (book_id, embedding_model, vector, text_hash)
         VALUES (?, ?, ?, ?)
         """,
         rows,
