@@ -173,8 +173,8 @@ def run_interactive_ranking(elo_df, titles, star_rating):
                 if index_a == index_b:
                     continue
 
-            title_a = titles.get(elo_df.at[index_a, "legacy_id"]) or f"Book {elo_df.at[index_a, 'legacy_id']}"
-            title_b = titles.get(elo_df.at[index_b, "legacy_id"]) or f"Book {elo_df.at[index_b, 'legacy_id']}"
+            title_a = titles.get(elo_df.at[index_a, 'legacy_id']) or f"Book {elo_df.at[index_a, 'legacy_id']}"
+            title_b = titles.get(elo_df.at[index_b, 'legacy_id']) or f"Book {elo_df.at[index_b, 'legacy_id']}"
 
             user_choice = input(f"[1] {title_a}\n[2] {title_b}\nChoose (1 or 2, 'q' to quit): ").strip().lower()
 
@@ -315,12 +315,12 @@ def get_similar_friend_ratings(
 ):
     cursor = db_conn.execute(
         """
-        SELECT rl.list_id, r_res.canonical_id AS legacy_id, MAX(rl.rating) AS rating
+        SELECT rl.list_id, r_res.canonical_book_id AS legacy_id, MAX(rl.rating) AS rating
         FROM reader_libraries rl
         JOIN readers r ON rl.list_id = r.list_id
-        JOIN book_id_resolved r_res ON rl.book_id = r_res.raw_id
+        JOIN editions_lookup r_res ON rl.book_id = r_res.raw_legacy_id
         WHERE r.is_self = 0
-        GROUP BY rl.list_id, r_res.canonical_id
+        GROUP BY rl.list_id, r_res.canonical_book_id
         """
     )
     rows = cursor.fetchall()
@@ -495,9 +495,9 @@ def build_adjacency_matrix(books_df, num_nodes, db_conn):
 
     cursor = db_conn.execute(
         """
-        SELECT sb.book_id, r.canonical_id AS similar_legacy_id
+        SELECT sb.book_id, r.canonical_book_id AS similar_legacy_id
         FROM book_similar_books sb
-        JOIN book_id_resolved r ON sb.similar_legacy_id = r.raw_id
+        JOIN editions_lookup r ON sb.similar_legacy_id = r.raw_legacy_id
         """
     )
     edge_indices = []
@@ -720,8 +720,8 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             """
             SELECT b.*, MAX(l.rating) AS my_rating
             FROM books b
-            LEFT JOIN book_id_resolved r ON b.legacy_id = r.canonical_id
-            LEFT JOIN reader_libraries l ON r.raw_id = l.book_id AND l.list_id = ?
+            LEFT JOIN editions_lookup r ON b.legacy_id = r.canonical_book_id
+            LEFT JOIN reader_libraries l ON r.raw_legacy_id = l.book_id AND l.list_id = ?
             GROUP BY b.legacy_id
             ORDER BY b.legacy_id
             """,
@@ -737,8 +737,8 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             """
             SELECT COUNT(DISTINCT l.book_id)
             FROM reader_libraries l
-            LEFT JOIN book_id_resolved r ON l.book_id = r.raw_id
-            WHERE r.raw_id IS NULL
+            LEFT JOIN editions_lookup r ON l.book_id = r.raw_legacy_id
+            WHERE r.raw_legacy_id IS NULL
             """
         ).fetchone()
         orphan_count = orphan_row[0] if orphan_row else 0

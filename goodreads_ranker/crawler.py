@@ -56,7 +56,7 @@ query getBookByLegacyId($legacyBookId: Int!, $pagination: PaginationInput!) {
       }
       editions(pagination: $pagination) {
         totalCount
-        edges { node { id legacyId title } }
+        edges { node { id legacyId } }
       }
     }
   }
@@ -234,19 +234,19 @@ async def resolve_and_save_book(
             ).fetchone()
             if canonical_row:
                 db_conn.execute(
-                    "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id, title) "
-                    "VALUES (?, ?, ?, ?)",
-                    (best_book_legacy_id, legacy_id, book_node.get("id"), book_node.get("title")),
+                    "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id) "
+                    "VALUES (?, ?, ?)",
+                    (best_book_legacy_id, legacy_id, book_node.get("id")),
                 )
 
                 for edition in current_page_editions:
                     db_conn.execute(
                         """
                         INSERT OR REPLACE INTO book_editions (
-                            book_id, edition_legacy_id, edition_kca_id, title
-                        ) VALUES (?, ?, ?, ?)
+                            book_id, edition_legacy_id, edition_kca_id
+                        ) VALUES (?, ?, ?)
                         """,
-                        (best_book_legacy_id, edition.get("legacyId"), edition.get("id"), edition.get("title")),
+                        (best_book_legacy_id, edition.get("legacyId"), edition.get("id")),
                     )
 
                 db_conn.execute(
@@ -273,9 +273,9 @@ async def resolve_and_save_book(
             )
             if result:
                 db_conn.execute(
-                    "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id, title) "
-                    "VALUES (?, ?, ?, ?)",
-                    (best_book_legacy_id, legacy_id, book_node.get("id"), book_node.get("title")),
+                    "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id) "
+                    "VALUES (?, ?, ?)",
+                    (best_book_legacy_id, legacy_id, book_node.get("id")),
                 )
                 db_conn.commit()
             return result
@@ -527,10 +527,10 @@ async def resolve_and_save_book(
                 db_conn.execute(
                     """
                     INSERT OR REPLACE INTO book_editions (
-                        book_id, edition_legacy_id, edition_kca_id, title
-                    ) VALUES (?, ?, ?, ?)
+                        book_id, edition_legacy_id, edition_kca_id
+                    ) VALUES (?, ?, ?)
                     """,
-                    (book_node.get("legacyId"), edition.get("legacyId"), edition.get("id"), edition.get("title")),
+                    (book_node.get("legacyId"), edition.get("legacyId"), edition.get("id")),
                 )
 
             for sim in similar_list:
@@ -539,13 +539,12 @@ async def resolve_and_save_book(
                 db_conn.execute(
                     """
                     INSERT OR REPLACE INTO book_similar_books (
-                        book_id, similar_legacy_id, title, average_rating, ratings_count, date_fetched
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        book_id, similar_legacy_id, average_rating, ratings_count, date_fetched
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
                     (
                         book_node.get("legacyId"),
                         sim.get("legacyId"),
-                        sim.get("title"),
                         sim_stats.get("averageRating"),
                         sim_stats.get("ratingsCount"),
                         now,

@@ -37,7 +37,8 @@ GOODREADS_PASSWORD=your_password
 brew install ollama
 ```
 
-#### B. Pull your desired embedding model. This repo uses [qwen3-embedding:8b](https://ollama.com/library/qwen3-embedding:8b) by default:
+#### B. Pull your desired embedding model:
+This repo uses [qwen3-embedding:8b](https://ollama.com/library/qwen3-embedding:8b) by default
 
 ```bash
 ollama pull qwen3-embedding:8b
@@ -53,6 +54,6 @@ Crawling book profiles and embedding books descriptions can take _several hours_
 
 ### 5. **Review the results** (WIP\*):
 
-Predictions are stored in `data/goodreads.db` under the `predictions` table.
+Predictions are stored in `data/goodreads.db` under the `book_predictions` table.
 
 You may join it with the `books` table and sort by one of the provided rating columns to view the best recommendations.

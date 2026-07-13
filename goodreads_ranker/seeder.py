@@ -26,9 +26,6 @@ RATING_MAP = {
     "did not like it": 1,
 }
 
-LIST_SORT = "date_added"
-LIST_ORDER = "d"
-
 DATA_DIR = Path("data")
 STORAGE_STATE_PATH = DATA_DIR / "storage_state.json"
 
@@ -321,7 +318,7 @@ def upsert_extracted(db_conn, rows):
 
 
 async def open_list_page(page, list_id, email, password):
-    url = f"https://www.goodreads.com/review/list/{list_id}?print=true&sort={LIST_SORT}&order={LIST_ORDER}&view=reviews"
+    url = f"https://www.goodreads.com/review/list/{list_id}?print=true"
     await goto_with_retry(page, url)
 
     if await is_login_page(page):
@@ -347,9 +344,20 @@ async def extract_friend_row(row, list_id):
     if not legacy_id:
         return None
 
-    rating_el = await row.query_selector(".field.rating .staticStars")
-    rating_text = await rating_el.get_attribute("title") if rating_el else ""
-    rating = RATING_MAP.get(rating_text, 0)
+    rating_container = await row.query_selector(".field.rating")
+    rating = 0
+    
+    if rating_container:
+        static_stars = await rating_container.query_selector(".staticStars") # for read-only staticStars (friend's rating)
+        if static_stars:
+            rating_text = await static_stars.get_attribute("title") or ""
+            rating = RATING_MAP.get(rating_text, 0)
+        else:
+            stars_el = await rating_container.query_selector(".stars") # for editable stars (own rating)
+            if stars_el:
+                data_rating = await stars_el.get_attribute("data-rating")
+                if data_rating and data_rating.isdigit():
+                    rating = int(data_rating)
 
     date_read_el = await row.query_selector(".field.date_read .date_read_value")
     date_read = clean_text(await date_read_el.inner_text()) if date_read_el else ""
@@ -378,7 +386,6 @@ async def extract_friend_row(row, list_id):
         "date_read": format_date(date_read),
         "date_added": format_date(date_added),
     }
-
 
 async def process_list(db_conn, page, list_id, email, password, force_seed=False):
     page_num = 1

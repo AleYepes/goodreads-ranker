@@ -31,14 +31,14 @@ CREATE TABLE IF NOT EXISTS reader_libraries (
 );
 
 CREATE TABLE IF NOT EXISTS book_elo_ratings (
-    book_id          INTEGER PRIMARY KEY,
+    book_id          INTEGER PRIMARY KEY REFERENCES books(legacy_id) ON DELETE CASCADE,
     original_rating  REAL,
     elo_score        REAL DEFAULT 1200.0,
     matches_played   INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS book_embeddings (
-    book_id          INTEGER,
+    book_id          INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
     embedding_model  TEXT,
     vector           BLOB NOT NULL,
     text_hash        TEXT NOT NULL,
@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS book_embeddings (
 );
 
 CREATE TABLE IF NOT EXISTS book_predictions (
-    book_id                INTEGER PRIMARY KEY,
+    book_id                INTEGER PRIMARY KEY REFERENCES books(legacy_id) ON DELETE CASCADE,
     solo_pred_rating       REAL,
     friend_pred_rating     REAL,
     count_adjusted_rating  REAL,
@@ -80,18 +80,7 @@ CREATE TABLE IF NOT EXISTS crawl_queue (
 CREATE INDEX IF NOT EXISTS idx_crawl_queue_priority
 ON crawl_queue(status, discovered_via, priority DESC);
 
--- 3. CONTRIBUTORS
-CREATE TABLE IF NOT EXISTS contributors (
-    legacy_id       INTEGER PRIMARY KEY,
-    kca_id          TEXT,
-    name            TEXT NOT NULL,
-    web_url         TEXT,
-    is_gr_author    INTEGER DEFAULT 0,
-    works_count     INTEGER DEFAULT 0,
-    followers_count INTEGER DEFAULT 0
-);
-
--- 4. CORE ENTITY: BOOKS
+-- 3. CORE ENTITY: BOOKS
 CREATE TABLE IF NOT EXISTS books (
     legacy_id                INTEGER PRIMARY KEY,
     kca_id                   TEXT,
@@ -116,6 +105,17 @@ CREATE TABLE IF NOT EXISTS books (
     currently_reading_count  INTEGER DEFAULT 0,
     to_read_count            INTEGER DEFAULT 0,
     date_fetched             TEXT DEFAULT (strftime('%Y-%m-%d', 'now'))
+);
+
+-- 4. CONTRIBUTORS
+CREATE TABLE IF NOT EXISTS contributors (
+    legacy_id       INTEGER PRIMARY KEY,
+    kca_id          TEXT,
+    name            TEXT NOT NULL,
+    web_url         TEXT,
+    is_gr_author    INTEGER DEFAULT 0,
+    works_count     INTEGER DEFAULT 0,
+    followers_count INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS book_contributors (
@@ -175,7 +175,6 @@ CREATE TABLE IF NOT EXISTS book_editions (
     book_id           INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
     edition_legacy_id INTEGER NOT NULL,
     edition_kca_id    TEXT,
-    title             TEXT,
     date_discovered   TEXT DEFAULT (strftime('%Y-%m-%d', 'now')),
     PRIMARY KEY (book_id, edition_legacy_id)
 );
@@ -183,12 +182,17 @@ CREATE TABLE IF NOT EXISTS book_editions (
 CREATE TABLE IF NOT EXISTS book_similar_books (
     book_id           INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
     similar_legacy_id INTEGER NOT NULL,
-    title             TEXT,
     average_rating    REAL,
     ratings_count     INTEGER,
     date_fetched      TEXT DEFAULT (strftime('%Y-%m-%d', 'now')),
     PRIMARY KEY (book_id, similar_legacy_id)
 );
+
+-- 8. VIEWS
+CREATE VIEW IF NOT EXISTS editions_lookup AS
+SELECT edition_legacy_id AS raw_legacy_id, book_id AS canonical_book_id FROM book_editions
+UNION
+SELECT legacy_id AS raw_legacy_id, legacy_id AS canonical_book_id FROM books;
 """
 
 
@@ -210,7 +214,6 @@ def get_connection(db_path=None):
 def init_db(db_path=None):
     with get_connection(db_path) as db_conn:
         db_conn.executescript(SCHEMA)
-        db_conn.execute("DROP VIEW IF EXISTS book_id_resolved")
         db_conn.commit()
 
 
