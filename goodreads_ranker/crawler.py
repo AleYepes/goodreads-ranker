@@ -16,6 +16,7 @@ from . import db
 from .utils import USER_AGENT, parse_id_from_slug, parse_slug
 
 API_URL = "https://kxbwmqov6jgg3daaamb744ycu4.appsync-api.us-east-1.amazonaws.com/graphql"
+X_API_KEY = "da2-xpgsdydkbregjhpr6ejzqdhuwy"
 
 BOOK_QUERY = """
 query getBookByLegacyId($legacyBookId: Int!, $pagination: PaginationInput!) {
@@ -664,7 +665,7 @@ async def run_crawler(limit=None, force_recrawl=False, db_path=None):
 
     headers = {
         "content-type": "application/json",
-        "x-api-key": os.getenv("X_API_KEY", "da2-xpgsdydkbregjhpr6ejzqdhuwy"),
+        "x-api-key": X_API_KEY,
         "user-agent": USER_AGENT,
     }
 

@@ -36,17 +36,25 @@ class GoodreadsRankerCLI:
         )
 
     def embed(self, batch_size=128, model=None):
+        import os
+
         from goodreads_ranker import embedder
 
         print("\nGenerating embeddings")
         db.init_db()
+        if not model:
+            model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
         embedder.generate_embeddings(batch_size=int(batch_size), model=model)
 
     def rank(self, interactive=False, optimize=False, model=None):
+        import os
+
         from goodreads_ranker import ranker
 
         print("\nRunning models and predictions")
         db.init_db()
+        if not model:
+            model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
         ranker.run_ranking(interactive=as_bool(interactive), optimize=as_bool(optimize), model=model)
 
     def run_pipeline(
@@ -57,7 +65,11 @@ class GoodreadsRankerCLI:
         optimize=False,
         model=None,
     ):
+        import os
+
         limit = parse_optional_int(limit)
+        if not model:
+            model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
         self.seed(force_seed=force_seed)
         self.crawl(limit=limit, force_recrawl=force_recrawl)
         self.embed(model=model)
@@ -66,6 +78,9 @@ class GoodreadsRankerCLI:
 
 
 def main():
+    from dotenv import load_dotenv
+
+    load_dotenv()
     fire.Fire(GoodreadsRankerCLI)
 
 
