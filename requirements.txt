@@ -16,3 +16,4 @@ nevergrad
 matplotlib
 plotly
 fire
+questionary

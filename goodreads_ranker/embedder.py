@@ -1,14 +1,12 @@
 import contextlib
-import os
 import re
 import subprocess
 import time
 
 import numpy as np
-from dotenv import load_dotenv
 from tqdm import tqdm
 
-from . import db
+from . import config, db
 
 
 @contextlib.contextmanager
@@ -168,11 +166,10 @@ def find_books_needing_embeddings(db_conn, all_inputs, model):
 
 
 def generate_embeddings(batch_size=128, model=None, db_path=None):
-    load_dotenv()
     db.init_db(db_path)
 
     if not model:
-        model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
+        model = config.get_embedding_model()
 
     with db.get_connection(db_path) as db_conn:
         all_inputs = build_embedding_inputs(db_conn)

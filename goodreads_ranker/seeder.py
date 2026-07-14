@@ -1,19 +1,17 @@
 import asyncio
 import contextlib
-import os
 import random
 import re
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
 
-from dotenv import load_dotenv
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 from tqdm import tqdm
 
-from . import db
+from . import config, db
 from .utils import USER_AGENT, clean_text, parse_id_from_slug
 
 SIGNIN_URL = "https://www.goodreads.com/ap/signin?language=en_US&openid.assoc_handle=amzn_goodreads_web_na&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.mode=checkid_setup&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.goodreads.com%2Fap-handler%2Fsign-in"
@@ -484,10 +482,9 @@ def get_libraries_to_scrape(db_conn, force_seed):
 
 
 async def scrape_libraries(db_path=None, library_ids=None, force_seed=False):
-    load_dotenv()
     db.init_db(db_path)
-    email = os.getenv("GOODREADS_EMAIL")
-    password = os.getenv("GOODREADS_PASSWORD")
+    email = config.get_goodreads_email()
+    password = config.get_goodreads_password()
 
     with db.get_connection(db_path) as db_conn:
         async with async_playwright() as p:

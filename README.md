@@ -1,59 +1,49 @@
-# Goodreads Crawler & Ranker WIP
+# Goodreads Recommendations
 
-Find books that match your tastes with this async Goodreads crawler + ML recommendation pipeline.
+Find books that match your tastes with this Goodreads crawler + recommendation pipeline.
 
 ## Getting Started
 
-### 0. **Populate Your Goodreads Library:**
+### 0. **Use Goodreads!**
 
 <img src="assets/button.png" alt="alt text" width="300">
 
-Your library seeds the crawler to find new similar books.<br>
-Any books you've rated will train your personal model.
+<br>The more books you rate (and the more users you befriend), the better your recommendations.
 
-### 1. **Pip Install Requirements:**
+### 1. **Set Up**
+
+#### A. Virtual environment
+
+```
+python3 -m venv venv
+```
+
+#### B. Required packages
 
 ```bash
+source venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
 nbstripout --install
 nbdime config-git --enable
 ```
 
-### 2. **Configure Log-in Credentials:**
-
-Create a `.env` file in the root with:
-
-```ini
-GOODREADS_EMAIL=your_email@example.com
-GOODREADS_PASSWORD=your_password
-```
-
-### 3. **Set up Ollama:**
-
-#### A. Download and install [Ollama](https://ollama.com/download)
+#### C. Ollama
 
 ```bash
 brew install ollama
 ```
 
-#### B. Pull your desired embedding model:
-This repo uses [qwen3-embedding:8b](https://ollama.com/library/qwen3-embedding:8b) by default
+### 2. **Run the Pipeline**
 
 ```bash
-ollama pull qwen3-embedding:8b
+venv/bin/python3 main.py run_pipeline
 ```
 
-### 4. **Run the recomendation pipeline:**
+If you have a large library, or many friends, **this can take several hours** when run for the first time.
 
-```bash
-python3 cli.py run_pipeline
-```
+### 3. **Review the recommendations** (WIP\*)
 
-Crawling book profiles and embedding books descriptions can take _several hours_ when run for the first time.
+Once the pipeline has run successfully, you can review your recommendations in `notebooks/explore_predictions.ipynb`
 
-### 5. **Review the results** (WIP\*):
-
-Predictions are stored in `data/goodreads.db` under the `book_predictions` table.
-
-You may join it with the `books` table and sort by one of the provided rating columns to view the best recommendations.
+- Predictions are stored in `data/goodreads.db` under the `book_predictions` table.

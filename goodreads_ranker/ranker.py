@@ -16,7 +16,7 @@ from sklearn.svm import SVR
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
 from torch_geometric.utils import add_self_loops
 
-from . import db
+from . import config, db
 
 torch.sparse.check_sparse_tensor_invariants.disable()
 
@@ -69,12 +69,11 @@ def get_or_create_prediction_hyperparams(db_conn, name, defaults):
 
 def load_valid_embeddings_for_books(db_conn, books_df, model=None):
     import hashlib
-    import os
 
     from . import embedder
 
     if not model:
-        model = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:8b")
+        model = config.get_embedding_model()
 
     all_inputs = embedder.build_embedding_inputs(db_conn)
     input_hashes = {legacy_id: hashlib.md5(text.encode("utf-8")).hexdigest() for legacy_id, text in all_inputs.items()}

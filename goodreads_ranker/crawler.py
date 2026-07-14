@@ -3,7 +3,6 @@ import base64
 import contextlib
 import json
 import math
-import os
 import re
 import time
 from contextlib import nullcontext
@@ -656,10 +655,6 @@ def handle_force_recrawl(db_conn):
 async def run_crawler(limit=None, force_recrawl=False, db_path=None):
     global _gql_sem
     _gql_sem = asyncio.Semaphore(3)
-
-    from dotenv import load_dotenv
-
-    load_dotenv()
 
     db.init_db(db_path)
 
