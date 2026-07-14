@@ -24,7 +24,7 @@ query getBookByLegacyId($legacyBookId: Int!, $pagination: PaginationInput!) {
     legacyId
     title
     titleComplete
-    description
+    description: description(stripped: true)
     webUrl
     primaryContributorEdge {
       node { id legacyId name isGrAuthor webUrl followers { totalCount } works { totalCount } }
@@ -177,9 +177,9 @@ async def resolve_and_save_book(
         if not book_node:
             db_conn.execute(
                 """
-                INSERT INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
+                INSERT INTO crawl_queue (book_legacy_id, status, error_count, last_error_message, date_processed)
                 VALUES (?, 'error', 1, 'Book not found (data is null)', ?)
-                ON CONFLICT(book_id) DO UPDATE SET
+                ON CONFLICT(book_legacy_id) DO UPDATE SET
                     status = 'error',
                     error_count = 1,
                     last_error_message = excluded.last_error_message,
@@ -197,9 +197,9 @@ async def resolve_and_save_book(
         if not best_book_legacy_id:
             db_conn.execute(
                 """
-                INSERT INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
+                INSERT INTO crawl_queue (book_legacy_id, status, error_count, last_error_message, date_processed)
                 VALUES (?, 'error', 1, 'No best book legacy ID resolved', ?)
-                ON CONFLICT(book_id) DO UPDATE SET
+                ON CONFLICT(book_legacy_id) DO UPDATE SET
                     status = 'error',
                     error_count = 1,
                     last_error_message = excluded.last_error_message,
@@ -218,9 +218,9 @@ async def resolve_and_save_book(
         if legacy_id != best_book_legacy_id:
             db_conn.execute(
                 """
-                INSERT INTO crawl_queue (book_id, status, error_count, date_processed)
+                INSERT INTO crawl_queue (book_legacy_id, status, error_count, date_processed)
                 VALUES (?, 'mapped_to_canonical', 0, ?)
-                ON CONFLICT(book_id) DO UPDATE SET
+                ON CONFLICT(book_legacy_id) DO UPDATE SET
                     status = 'mapped_to_canonical',
                     error_count = 0,
                     date_processed = excluded.date_processed
@@ -234,8 +234,7 @@ async def resolve_and_save_book(
             ).fetchone()
             if canonical_row:
                 db_conn.execute(
-                    "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id) "
-                    "VALUES (?, ?, ?)",
+                    "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id) VALUES (?, ?, ?)",
                     (best_book_legacy_id, legacy_id, book_node.get("id")),
                 )
 
@@ -253,7 +252,7 @@ async def resolve_and_save_book(
                     """
                     UPDATE crawl_queue
                     SET status = 'skipped_known_edition', date_processed = ?
-                    WHERE book_id IN (SELECT edition_legacy_id FROM book_editions WHERE book_id = ?)
+                    WHERE book_legacy_id IN (SELECT edition_legacy_id FROM book_editions WHERE book_id = ?)
                       AND status = 'pending'
                     """,
                     (now, best_book_legacy_id),
@@ -273,8 +272,7 @@ async def resolve_and_save_book(
             )
             if result:
                 db_conn.execute(
-                    "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id) "
-                    "VALUES (?, ?, ?)",
+                    "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id) VALUES (?, ?, ?)",
                     (best_book_legacy_id, legacy_id, book_node.get("id")),
                 )
                 db_conn.commit()
@@ -294,7 +292,7 @@ async def resolve_and_save_book(
             SELECT COUNT(*)
             FROM crawl_queue
             WHERE status='pending'
-            AND book_id IN ({})
+            AND book_legacy_id IN ({})
             """.format(",".join("?" * len(all_editions))),
                 [e["legacyId"] for e in all_editions],
             ).fetchone()[0]
@@ -538,7 +536,7 @@ async def resolve_and_save_book(
                 sim_stats = sim_work.get("stats") or {}
                 db_conn.execute(
                     """
-                    INSERT OR REPLACE INTO book_similar_books (
+                    INSERT OR REPLACE INTO similar_books (
                         book_id, similar_legacy_id, average_rating, ratings_count, date_fetched
                     ) VALUES (?, ?, ?, ?, ?)
                     """,
@@ -558,9 +556,9 @@ async def resolve_and_save_book(
                     priority = avg_rating - avg_rating / math.log10(ratings_count + 10)
                     db_conn.execute(
                         """
-                        INSERT INTO crawl_queue (book_id, priority, status, discovered_via)
+                        INSERT INTO crawl_queue (book_legacy_id, priority, status, discovered_via)
                         VALUES (?, ?, 'pending', 'similar')
-                        ON CONFLICT(book_id) DO UPDATE SET
+                        ON CONFLICT(book_legacy_id) DO UPDATE SET
                             priority = MAX(priority, excluded.priority)
                         WHERE status = 'pending'
                         """,
@@ -569,9 +567,9 @@ async def resolve_and_save_book(
 
             db_conn.execute(
                 """
-                INSERT INTO crawl_queue (book_id, status, error_count, date_processed)
+                INSERT INTO crawl_queue (book_legacy_id, status, error_count, date_processed)
                 VALUES (?, 'done', 0, ?)
-                ON CONFLICT(book_id) DO UPDATE SET
+                ON CONFLICT(book_legacy_id) DO UPDATE SET
                     status = 'done',
                     error_count = 0,
                     date_processed = excluded.date_processed
@@ -583,7 +581,7 @@ async def resolve_and_save_book(
                 """
                 UPDATE crawl_queue
                 SET status = 'skipped_known_edition', date_processed = ?
-                WHERE book_id IN (SELECT edition_legacy_id FROM book_editions WHERE book_id = ?)
+                WHERE book_legacy_id IN (SELECT edition_legacy_id FROM book_editions WHERE book_id = ?)
                   AND status = 'pending'
                 """,
                 (now, book_node.get("legacyId")),
@@ -592,9 +590,9 @@ async def resolve_and_save_book(
     except InvalidLegacyIdError as e:
         db_conn.execute(
             """
-            INSERT INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
+            INSERT INTO crawl_queue (book_legacy_id, status, error_count, last_error_message, date_processed)
             VALUES (?, 'error', 1, ?, ?)
-            ON CONFLICT(book_id) DO UPDATE SET
+            ON CONFLICT(book_legacy_id) DO UPDATE SET
                 status = 'error',
                 error_count = 1,
                 last_error_message = excluded.last_error_message,
@@ -605,14 +603,14 @@ async def resolve_and_save_book(
         db_conn.commit()
         return False
     except Exception as e:
-        row = db_conn.execute("SELECT error_count FROM crawl_queue WHERE book_id = ?", (legacy_id,)).fetchone()
+        row = db_conn.execute("SELECT error_count FROM crawl_queue WHERE book_legacy_id = ?", (legacy_id,)).fetchone()
         error_count = (row["error_count"] or 0) + 1 if row else 1
         status = "error" if error_count >= 3 else "pending"
         db_conn.execute(
             """
-            INSERT INTO crawl_queue (book_id, status, error_count, last_error_message, date_processed)
+            INSERT INTO crawl_queue (book_legacy_id, status, error_count, last_error_message, date_processed)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(book_id) DO UPDATE SET
+            ON CONFLICT(book_legacy_id) DO UPDATE SET
                 status = excluded.status,
                 error_count = excluded.error_count,
                 last_error_message = excluded.last_error_message,
@@ -627,12 +625,12 @@ async def resolve_and_save_book(
 
 
 def populate_seeds(db_conn):
-    cursor = db_conn.execute("SELECT DISTINCT book_id FROM reader_libraries WHERE book_id IS NOT NULL")
-    seeds = [row["book_id"] for row in cursor.fetchall()]
+    cursor = db_conn.execute("SELECT DISTINCT book_legacy_id FROM library_books WHERE book_legacy_id IS NOT NULL")
+    seeds = [row["book_legacy_id"] for row in cursor.fetchall()]
     for seed in seeds:
         db_conn.execute(
             """
-            INSERT OR IGNORE INTO crawl_queue (book_id, status, priority, discovered_via)
+            INSERT OR IGNORE INTO crawl_queue (book_legacy_id, status, priority, discovered_via)
             VALUES (?, 'pending', 0.0, 'seed')
             """,
             (seed,),
@@ -645,7 +643,7 @@ def handle_force_recrawl(db_conn):
         """
         UPDATE crawl_queue
         SET status = 'pending'
-        WHERE book_id IN (
+        WHERE book_legacy_id IN (
             SELECT legacy_id FROM books WHERE date_fetched < date('now', '-30 days')
         )
         AND status = 'done'
@@ -729,7 +727,7 @@ async def run_crawler(limit=None, force_recrawl=False, db_path=None):
                         break
 
                 query = f"""
-                    SELECT book_id FROM crawl_queue
+                    SELECT book_legacy_id FROM crawl_queue
                     WHERE status = 'pending'
                       AND discovered_via IN ({placeholders})
                     ORDER BY (discovered_via = 'seed') DESC, priority DESC
@@ -739,7 +737,7 @@ async def run_crawler(limit=None, force_recrawl=False, db_path=None):
                 if not row:
                     break
 
-                legacy_id = row["book_id"]
+                legacy_id = row["book_legacy_id"]
 
                 await resolve_and_save_book(client, headers, db_conn, legacy_id, allowed_sources)
 

@@ -7,7 +7,7 @@ from goodreads_ranker.utils import as_bool, parse_optional_int
 
 
 class GoodreadsRankerCLI:
-    def seed(self, force_seed=False, list_ids=None):
+    def seed(self, force_seed=False, library_ids=None):
         from dotenv import load_dotenv
 
         from goodreads_ranker import seeder
@@ -15,13 +15,12 @@ class GoodreadsRankerCLI:
         print("\nSeeding database")
         load_dotenv()
         db.init_db()
-        parsed_ids = None
-        if list_ids is not None:
-            if isinstance(list_ids, str):
-                parsed_ids = [int(x.strip()) for x in list_ids.split(",") if x.strip()]
+        if library_ids is not None:
+            if isinstance(library_ids, str):
+                library_ids = [int(x.strip()) for x in library_ids.split(",") if x.strip()]
             else:
-                parsed_ids = [int(x) for x in list_ids]
-        asyncio.run(seeder.scrape_reader_libraries(list_ids=parsed_ids, force_seed=as_bool(force_seed)))
+                library_ids = [int(x) for x in library_ids]
+        asyncio.run(seeder.scrape_libraries(library_ids=library_ids, force_seed=as_bool(force_seed)))
 
     def crawl(self, limit=None, force_recrawl=False):
         from goodreads_ranker import crawler

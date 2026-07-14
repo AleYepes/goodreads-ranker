@@ -125,9 +125,9 @@ async def extract_main_user(page):
         raise RuntimeError("User profile metadata extraction failed.")
 
     user_id = parse_id_from_slug(profile_href)
-    list_id = parse_id_from_slug(my_books_href)
+    library_id = parse_id_from_slug(my_books_href)
 
-    return {"user_id": user_id, "list_id": list_id, "username": username}
+    return {"user_id": user_id, "library_id": library_id, "username": username}
 
 
 async def fetch_friends(page, user_id: int, email: str | None = None, password: str | None = None) -> list[dict]:
@@ -181,7 +181,7 @@ async def fetch_friends(page, user_id: int, email: str | None = None, password: 
             friends.append(
                 {
                     "user_id": parse_id_from_slug(user_href),
-                    "list_id": parse_id_from_slug(list_href),
+                    "library_id": parse_id_from_slug(list_href),
                     "username": username,
                 }
             )
@@ -197,64 +197,64 @@ async def fetch_friends(page, user_id: int, email: str | None = None, password: 
     return friends
 
 
-def upsert_readers(db_conn, main_user: dict, friends: list[dict]):
+def upsert_libraries(db_conn, main_user: dict, friends: list[dict]):
     db_conn.execute(
-        "UPDATE readers SET is_self = 0 WHERE is_self = 1 AND list_id != ?",
-        (main_user["list_id"],),
+        "UPDATE libraries SET is_main = 0 WHERE is_main = 1 AND legacy_id != ?",
+        (main_user["library_id"],),
     )
 
     db_conn.execute(
         """
-        INSERT OR IGNORE INTO readers (list_id, user_id, username, is_self, scrape_complete)
+        INSERT OR IGNORE INTO libraries (legacy_id, user_id, username, is_main, scrape_complete)
         VALUES (?, ?, ?, 1, 0)
         """,
-        (main_user["list_id"], main_user["user_id"], main_user["username"]),
+        (main_user["library_id"], main_user["user_id"], main_user["username"]),
     )
     db_conn.execute(
         """
-        UPDATE readers
-        SET user_id = ?, username = ?, is_self = 1
-        WHERE list_id = ?
+        UPDATE libraries
+        SET user_id = ?, username = ?, is_main = 1
+        WHERE legacy_id = ?
         """,
-        (main_user["user_id"], main_user["username"], main_user["list_id"]),
+        (main_user["user_id"], main_user["username"], main_user["library_id"]),
     )
 
     db_conn.executemany(
         """
-        INSERT OR IGNORE INTO readers (list_id, user_id, username, is_self, scrape_complete)
+        INSERT OR IGNORE INTO libraries (legacy_id, user_id, username, is_main, scrape_complete)
         VALUES (?, ?, ?, 0, 0)
         """,
-        [(f["list_id"], f["user_id"], f["username"]) for f in friends],
+        [(f["library_id"], f["user_id"], f["username"]) for f in friends],
     )
     db_conn.commit()
 
 
-def update_friend_info(db_conn, list_id, username, user_id):
+def update_friend_info(db_conn, library_id, username, user_id):
     db_conn.execute(
         """
-        UPDATE readers
+        UPDATE libraries
         SET username = ?,
             user_id = ?
-        WHERE list_id = ?
+        WHERE legacy_id = ?
         """,
-        (username, user_id, list_id),
+        (username, user_id, library_id),
     )
     db_conn.commit()
 
 
-def load_existing_rows(db_conn, list_id):
+def load_existing_rows(db_conn, library_id):
     rows = db_conn.execute(
         """
-        SELECT list_id, book_id, rating, date_read, date_added
-        FROM reader_libraries
-        WHERE list_id = ?
+        SELECT library_id, book_legacy_id, rating, date_read, date_added
+        FROM library_books
+        WHERE library_id = ?
         """,
-        (list_id,),
+        (library_id,),
     ).fetchall()
     return {
-        (int(row["list_id"]), int(row["book_id"])): {
-            "list_id": int(row["list_id"]),
-            "book_id": int(row["book_id"]),
+        (int(row["library_id"]), int(row["book_legacy_id"])): {
+            "library_id": int(row["library_id"]),
+            "book_legacy_id": int(row["book_legacy_id"]),
             "rating": int(row["rating"] or 0),
             "date_read": row["date_read"] or "",
             "date_added": row["date_added"] or "",
@@ -263,30 +263,30 @@ def load_existing_rows(db_conn, list_id):
     }
 
 
-def mark_list_complete(db_conn, list_id):
+def mark_library_complete(db_conn, library_id):
     today = datetime.now().strftime("%Y-%m-%d")
     db_conn.execute(
         """
-        UPDATE readers
+        UPDATE libraries
         SET scrape_complete = 1,
             date_scraped = ?,
             scrape_error = NULL
-        WHERE list_id = ?
+        WHERE legacy_id = ?
         """,
-        (today, list_id),
+        (today, library_id),
     )
     db_conn.commit()
 
 
-def mark_list_failed(db_conn, list_id, error):
+def mark_library_failed(db_conn, library_id, error):
     db_conn.execute(
         """
-        UPDATE readers
+        UPDATE libraries
         SET scrape_complete = 0,
             scrape_error = ?
-        WHERE list_id = ?
+        WHERE legacy_id = ?
         """,
-        (str(error)[:1000], list_id),
+        (str(error)[:1000], library_id),
     )
     db_conn.commit()
 
@@ -296,11 +296,11 @@ def upsert_extracted(db_conn, rows):
         return
     db.upsert_rows(
         db_conn,
-        "reader_libraries",
+        "library_books",
         [
             (
-                row["list_id"],
-                row["book_id"],
+                row["library_id"],
+                row["book_legacy_id"],
                 row["rating"],
                 row["date_read"],
                 row["date_added"],
@@ -308,8 +308,8 @@ def upsert_extracted(db_conn, rows):
             for row in rows
         ],
         [
-            "list_id",
-            "book_id",
+            "library_id",
+            "book_legacy_id",
             "rating",
             "date_read",
             "date_added",
@@ -336,7 +336,7 @@ async def ensure_list_page(page, target_url, email, password):
         await goto_with_retry(page, target_url)
 
 
-async def extract_friend_row(row, list_id):
+async def extract_friend_row(row, library_id):
     title_el = await row.query_selector(".field.title a")
     href = await title_el.get_attribute("href") if title_el else ""
     legacy_id_match = re.search(r"/book/show/(\d+)", href)
@@ -346,14 +346,16 @@ async def extract_friend_row(row, list_id):
 
     rating_container = await row.query_selector(".field.rating")
     rating = 0
-    
+
     if rating_container:
-        static_stars = await rating_container.query_selector(".staticStars") # for read-only staticStars (friend's rating)
+        static_stars = await rating_container.query_selector(
+            ".staticStars"
+        )  # for read-only staticStars (friend's rating)
         if static_stars:
             rating_text = await static_stars.get_attribute("title") or ""
             rating = RATING_MAP.get(rating_text, 0)
         else:
-            stars_el = await rating_container.query_selector(".stars") # for editable stars (own rating)
+            stars_el = await rating_container.query_selector(".stars")  # for editable stars (own rating)
             if stars_el:
                 data_rating = await stars_el.get_attribute("data-rating")
                 if data_rating and data_rating.isdigit():
@@ -380,18 +382,19 @@ async def extract_friend_row(row, list_id):
             return dt_str.strip()
 
     return {
-        "list_id": int(list_id),
-        "book_id": legacy_id,
+        "library_id": int(library_id),
+        "book_legacy_id": legacy_id,
         "rating": rating,
         "date_read": format_date(date_read),
         "date_added": format_date(date_added),
     }
 
-async def process_list(db_conn, page, list_id, email, password, force_seed=False):
+
+async def process_library(db_conn, page, library_id, email, password, force_seed=False):
     page_num = 1
     total_rows = 0
     valid_page_parsed = False
-    target_url = await open_list_page(page, list_id, email, password)
+    target_url = await open_list_page(page, library_id, email, password)
 
     with contextlib.suppress(PlaywrightTimeoutError):
         await page.wait_for_selector("h1", timeout=10000)
@@ -410,9 +413,9 @@ async def process_list(db_conn, page, list_id, email, password, force_seed=False
                 if text:
                     username = text
     if username or user_id:
-        update_friend_info(db_conn, list_id, username, user_id)
+        update_friend_info(db_conn, library_id, username, user_id)
 
-    existing_rows = load_existing_rows(db_conn, list_id)
+    existing_rows = load_existing_rows(db_conn, library_id)
 
     while True:
         await ensure_list_page(page, target_url, email, password)
@@ -423,19 +426,19 @@ async def process_list(db_conn, page, list_id, email, password, force_seed=False
         page_all_known = bool(rows)
         for row in rows:
             try:
-                extracted = await extract_friend_row(row, list_id)
+                extracted = await extract_friend_row(row, library_id)
                 if not extracted:
                     page_all_known = False
                     continue
 
-                key = (extracted["list_id"], extracted["book_id"])
+                key = (extracted["library_id"], extracted["book_legacy_id"])
                 if existing_rows.get(key) != extracted:
                     page_all_known = False
                 existing_rows[key] = extracted
                 page_rows.append(extracted)
             except Exception as e:
                 page_all_known = False
-                tqdm.write(f"Error parsing book in list {list_id}: {e}")
+                tqdm.write(f"Error parsing book in library {library_id}: {e}")
 
         if not page_rows:
             raise RuntimeError(f"No valid rows parsed on page {page_num}")
@@ -463,24 +466,24 @@ async def process_list(db_conn, page, list_id, email, password, force_seed=False
     if not valid_page_parsed:
         raise RuntimeError("No valid list page was parsed")
 
-    mark_list_complete(db_conn, list_id)
+    mark_library_complete(db_conn, library_id)
 
 
-def get_lists_to_scrape(db_conn, force_seed):
+def get_libraries_to_scrape(db_conn, force_seed):
     if force_seed:
-        cursor = db_conn.execute("SELECT list_id FROM readers")
+        cursor = db_conn.execute("SELECT legacy_id FROM libraries")
     else:
         cursor = db_conn.execute(
             """
-            SELECT list_id
-            FROM readers
+            SELECT legacy_id
+            FROM libraries
             WHERE scrape_complete != 1
             """
         )
-    return [row["list_id"] for row in cursor.fetchall()]
+    return [row["legacy_id"] for row in cursor.fetchall()]
 
 
-async def scrape_reader_libraries(db_path=None, list_ids=None, force_seed=False):
+async def scrape_libraries(db_path=None, library_ids=None, force_seed=False):
     load_dotenv()
     db.init_db(db_path)
     email = os.getenv("GOODREADS_EMAIL")
@@ -501,14 +504,14 @@ async def scrape_reader_libraries(db_path=None, list_ids=None, force_seed=False)
 
             setup_page = await context.new_page()
 
-            if list_ids is not None:
-                for lid in list_ids:
+            if library_ids is not None:
+                for lid in library_ids:
                     db_conn.execute(
-                        "INSERT OR IGNORE INTO readers (list_id, is_self, scrape_complete) VALUES (?, 0, 0)",
+                        "INSERT OR IGNORE INTO libraries (legacy_id, is_main, scrape_complete) VALUES (?, 0, 0)",
                         (lid,),
                     )
                     db_conn.execute(
-                        "UPDATE readers SET scrape_complete = 0 WHERE list_id = ?",
+                        "UPDATE libraries SET scrape_complete = 0 WHERE legacy_id = ?",
                         (lid,),
                     )
                 db_conn.commit()
@@ -517,12 +520,12 @@ async def scrape_reader_libraries(db_path=None, list_ids=None, force_seed=False)
                 await login_to_goodreads(setup_page, email, password)
                 main_user = await extract_main_user(setup_page)
                 friends = await fetch_friends(setup_page, main_user["user_id"], email=email, password=password)
-                upsert_readers(db_conn, main_user, friends)
+                upsert_libraries(db_conn, main_user, friends)
 
-            to_scrape = get_lists_to_scrape(db_conn, force_seed)
+            to_scrape = get_libraries_to_scrape(db_conn, force_seed)
 
             if not to_scrape:
-                print("No new friends or incomplete lists to scrape. Use --force_seed to re-scrape.")
+                print("No new friends or incomplete libraries to scrape. Use --force_seed to re-scrape.")
                 await browser.close()
                 return
 
@@ -533,28 +536,28 @@ async def scrape_reader_libraries(db_path=None, list_ids=None, force_seed=False)
                 worker_pages.append(await context.new_page())
 
             queue = asyncio.Queue()
-            for list_id in to_scrape:
-                queue.put_nowait(list_id)
+            for library_id in to_scrape:
+                queue.put_nowait(library_id)
 
             pbar = tqdm(total=len(to_scrape), desc="Scraping friend libraries", unit="list")
 
-            async def list_worker(page):
+            async def library_worker(page):
                 while True:
                     try:
-                        list_id = queue.get_nowait()
+                        library_id = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         return
                     try:
-                        await process_list(db_conn, page, list_id, email, password, force_seed=force_seed)
+                        await process_library(db_conn, page, library_id, email, password, force_seed=force_seed)
                     except Exception as e:
-                        tqdm.write(f"Failed list {list_id}: {e}")
-                        mark_list_failed(db_conn, list_id, e)
+                        tqdm.write(f"Failed library {library_id}: {e}")
+                        mark_library_failed(db_conn, library_id, e)
                         with contextlib.suppress(Exception):
                             await page.goto("about:blank")
                     finally:
                         pbar.update(1)
 
-            await asyncio.gather(*(list_worker(wp) for wp in worker_pages))
+            await asyncio.gather(*(library_worker(wp) for wp in worker_pages))
             pbar.close()
 
             await browser.close()

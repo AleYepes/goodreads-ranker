@@ -9,25 +9,25 @@ import numpy as np
 DB_PATH = Path("data/goodreads.db")
 
 SCHEMA = """
--- 1. COMPATIBILITY TABLES
+-- 1. READER LIBRARIES
 
-CREATE TABLE IF NOT EXISTS readers (
-    list_id            INTEGER PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS libraries (
+    legacy_id          INTEGER PRIMARY KEY,
     username           TEXT,
     user_id            INTEGER,
-    is_self            INTEGER DEFAULT 0,
+    is_main            INTEGER DEFAULT 0,
     scrape_complete    INTEGER DEFAULT 0,
     date_scraped       TEXT,
     scrape_error       TEXT
 );
 
-CREATE TABLE IF NOT EXISTS reader_libraries (
-    list_id  INTEGER NOT NULL,
-    book_id  INTEGER NOT NULL,
-    rating   INTEGER,
-    date_read  TEXT,
-    date_added TEXT,
-    PRIMARY KEY (list_id, book_id)
+CREATE TABLE IF NOT EXISTS library_books (
+    library_id     INTEGER NOT NULL REFERENCES libraries(legacy_id) ON DELETE CASCADE,
+    book_legacy_id INTEGER NOT NULL,
+    rating         INTEGER,
+    date_read      TEXT,
+    date_added     TEXT,
+    PRIMARY KEY (library_id, book_legacy_id)
 );
 
 CREATE TABLE IF NOT EXISTS book_elo_ratings (
@@ -61,13 +61,13 @@ CREATE TABLE IF NOT EXISTS prediction_hyperparams (
     date_updated TEXT NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_readers_single_self
-ON readers(is_self) WHERE is_self = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_libraries_single_main
+ON libraries(is_main) WHERE is_main = 1;
 
 -- 2. PERSISTENT CRAWL QUEUE
 
 CREATE TABLE IF NOT EXISTS crawl_queue (
-    book_id            INTEGER PRIMARY KEY,
+    book_legacy_id     INTEGER PRIMARY KEY,
     status             TEXT NOT NULL DEFAULT 'pending',
     priority           REAL NOT NULL DEFAULT 0.0,
     error_count        INTEGER DEFAULT 0,
@@ -179,7 +179,7 @@ CREATE TABLE IF NOT EXISTS book_editions (
     PRIMARY KEY (book_id, edition_legacy_id)
 );
 
-CREATE TABLE IF NOT EXISTS book_similar_books (
+CREATE TABLE IF NOT EXISTS similar_books (
     book_id           INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
     similar_legacy_id INTEGER NOT NULL,
     average_rating    REAL,
@@ -187,12 +187,6 @@ CREATE TABLE IF NOT EXISTS book_similar_books (
     date_fetched      TEXT DEFAULT (strftime('%Y-%m-%d', 'now')),
     PRIMARY KEY (book_id, similar_legacy_id)
 );
-
--- 8. VIEWS
-CREATE VIEW IF NOT EXISTS editions_lookup AS
-SELECT edition_legacy_id AS raw_legacy_id, book_id AS canonical_book_id FROM book_editions
-UNION
-SELECT legacy_id AS raw_legacy_id, legacy_id AS canonical_book_id FROM books;
 """
 
 
@@ -214,6 +208,17 @@ def get_connection(db_path=None):
 def init_db(db_path=None):
     with get_connection(db_path) as db_conn:
         db_conn.executescript(SCHEMA)
+        db_conn.execute("DROP VIEW IF EXISTS best_book_lookup")
+        db_conn.execute(
+            """
+            CREATE VIEW best_book_lookup AS
+            SELECT edition_legacy_id AS raw_legacy_id, book_id AS best_book_id
+            FROM book_editions
+            UNION
+            SELECT legacy_id AS raw_legacy_id, legacy_id AS best_book_id
+            FROM books
+            """
+        )
         db_conn.commit()
 
 
@@ -280,8 +285,8 @@ def upsert_rows(db_conn, table, rows, columns):
     db_conn.commit()
 
 
-def get_self_list_id(db_conn):
-    row = db_conn.execute("SELECT list_id FROM readers WHERE is_self = 1").fetchone()
+def get_main_library_id(db_conn):
+    row = db_conn.execute("SELECT legacy_id FROM libraries WHERE is_main = 1").fetchone()
     if row is None:
-        raise RuntimeError("No self reader found. Run seeding first.")
-    return row["list_id"]
+        raise RuntimeError("No main library found. Run seeding first.")
+    return row["legacy_id"]

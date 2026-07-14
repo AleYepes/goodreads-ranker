@@ -173,8 +173,8 @@ def run_interactive_ranking(elo_df, titles, star_rating):
                 if index_a == index_b:
                     continue
 
-            title_a = titles.get(elo_df.at[index_a, 'legacy_id']) or f"Book {elo_df.at[index_a, 'legacy_id']}"
-            title_b = titles.get(elo_df.at[index_b, 'legacy_id']) or f"Book {elo_df.at[index_b, 'legacy_id']}"
+            title_a = titles.get(elo_df.at[index_a, "legacy_id"]) or f"Book {elo_df.at[index_a, 'legacy_id']}"
+            title_b = titles.get(elo_df.at[index_b, "legacy_id"]) or f"Book {elo_df.at[index_b, 'legacy_id']}"
 
             user_choice = input(f"[1] {title_a}\n[2] {title_b}\nChoose (1 or 2, 'q' to quit): ").strip().lower()
 
@@ -315,12 +315,12 @@ def get_similar_friend_ratings(
 ):
     cursor = db_conn.execute(
         """
-        SELECT rl.list_id, r_res.canonical_book_id AS legacy_id, MAX(rl.rating) AS rating
-        FROM reader_libraries rl
-        JOIN readers r ON rl.list_id = r.list_id
-        JOIN editions_lookup r_res ON rl.book_id = r_res.raw_legacy_id
-        WHERE r.is_self = 0
-        GROUP BY rl.list_id, r_res.canonical_book_id
+        SELECT lb.library_id, bbl.best_book_id AS legacy_id, MAX(lb.rating) AS rating
+        FROM library_books lb
+        JOIN libraries l ON lb.library_id = l.legacy_id
+        JOIN best_book_lookup bbl ON lb.book_legacy_id = bbl.raw_legacy_id
+        WHERE l.is_main = 0
+        GROUP BY lb.library_id, bbl.best_book_id
         """
     )
     rows = cursor.fetchall()
@@ -330,7 +330,7 @@ def get_similar_friend_ratings(
         return pd.Series(dtype=float), [], pd.DataFrame()
 
     friends["rating"] = friends["rating"].astype("UInt8").replace(0, np.nan)
-    friends["list_id"] = friends["list_id"].astype(str)
+    friends["library_id"] = friends["library_id"].astype(str)
 
     current_book_ids = books_df["legacy_id"].to_numpy()
     current_book_id_set = set(current_book_ids.tolist())
@@ -338,7 +338,7 @@ def get_similar_friend_ratings(
     friends = cast(pd.DataFrame, friends_df.dropna(subset=["rating"]).copy())
     friends = cast(
         pd.DataFrame,
-        friends.groupby(["list_id", "legacy_id"], as_index=False)["rating"].mean(),
+        friends.groupby(["library_id", "legacy_id"], as_index=False)["rating"].mean(),
     )
 
     my_books = books_df[["legacy_id", "my_refined"]].dropna().copy()
@@ -360,7 +360,7 @@ def get_similar_friend_ratings(
     friend_scores = []
     calibrated_friend_rows = []
 
-    for list_id, friend_df in friends.groupby("list_id"):
+    for library_id, friend_df in friends.groupby("library_id"):
         overlap = friend_df.merge(my_books, on="legacy_id", how="inner").dropna(subset=["rating", "my_refined"]).copy()
         overlap_count = len(overlap)
         if overlap_count < min_overlap:
@@ -433,7 +433,7 @@ def get_similar_friend_ratings(
 
         friend_scores.append(
             {
-                "list_id": list_id,
+                "library_id": library_id,
                 "overlap_count": overlap_count,
                 "union_count": len(my_union),
                 "friend_books": len(friend_df),
@@ -457,12 +457,12 @@ def get_similar_friend_ratings(
     if len(selected) < minimum_selected:
         selected = friend_scores.head(minimum_selected).copy()
 
-    similar_friends = selected["list_id"].tolist()
+    similar_friends = selected["library_id"].tolist()
     similar_friend_ratings = cast(pd.DataFrame, pd.concat(calibrated_friend_rows, ignore_index=True))
-    selected_sub = cast(pd.DataFrame, selected[["list_id", "score"]])
+    selected_sub = cast(pd.DataFrame, selected[["library_id", "score"]])
     similar_friend_ratings = similar_friend_ratings.merge(
         selected_sub.rename(columns={"score": "friend_weight"}),
-        on="list_id",
+        on="library_id",
         how="inner",
     )
     similar_friend_ratings = similar_friend_ratings[
@@ -478,7 +478,7 @@ def get_similar_friend_ratings(
         similar_friend_ratings.groupby("legacy_id").agg(
             weighted_rating=("weighted_rating", "sum"),
             total_weight=("friend_weight", "sum"),
-            supporting_friends=("list_id", "nunique"),
+            supporting_friends=("library_id", "nunique"),
         )
     )
     similar_friend_ratings["rating"] = (
@@ -495,9 +495,9 @@ def build_adjacency_matrix(books_df, num_nodes, db_conn):
 
     cursor = db_conn.execute(
         """
-        SELECT sb.book_id, r.canonical_book_id AS similar_legacy_id
-        FROM book_similar_books sb
-        JOIN editions_lookup r ON sb.similar_legacy_id = r.raw_legacy_id
+        SELECT sb.book_id, bbl.best_book_id AS similar_legacy_id
+        FROM similar_books sb
+        JOIN best_book_lookup bbl ON sb.similar_legacy_id = bbl.raw_legacy_id
         """
     )
     edge_indices = []
@@ -707,9 +707,9 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
     db.init_db(db_path)
     with db.get_connection(db_path) as db_conn:
         try:
-            self_list_id = db.get_self_list_id(db_conn)
+            main_library_id = db.get_main_library_id(db_conn)
         except RuntimeError as err:
-            raise RuntimeError("No self reader found. Run seed first.") from err
+            raise RuntimeError("No main library found. Run seed first.") from err
 
         cursor = db_conn.execute("SELECT * FROM books ORDER BY legacy_id")
         books_rows = cursor.fetchall()
@@ -718,14 +718,14 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
 
         cursor = db_conn.execute(
             """
-            SELECT b.*, MAX(l.rating) AS my_rating
+            SELECT b.*, MAX(lb.rating) AS my_rating
             FROM books b
-            LEFT JOIN editions_lookup r ON b.legacy_id = r.canonical_book_id
-            LEFT JOIN reader_libraries l ON r.raw_legacy_id = l.book_id AND l.list_id = ?
+            LEFT JOIN best_book_lookup bbl ON b.legacy_id = bbl.best_book_id
+            LEFT JOIN library_books lb ON bbl.raw_legacy_id = lb.book_legacy_id AND lb.library_id = ?
             GROUP BY b.legacy_id
             ORDER BY b.legacy_id
             """,
-            (self_list_id,),
+            (main_library_id,),
         )
         books_df = pd.DataFrame([dict(r) for r in cursor.fetchall()])
         books_df["my_rating"] = cast(Any, pd.to_numeric(books_df["my_rating"], errors="coerce")).replace(0, np.nan)
@@ -735,10 +735,10 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
 
         orphan_row = db_conn.execute(
             """
-            SELECT COUNT(DISTINCT l.book_id)
-            FROM reader_libraries l
-            LEFT JOIN editions_lookup r ON l.book_id = r.raw_legacy_id
-            WHERE r.raw_legacy_id IS NULL
+            SELECT COUNT(DISTINCT lb.book_legacy_id)
+            FROM library_books lb
+            LEFT JOIN best_book_lookup bbl ON lb.book_legacy_id = bbl.raw_legacy_id
+            WHERE bbl.raw_legacy_id IS NULL
             """
         ).fetchone()
         orphan_count = orphan_row[0] if orphan_row else 0
@@ -786,18 +786,18 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         print("Taste calibration")
         print(f"My ratings ({my_rating_count})")
 
-        friend_meta = db_conn.execute("SELECT list_id, username FROM readers WHERE is_self != 1").fetchall()
-        list_to_user = {int(row["list_id"]): row["username"] or str(row["list_id"]) for row in friend_meta}
+        friend_meta = db_conn.execute("SELECT legacy_id, username FROM libraries WHERE is_main != 1").fetchall()
+        library_to_user = {int(row["legacy_id"]): row["username"] or str(row["legacy_id"]) for row in friend_meta}
 
         if not friend_scores.empty:
             selected_scores = cast(
                 pd.DataFrame,
-                friend_scores[friend_scores["list_id"].astype(int).isin([int(x) for x in similar_friends])],
+                friend_scores[friend_scores["library_id"].astype(int).isin([int(x) for x in similar_friends])],
             )
             records = cast(list[dict[str, Any]], selected_scores.to_dict(orient="records"))
             for row in records:
-                lid = int(row["list_id"])
-                username = list_to_user.get(lid, str(lid))
+                lid = int(row["library_id"])
+                username = library_to_user.get(lid, str(lid))
                 overlap_c = int(row["overlap_count"])
                 print(f"{username} - {lid} ({overlap_c} books)")
 
