@@ -14,7 +14,6 @@ DEFAULT_FRIEND_LIST_IDS = [
     156484926,  # 156484926-victoria
     160516894,  # 160516894-janine
     166997642,  # 166997642-carson-cummins
-    1713956,  # 1834894.Manny_Rayner ## Different list for some reason
     174792571,  # 174792571-annie
     18922126,  # 18922126-ella-park
     18913667,  # 18913667.Edward_Vass
@@ -32,7 +31,6 @@ DEFAULT_FRIEND_LIST_IDS = [
     34518408,  # 34518408-dawood
     40426330,  # 40426330-sabrina-li
     41797321,  # 41797321-cristina-cojocaru
-    41944053,  # 8136076.Cosmin_Leucu_a ## Different list for some reason
     42001957,  # 42001957-matty-van-hoof
     43400637,  # 43400637-fay-pretty
     46459461,  # 46459461-an-fech

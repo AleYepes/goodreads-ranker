@@ -68,15 +68,13 @@ def get_or_create_prediction_hyperparams(db_conn, name, defaults):
     return params
 
 
-def load_valid_embeddings_for_books(db_conn, books_df, model=None):
+def load_valid_embeddings_for_books(db_conn, books_df, embedding_model=None):
     import hashlib
 
-    from . import embedder
+    if not embedding_model:
+        embedding_model = config.get_embedding_model()
 
-    if not model:
-        model = config.get_embedding_model()
-
-    all_inputs = embedder.build_embedding_inputs(db_conn)
+    all_inputs = db.build_embedding_inputs(db_conn)
     input_hashes = {legacy_id: hashlib.md5(text.encode("utf-8")).hexdigest() for legacy_id, text in all_inputs.items()}
 
     rows = db_conn.execute(
@@ -85,7 +83,7 @@ def load_valid_embeddings_for_books(db_conn, books_df, model=None):
         FROM book_embeddings
         WHERE embedding_model = ?
         """,
-        (model,),
+        (embedding_model,),
     ).fetchall()
     embedding_rows = {int(row["legacy_id"]): row for row in rows}
 
@@ -714,7 +712,7 @@ def run_optimized(best_params, books_df, precomputed_embeddings, training_col):
     return final_pred
 
 
-def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
+def run_ranking(interactive=False, optimize=False, embedding_model=None, db_path=None):
     db.init_db(db_path)
     with db.get_connection(db_path) as db_conn:
         try:
@@ -760,7 +758,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         books_df = books_df.merge(my_refined.rename("my_refined"), on="legacy_id", how="left")
 
         has_embedding, embedded_embeddings, invalid_counts = load_valid_embeddings_for_books(
-            db_conn, books_df, model=model
+            db_conn, books_df, embedding_model=embedding_model
         )
         excluded_count = int((~has_embedding).sum())
         if excluded_count:

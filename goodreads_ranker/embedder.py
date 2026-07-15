@@ -1,5 +1,4 @@
 import contextlib
-import re
 import subprocess
 import time
 
@@ -10,7 +9,7 @@ from . import config, db
 
 
 @contextlib.contextmanager
-def _ensure_ollama(model: str):
+def _ensure_ollama(embedding_model: str):
     import ollama
 
     server_started_here = False
@@ -45,10 +44,10 @@ def _ensure_ollama(model: str):
     def _normalise(name: str) -> str:
         return name if ":" in name else f"{name}:latest"
 
-    if _normalise(model) not in {_normalise(m) for m in available}:
-        print(f"Model '{model}' not found locally — pulling...")
-        ollama.pull(model)
-        print(f"Model '{model}' ready.")
+    if _normalise(embedding_model) not in {_normalise(m) for m in available}:
+        print(f"Model '{embedding_model}' not found locally — pulling...")
+        ollama.pull(embedding_model)
+        print(f"Model '{embedding_model}' ready.")
 
     try:
         yield
@@ -58,75 +57,7 @@ def _ensure_ollama(model: str):
             proc.wait(timeout=10)
 
 
-def format_string_for_embedding(items, kind=None):
-    if not isinstance(items, list) or len(items) == 0:
-        return ""
-
-    n = len(items)
-    res = items[0] if n == 1 else f"{', '.join(items[:-1])}{',' if n > 2 else ''} and {items[-1]}"
-
-    prefix = f"{kind.capitalize()}{'s' if n > 1 else ''}: " if kind else ""
-    return f"{prefix}{res}"
-
-
-def join_embedding_parts(title, authors, genres, desc):
-    text = f"Book: {title}\n"
-    if authors:
-        text += f"Written by: {authors}\n"
-    if genres:
-        text += f"{genres}\n"
-    if desc:
-        text += f"{desc}"
-    return text
-
-
-def build_embedding_inputs(db_conn):
-    cursor = db_conn.execute(
-        """
-        SELECT b.legacy_id, b.title, c.name AS author_name, b.description
-        FROM books b
-        LEFT JOIN book_contributors bc ON bc.book_id = b.legacy_id AND bc.is_primary = 1
-        LEFT JOIN contributors c ON c.legacy_id = bc.contributor_id
-        ORDER BY b.legacy_id
-        """
-    )
-    rows = cursor.fetchall()
-
-    cursor_genres = db_conn.execute(
-        """
-        SELECT bg.book_id, g.name
-        FROM book_genres bg
-        JOIN genres g ON bg.genre_id = g.legacy_id
-        """
-    )
-    genres_by_book = {}
-    for r in cursor_genres.fetchall():
-        bid = int(r["book_id"])
-        genres_by_book.setdefault(bid, []).append(r["name"])
-
-    inputs = {}
-    for row in rows:
-        legacy_id = int(row["legacy_id"])
-        title = row["title"] or ""
-
-        author_name = row["author_name"]
-        authors_post = author_name.strip() if author_name and author_name.strip() else ""
-
-        genres_list = genres_by_book.get(legacy_id, [])
-        genres_post = format_string_for_embedding(genres_list, kind="genre")
-
-        desc_raw = row["description"] or ""
-        desc_clean = re.sub(r"\s+", " ", desc_raw).strip()
-        desc_list = [desc_clean] if desc_clean else []
-        desc_post = format_string_for_embedding(desc_list, kind="description")
-
-        embedding_input = join_embedding_parts(title, authors_post, genres_post, desc_post)
-        inputs[legacy_id] = embedding_input
-
-    return inputs
-
-
-def find_books_needing_embeddings(db_conn, all_inputs, model):
+def find_books_needing_embeddings(db_conn, all_inputs, embedding_model):
     if not all_inputs:
         return []
 
@@ -143,7 +74,7 @@ def find_books_needing_embeddings(db_conn, all_inputs, model):
         LEFT JOIN book_embeddings e ON e.book_id = b.legacy_id AND e.embedding_model = ?
         ORDER BY b.legacy_id
         """,
-        (model,),
+        (embedding_model,),
     )
 
     queued = []
@@ -165,41 +96,41 @@ def find_books_needing_embeddings(db_conn, all_inputs, model):
     return queued
 
 
-def generate_embeddings(batch_size=128, model=None, db_path=None):
+def generate_embeddings(batch_size=128, embedding_model=None, db_path=None):
     db.init_db(db_path)
 
-    if not model:
-        model = config.get_embedding_model()
+    if not embedding_model:
+        embedding_model = config.get_embedding_model()
 
     with db.get_connection(db_path) as db_conn:
-        all_inputs = build_embedding_inputs(db_conn)
+        all_inputs = db.build_embedding_inputs(db_conn)
         if not all_inputs:
             print("No books found. Run crawler first.")
             return
 
-        missing_ids = find_books_needing_embeddings(db_conn, all_inputs, model)
+        missing_ids = find_books_needing_embeddings(db_conn, all_inputs, embedding_model)
 
         if not missing_ids:
-            print(f"Nothing to embed: all books have valid embeddings for model '{model}'.")
+            print(f"Nothing to embed: all books have valid embeddings for model '{embedding_model}'.")
             return
 
         import hashlib
 
         import ollama
 
-        with _ensure_ollama(model):
+        with _ensure_ollama(embedding_model):
             for i in tqdm(range(0, len(missing_ids), batch_size)):
                 batch_ids = missing_ids[i : i + batch_size]
                 batch_strings = [all_inputs[bid] for bid in batch_ids]
 
                 try:
-                    response = ollama.embed(model=model, input=batch_strings)
+                    response = ollama.embed(model=embedding_model, input=batch_strings)
                     embeddings_list = response["embeddings"]
 
                     vectors = np.array(embeddings_list, dtype=np.float32)
 
                     batch_hashes = {bid: hashlib.md5(all_inputs[bid].encode("utf-8")).hexdigest() for bid in batch_ids}
-                    db.save_embeddings(db_conn, batch_ids, vectors, model, batch_hashes)
+                    db.save_embeddings(db_conn, batch_ids, vectors, embedding_model, batch_hashes)
                 except Exception as e:
                     print(f"\n  Error generating embeddings for batch starting with legacy_id {batch_ids[0]}: {e}")
                     continue

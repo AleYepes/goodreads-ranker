@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -208,11 +209,6 @@ def get_connection(db_path=None):
 def init_db(db_path=None):
     with get_connection(db_path) as db_conn:
         db_conn.executescript(SCHEMA)
-        ###
-        library_columns = {row["name"] for row in db_conn.execute("PRAGMA table_info(libraries)").fetchall()}
-        if "is_similar" not in library_columns:
-            db_conn.execute("ALTER TABLE libraries ADD COLUMN is_similar INTEGER DEFAULT 0")
-        ###
         db_conn.execute("DROP VIEW IF EXISTS best_book_lookup")
         db_conn.execute(
             """
@@ -229,15 +225,6 @@ def init_db(db_path=None):
 
 def vector_to_blob(vec):
     return vec.astype(np.float32).tobytes()
-
-
-def is_valid_embedding_blob(blob):
-    if blob is None:
-        return False
-    if len(blob) % np.dtype(np.float32).itemsize != 0:
-        return False
-    vector = np.frombuffer(blob, dtype=np.float32)
-    return bool(vector.size and np.any(vector != 0))
 
 
 def save_prediction_hyperparams(db_conn, name, params):
@@ -259,6 +246,83 @@ def load_prediction_hyperparams(db_conn, name):
         return json.loads(row["params_json"])
     except json.JSONDecodeError:
         return None
+
+
+def is_valid_embedding_blob(blob):
+    if blob is None:
+        return False
+    if len(blob) % np.dtype(np.float32).itemsize != 0:
+        return False
+    vector = np.frombuffer(blob, dtype=np.float32)
+    return bool(vector.size and np.any(vector != 0))
+
+
+def format_string_for_embedding(items, kind=None):
+    if not isinstance(items, list) or len(items) == 0:
+        return ""
+
+    n = len(items)
+    res = items[0] if n == 1 else f"{', '.join(items[:-1])}{',' if n > 2 else ''} and {items[-1]}"
+
+    prefix = f"{kind.capitalize()}{'s' if n > 1 else ''}: " if kind else ""
+    return f"{prefix}{res}"
+
+
+def join_embedding_parts(title, authors, genres, desc):
+    text = f"Book: {title}\n"
+    if authors:
+        text += f"Written by: {authors}\n"
+    if genres:
+        text += f"{genres}\n"
+    if desc:
+        text += f"{desc}"
+    return text
+
+
+def build_embedding_inputs(db_conn):
+    cursor = db_conn.execute(
+        """
+        SELECT b.legacy_id, b.title, c.name AS author_name, b.description
+        FROM books b
+        LEFT JOIN book_contributors bc ON bc.book_id = b.legacy_id AND bc.is_primary = 1
+        LEFT JOIN contributors c ON c.legacy_id = bc.contributor_id
+        ORDER BY b.legacy_id
+        """
+    )
+    rows = cursor.fetchall()
+
+    cursor_genres = db_conn.execute(
+        """
+        SELECT bg.book_id, g.name
+        FROM book_genres bg
+        JOIN genres g ON bg.genre_id = g.legacy_id
+        """
+    )
+    genres_by_book = {}
+    for r in cursor_genres.fetchall():
+        bid = int(r["book_id"])
+        genres_by_book.setdefault(bid, []).append(r["name"])
+
+    inputs = {}
+    for row in rows:
+        legacy_id = int(row["legacy_id"])
+        title = row["title"] or ""
+
+        author_name = row["author_name"]
+        authors_post = author_name.strip() if author_name and author_name.strip() else ""
+
+        genres_list = genres_by_book.get(legacy_id, [])
+        genres_post = format_string_for_embedding(genres_list, kind="genre")
+
+        desc_raw = row["description"] or ""
+        desc_clean = re.sub(r"\s+", " ", desc_raw).strip()
+        desc_list = [desc_clean] if desc_clean else []
+        desc_post = format_string_for_embedding(desc_list, kind="description")
+
+        embedding_input = join_embedding_parts(title, authors_post, genres_post, desc_post)
+        inputs[legacy_id] = embedding_input
+
+    return inputs
 
 
 def save_embeddings(db_conn, legacy_ids, vectors, model, text_hashes):

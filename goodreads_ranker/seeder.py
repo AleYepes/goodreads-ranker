@@ -346,14 +346,12 @@ async def extract_friend_row(row, library_id):
     rating = 0
 
     if rating_container:
-        static_stars = await rating_container.query_selector(
-            ".staticStars"
-        )  # for read-only staticStars (friend's rating)
+        static_stars = await rating_container.query_selector(".staticStars")  # for read-only friend's ratings
         if static_stars:
             rating_text = await static_stars.get_attribute("title") or ""
             rating = RATING_MAP.get(rating_text, 0)
         else:
-            stars_el = await rating_container.query_selector(".stars")  # for editable stars (own rating)
+            stars_el = await rating_container.query_selector(".stars")  # for editable personal ratings
             if stars_el:
                 data_rating = await stars_el.get_attribute("data-rating")
                 if data_rating and data_rating.isdigit():
