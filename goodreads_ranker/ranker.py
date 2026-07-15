@@ -362,10 +362,13 @@ def get_similar_friend_ratings(
     friend_scores = []
     calibrated_friend_rows = []
 
+    friend_groups = list(cast(Any, friends.groupby("library_id", sort=False)))
+    friend_group_count = len(cast(Any, friends["library_id"].dropna().unique()))
+
     for library_id, friend_df in tqdm(
-        friends.groupby("library_id"),
+        friend_groups,
         desc="Calibrating friends",
-        total=friends["library_id"].nunique(),
+        total=friend_group_count,
         unit="friend",
     ):
         overlap = friend_df.merge(my_books, on="legacy_id", how="inner").dropna(subset=["rating", "my_refined"]).copy()

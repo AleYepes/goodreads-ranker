@@ -1,47 +1,45 @@
 import asyncio
 import sys
 
+import fire
+
 from goodreads_ranker import config, db
 from goodreads_ranker.utils import as_bool, parse_optional_int
-
-import fire
 
 # Centralized CLI documentation mapping
 COMMAND_HELPS = {
     "init": {
         "desc": "Interactively configure required environment variables in .env.",
-        "flags": [
-            ("--force", "Force update of existing environment variables.")
-        ]
+        "flags": [("--force", "Force update of existing environment variables.")],
     },
     "seed": {
         "desc": "Scrape Goodreads library shelves to seed the database.",
         "flags": [
             ("--force", "Force seeding even if shelves were already seeded."),
-            ("--library-ids", "Comma-separated list of Goodreads user/library IDs to seed.")
-        ]
+            ("--library-ids", "Comma-separated list of Goodreads user/library IDs to seed."),
+        ],
     },
     "crawl": {
         "desc": "Crawl detailed metadata for all seeded books.",
         "flags": [
             ("--limit", "Limit the number of books to crawl."),
-            ("--force", "Force crawl even if details were already crawled.")
-        ]
+            ("--force", "Force crawl even if details were already crawled."),
+        ],
     },
     "embed": {
         "desc": "Generate Ollama vector embeddings for crawled books.",
         "flags": [
             ("--batch-size", "Batch size for generating embeddings (default: 128)."),
-            ("--model", "Ollama model name (overrides configured default).")
-        ]
+            ("--model", "Ollama model name (overrides configured default)."),
+        ],
     },
     "rank": {
         "desc": "Train ranking models and generate book recommendations.",
         "flags": [
             ("--interactive", "Train and evaluate models in interactive mode."),
             ("--optimize", "Optimize ranker model hyperparameters."),
-            ("--model", "Specific algorithm or model to run for ranking.")
-        ]
+            ("--model", "Specific algorithm or model to run for ranking."),
+        ],
     },
     "run_pipeline": {
         "desc": "Run the complete pipeline from initialization to ranking.",
@@ -52,9 +50,9 @@ COMMAND_HELPS = {
             ("--force-crawl", "Force book crawling step."),
             ("--optimize", "Optimize ranking model hyperparameters."),
             ("--interactive", "Run ranker in interactive mode."),
-            ("--model", "Embedding/ranking model name to use.")
-        ]
-    }
+            ("--model", "Embedding/ranking model name to use."),
+        ],
+    },
 }
 
 
@@ -286,7 +284,7 @@ def print_help(command=None):
         print("Available commands:")
         for cmd, info in COMMAND_HELPS.items():
             print(f"  {cmd:<22}{info['desc']}")
-            for flag, flag_desc in info['flags']:
+            for flag, flag_desc in info["flags"]:
                 print(f"    {flag:<20}{flag_desc}")
             print()
         print("Additional options:")
@@ -301,9 +299,9 @@ def print_help(command=None):
             print(f"  python main.py {command} [<args>]\n")
             print("Description:")
             print(f"  {info['desc']}\n")
-            if info['flags']:
+            if info["flags"]:
                 print("Available options:")
-                for flag, flag_desc in info['flags']:
+                for flag, flag_desc in info["flags"]:
                     print(f"  {flag:<22}{flag_desc}")
             else:
                 print("This command does not accept any additional options.")
@@ -320,12 +318,13 @@ def main():
             if arg in COMMAND_HELPS:
                 subcommand = arg
                 break
-        
+
         print_help(subcommand)
         sys.exit(0)
 
     # Disable Google Fire's default interactive console pager
     import os
+
     os.environ["PAGER"] = f'"{sys.executable}" -c "import sys; sys.stdout.write(sys.stdin.read())"'
 
     fire.Fire(GoodreadsRankerCLI)
