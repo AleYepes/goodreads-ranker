@@ -15,6 +15,7 @@ from sklearn.preprocessing import MinMaxScaler, Normalizer
 from sklearn.svm import SVR
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
 from torch_geometric.utils import add_self_loops
+from tqdm import tqdm
 
 from . import config, db
 
@@ -231,6 +232,7 @@ def refine_ratings(target_df, rating_col, db_conn, interactive=False):
         elo_df = pd.DataFrame(columns=["legacy_id", "original_rating", "elo_score", "matches_played"])
 
     elo_df = elo_df.set_index("legacy_id")
+    elo_df = elo_df[elo_df.index.isin(target_clean["legacy_id"])]
 
     common_books = elo_df.index.intersection(target_clean["legacy_id"])
     elo_df.loc[common_books, "original_rating"] = target_clean.set_index("legacy_id").loc[common_books, rating_col]
@@ -326,6 +328,7 @@ def get_similar_friend_ratings(
     friends = pd.DataFrame([dict(r) for r in rows])
 
     if friends.empty:
+        print("No friend library data available for calibration.")
         return pd.Series(dtype=float), [], pd.DataFrame()
 
     friends["rating"] = friends["rating"].astype("UInt8").replace(0, np.nan)
@@ -359,7 +362,12 @@ def get_similar_friend_ratings(
     friend_scores = []
     calibrated_friend_rows = []
 
-    for library_id, friend_df in friends.groupby("library_id"):
+    for library_id, friend_df in tqdm(
+        friends.groupby("library_id"),
+        desc="Calibrating friends",
+        total=friends["library_id"].nunique(),
+        unit="friend",
+    ):
         overlap = friend_df.merge(my_books, on="legacy_id", how="inner").dropna(subset=["rating", "my_refined"]).copy()
         overlap_count = len(overlap)
         if overlap_count < min_overlap:
@@ -536,6 +544,7 @@ def prep_optimization(
     mrl_dimensions,
     max_propagations,
     budget=300,
+    desc="Optimizing model",
 ):
     training_mask = ~books_df[training_col].isna()
     my_ratings = books_df.loc[training_mask, training_col].values
@@ -634,7 +643,7 @@ def prep_optimization(
     optimizer = ng.optimizers.NGOpt(parametrization=parametrization, budget=budget)
     best_loss = float("inf")
 
-    for _ in range(budget):
+    for _ in tqdm(range(budget), desc=desc, unit="trial"):
         x = optimizer.ask()
         loss = objective(*x.args, **x.kwargs)
         optimizer.tell(x, loss)
@@ -741,21 +750,19 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             """
         ).fetchone()
         orphan_count = orphan_row[0] if orphan_row else 0
-        print(f"Unresolved library books (orphans): {orphan_count}")
+        if orphan_count:
+            print(f"Warning: {orphan_count} unresolved library books (orphans).")
 
-        print("Running ELO ratings refinement...")
         my_refined = refine_ratings(books_df, "my_rating", db_conn, interactive=interactive)
-
         books_df = books_df.merge(my_refined.rename("my_refined"), on="legacy_id", how="left")
 
-        print("Loading valid embeddings...")
         has_embedding, embedded_embeddings, invalid_counts = load_valid_embeddings_for_books(
             db_conn, books_df, model=model
         )
         excluded_count = int((~has_embedding).sum())
         if excluded_count:
             print(
-                "Excluding "
+                "Warning: excluding "
                 f"{excluded_count} books from model inputs "
                 f"(missing={invalid_counts['missing']}, "
                 f"invalid={invalid_counts['invalid']}, "
@@ -764,8 +771,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             )
         if embedded_embeddings.size == 0:
             raise RuntimeError("No valid embeddings found. Run embedder before ranking.")
-
-        print("Calibrating friend ratings...")
 
         embedded_books_df = books_df[has_embedding].copy().reset_index(drop=True)
 
@@ -781,26 +786,8 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             cast(Any, embedded_books_df["legacy_id"]).map(cast(Any, friend_ratings_dict))
         )
 
-        my_rating_count = len(books_df[books_df["my_rating"].notna()])
-        print("Taste calibration")
-        print(f"My ratings ({my_rating_count})")
+        db.set_similar_libraries(db_conn, similar_friends)
 
-        friend_meta = db_conn.execute("SELECT legacy_id, username FROM libraries WHERE is_main != 1").fetchall()
-        library_to_user = {int(row["legacy_id"]): row["username"] or str(row["legacy_id"]) for row in friend_meta}
-
-        if not friend_scores.empty:
-            selected_scores = cast(
-                pd.DataFrame,
-                friend_scores[friend_scores["library_id"].astype(int).isin([int(x) for x in similar_friends])],
-            )
-            records = cast(list[dict[str, Any]], selected_scores.to_dict(orient="records"))
-            for row in records:
-                lid = int(row["library_id"])
-                username = library_to_user.get(lid, str(lid))
-                overlap_c = int(row["overlap_count"])
-                print(f"{username} - {lid} ({overlap_c} books)")
-
-        print("Running graph GCN propagation...")
         device = torch.device(
             "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         )
@@ -831,7 +818,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         del propagated, adj_matrix, embeddings_tensor
 
         if optimize:
-            print("Tuning hyperparameters via Nevergrad (budget=200)...")
             friend_params = prep_optimization(
                 embedded_books_df,
                 precomputed_embeddings,
@@ -839,6 +825,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                 mrl_dimensions,
                 max_propagations,
                 budget=200,
+                desc="Optimizing friend-taste model",
             )
             solo_params = prep_optimization(
                 embedded_books_df,
@@ -847,6 +834,7 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                 mrl_dimensions,
                 max_propagations,
                 budget=200,
+                desc="Optimizing solo-taste model",
             )
             friend_params = normalize_model_params(friend_params)
             solo_params = normalize_model_params(solo_params)
@@ -857,7 +845,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             friend_params = get_or_create_prediction_hyperparams(db_conn, "friend_params", DEFAULT_FRIEND_PARAMS)
             solo_params = get_or_create_prediction_hyperparams(db_conn, "solo_params", DEFAULT_SOLO_PARAMS)
 
-        print("Running ensemble models...")
         friend_final_pred_embedded = run_optimized(
             friend_params, embedded_books_df, precomputed_embeddings, "training_ratings"
         )
@@ -869,7 +856,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         friend_final_pred[embedded_positions] = friend_final_pred_embedded
         solo_final_pred[embedded_positions] = solo_final_pred_embedded
 
-        print("Formulating final recommendations...")
         star_cols = ["star_1", "star_2", "star_3", "star_4", "star_5"]
         books_df["rating_count"] = books_df[star_cols].sum(axis=1)
 
@@ -904,10 +890,8 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
         books_df["solo_pred_rating"] = solo_pred
         books_df["friend_pred_rating"] = friend_pred
         books_df["count_adjusted_rating"] = count_adjusted_scaled
-        books_df["pred_rating"] = friend_pred * solo_pred
         books_df["final_rating"] = count_adjusted_scaled * friend_pred * solo_pred
 
-        print("Saving predictions to database...")
         now_str = datetime.now().strftime("%Y-%m-%d")
         predictions_data = []
 
@@ -915,7 +899,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
             required = [
                 row["solo_pred_rating"],
                 row["friend_pred_rating"],
-                row["pred_rating"],
                 row["final_rating"],
             ]
             if any(pd.isna(value) for value in required):
@@ -926,7 +909,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                     float(row["solo_pred_rating"]),
                     float(row["friend_pred_rating"]),
                     float(row["count_adjusted_rating"]),
-                    float(row["pred_rating"]),
                     float(row["final_rating"]),
                     now_str,
                 )
@@ -943,7 +925,6 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                         "solo_pred_rating",
                         "friend_pred_rating",
                         "count_adjusted_rating",
-                        "pred_rating",
                         "final_rating",
                         "date_updated",
                     ],
@@ -952,5 +933,3 @@ def run_ranking(interactive=False, optimize=False, model=None, db_path=None):
                 placeholders = ",".join("?" for _ in predictions_data)
                 prune_ids = [x[0] for x in predictions_data]
                 db_conn.execute(f"DELETE FROM book_predictions WHERE book_id NOT IN ({placeholders})", prune_ids)
-
-        print(f"Saved predictions for {len(predictions_data)} books.")

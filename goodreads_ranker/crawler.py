@@ -638,7 +638,7 @@ def populate_seeds(db_conn):
     db_conn.commit()
 
 
-def handle_force_recrawl(db_conn):
+def handle_force_crawl(db_conn):
     db_conn.execute(
         """
         UPDATE crawl_queue
@@ -652,7 +652,7 @@ def handle_force_recrawl(db_conn):
     db_conn.commit()
 
 
-async def run_crawler(limit=None, force_recrawl=False, db_path=None):
+async def run_crawler(limit=None, force_crawl=False, db_path=None):
     global _gql_sem
     _gql_sem = asyncio.Semaphore(3)
 
@@ -667,8 +667,8 @@ async def run_crawler(limit=None, force_recrawl=False, db_path=None):
     with db.get_connection(db_path) as db_conn:
         populate_seeds(db_conn)
 
-        if force_recrawl:
-            handle_force_recrawl(db_conn)
+        if force_crawl:
+            handle_force_crawl(db_conn)
 
         expand_similar = limit is not None
         effective_limit = limit if (limit is not None and limit > 0) else None

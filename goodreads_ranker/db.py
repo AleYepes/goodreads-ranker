@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS libraries (
     username           TEXT,
     user_id            INTEGER,
     is_main            INTEGER DEFAULT 0,
+    is_similar         INTEGER DEFAULT 0,
     scrape_complete    INTEGER DEFAULT 0,
     date_scraped       TEXT,
     scrape_error       TEXT
@@ -50,7 +51,6 @@ CREATE TABLE IF NOT EXISTS book_predictions (
     solo_pred_rating       REAL,
     friend_pred_rating     REAL,
     count_adjusted_rating  REAL,
-    pred_rating            REAL,
     final_rating           REAL,
     date_updated           TEXT
 );
@@ -208,6 +208,11 @@ def get_connection(db_path=None):
 def init_db(db_path=None):
     with get_connection(db_path) as db_conn:
         db_conn.executescript(SCHEMA)
+        ###
+        library_columns = {row["name"] for row in db_conn.execute("PRAGMA table_info(libraries)").fetchall()}
+        if "is_similar" not in library_columns:
+            db_conn.execute("ALTER TABLE libraries ADD COLUMN is_similar INTEGER DEFAULT 0")
+        ###
         db_conn.execute("DROP VIEW IF EXISTS best_book_lookup")
         db_conn.execute(
             """
@@ -282,6 +287,17 @@ def upsert_rows(db_conn, table, rows, columns):
         f"INSERT OR REPLACE INTO {table} ({col_names}) VALUES ({placeholders})",
         rows,
     )
+    db_conn.commit()
+
+
+def set_similar_libraries(db_conn, library_ids):
+    db_conn.execute("UPDATE libraries SET is_similar = 0 WHERE is_main != 1")
+    if library_ids:
+        placeholders = ",".join("?" for _ in library_ids)
+        db_conn.execute(
+            f"UPDATE libraries SET is_similar = 1 WHERE legacy_id IN ({placeholders})",
+            [int(x) for x in library_ids],
+        )
     db_conn.commit()
 
 
