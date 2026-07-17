@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import sqlite3
@@ -6,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+
+from .utils import format_string_for_embedding, join_embedding_parts
 
 DB_PATH = Path("data/goodreads.db")
 
@@ -103,8 +106,6 @@ CREATE TABLE IF NOT EXISTS books (
     star_3                   INTEGER DEFAULT 0,
     star_4                   INTEGER DEFAULT 0,
     star_5                   INTEGER DEFAULT 0,
-    currently_reading_count  INTEGER DEFAULT 0,
-    to_read_count            INTEGER DEFAULT 0,
     date_fetched             TEXT DEFAULT (strftime('%Y-%m-%d', 'now'))
 );
 
@@ -223,8 +224,145 @@ def init_db(db_path=None):
         db_conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# Embedding helpers
+# ---------------------------------------------------------------------------
+
+
 def vector_to_blob(vec):
     return vec.astype(np.float32).tobytes()
+
+
+def is_valid_embedding_blob(blob):
+    if blob is None:
+        return False
+    if len(blob) % np.dtype(np.float32).itemsize != 0:
+        return False
+    vector = np.frombuffer(blob, dtype=np.float32)
+    return bool(vector.size and np.any(vector != 0))
+
+
+def save_embeddings(db_conn, legacy_ids, vectors, model, text_hashes):
+    rows = []
+    for i, bid in enumerate(legacy_ids):
+        bid_int = int(bid)
+        h = text_hashes.get(bid_int) if isinstance(text_hashes, dict) else text_hashes[i]
+        rows.append((bid_int, model, vector_to_blob(vectors[i]), h))
+
+    db_conn.executemany(
+        """
+        INSERT OR REPLACE INTO book_embeddings (book_id, embedding_model, vector, text_hash)
+        VALUES (?, ?, ?, ?)
+        """,
+        rows,
+    )
+    db_conn.commit()
+
+
+def build_embedding_inputs(db_conn) -> dict[int, str]:
+    """Return a mapping of book legacy_id → embedding text string."""
+    cursor = db_conn.execute(
+        """
+        SELECT b.legacy_id, b.title, c.name AS author_name, b.description
+        FROM books b
+        LEFT JOIN book_contributors bc ON bc.book_id = b.legacy_id AND bc.is_primary = 1
+        LEFT JOIN contributors c ON c.legacy_id = bc.contributor_id
+        ORDER BY b.legacy_id
+        """
+    )
+    rows = cursor.fetchall()
+
+    cursor_genres = db_conn.execute(
+        """
+        SELECT bg.book_id, g.name
+        FROM book_genres bg
+        JOIN genres g ON bg.genre_id = g.legacy_id
+        """
+    )
+    genres_by_book: dict[int, list[str]] = {}
+    for r in cursor_genres.fetchall():
+        bid = int(r["book_id"])
+        genres_by_book.setdefault(bid, []).append(r["name"])
+
+    inputs: dict[int, str] = {}
+    for row in rows:
+        legacy_id = int(row["legacy_id"])
+        title = row["title"] or ""
+
+        author_name = row["author_name"]
+        authors_post = author_name.strip() if author_name and author_name.strip() else ""
+
+        genres_list = genres_by_book.get(legacy_id, [])
+        genres_post = format_string_for_embedding(genres_list, kind="genre")
+
+        desc_raw = row["description"] or ""
+        desc_clean = re.sub(r"\s+", " ", desc_raw).strip()
+        desc_list = [desc_clean] if desc_clean else []
+        desc_post = format_string_for_embedding(desc_list, kind="description")
+
+        embedding_input = join_embedding_parts(title, authors_post, genres_post, desc_post)
+        inputs[legacy_id] = embedding_input
+
+    return inputs
+
+
+def find_stale_or_missing_embeddings(db_conn, all_inputs: dict[int, str], embedding_model: str) -> list[int]:
+    if not all_inputs:
+        return []
+
+    input_hashes = {legacy_id: hashlib.md5(text.encode("utf-8")).hexdigest() for legacy_id, text in all_inputs.items()}
+
+    cursor = db_conn.execute(
+        """
+        SELECT b.legacy_id,
+               e.vector,
+               e.text_hash
+        FROM books b
+        LEFT JOIN book_embeddings e ON e.book_id = b.legacy_id AND e.embedding_model = ?
+        ORDER BY b.legacy_id
+        """,
+        (embedding_model,),
+    )
+
+    queued = []
+    for row in cursor.fetchall():
+        legacy_id = int(row["legacy_id"])
+        if legacy_id not in all_inputs:
+            continue
+        if row["vector"] is None:
+            queued.append(legacy_id)
+            continue
+        if not is_valid_embedding_blob(row["vector"]):
+            queued.append(legacy_id)
+            continue
+
+        current_hash = input_hashes.get(legacy_id, "")
+        if not current_hash or row["text_hash"] != current_hash:
+            queued.append(legacy_id)
+
+    return queued
+
+
+# ---------------------------------------------------------------------------
+# Generic persistence helpers
+# ---------------------------------------------------------------------------
+
+
+def upsert_rows(db_conn, table, rows, columns):
+    if not rows:
+        return
+    placeholders = ",".join("?" for _ in columns)
+    col_names = ",".join(columns)
+    db_conn.executemany(
+        f"INSERT OR REPLACE INTO {table} ({col_names}) VALUES ({placeholders})",
+        rows,
+    )
+    db_conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameter persistence
+# ---------------------------------------------------------------------------
 
 
 def save_prediction_hyperparams(db_conn, name, params):
@@ -248,110 +386,155 @@ def load_prediction_hyperparams(db_conn, name):
         return None
 
 
-def is_valid_embedding_blob(blob):
-    if blob is None:
-        return False
-    if len(blob) % np.dtype(np.float32).itemsize != 0:
-        return False
-    vector = np.frombuffer(blob, dtype=np.float32)
-    return bool(vector.size and np.any(vector != 0))
+# ---------------------------------------------------------------------------
+# Library / seeder persistence
+# ---------------------------------------------------------------------------
 
 
-def format_string_for_embedding(items, kind=None):
-    if not isinstance(items, list) or len(items) == 0:
-        return ""
-
-    n = len(items)
-    res = items[0] if n == 1 else f"{', '.join(items[:-1])}{',' if n > 2 else ''} and {items[-1]}"
-
-    prefix = f"{kind.capitalize()}{'s' if n > 1 else ''}: " if kind else ""
-    return f"{prefix}{res}"
-
-
-def join_embedding_parts(title, authors, genres, desc):
-    text = f"Book: {title}\n"
-    if authors:
-        text += f"Written by: {authors}\n"
-    if genres:
-        text += f"{genres}\n"
-    if desc:
-        text += f"{desc}"
-    return text
-
-
-def build_embedding_inputs(db_conn):
-    cursor = db_conn.execute(
-        """
-        SELECT b.legacy_id, b.title, c.name AS author_name, b.description
-        FROM books b
-        LEFT JOIN book_contributors bc ON bc.book_id = b.legacy_id AND bc.is_primary = 1
-        LEFT JOIN contributors c ON c.legacy_id = bc.contributor_id
-        ORDER BY b.legacy_id
-        """
+def upsert_libraries(db_conn, main_user: dict, friends: list[dict]):
+    db_conn.execute(
+        "UPDATE libraries SET is_main = 0 WHERE is_main = 1 AND legacy_id != ?",
+        (main_user["library_id"],),
     )
-    rows = cursor.fetchall()
 
-    cursor_genres = db_conn.execute(
+    db_conn.execute(
         """
-        SELECT bg.book_id, g.name
-        FROM book_genres bg
-        JOIN genres g ON bg.genre_id = g.legacy_id
-        """
+        INSERT OR IGNORE INTO libraries (legacy_id, user_id, username, is_main, scrape_complete)
+        VALUES (?, ?, ?, 1, 0)
+        """,
+        (main_user["library_id"], main_user["user_id"], main_user["username"]),
     )
-    genres_by_book = {}
-    for r in cursor_genres.fetchall():
-        bid = int(r["book_id"])
-        genres_by_book.setdefault(bid, []).append(r["name"])
-
-    inputs = {}
-    for row in rows:
-        legacy_id = int(row["legacy_id"])
-        title = row["title"] or ""
-
-        author_name = row["author_name"]
-        authors_post = author_name.strip() if author_name and author_name.strip() else ""
-
-        genres_list = genres_by_book.get(legacy_id, [])
-        genres_post = format_string_for_embedding(genres_list, kind="genre")
-
-        desc_raw = row["description"] or ""
-        desc_clean = re.sub(r"\s+", " ", desc_raw).strip()
-        desc_list = [desc_clean] if desc_clean else []
-        desc_post = format_string_for_embedding(desc_list, kind="description")
-
-        embedding_input = join_embedding_parts(title, authors_post, genres_post, desc_post)
-        inputs[legacy_id] = embedding_input
-
-    return inputs
-
-
-def save_embeddings(db_conn, legacy_ids, vectors, model, text_hashes):
-    rows = []
-    for i, bid in enumerate(legacy_ids):
-        bid_int = int(bid)
-        h = text_hashes.get(bid_int) if isinstance(text_hashes, dict) else text_hashes[i]
-        rows.append((bid_int, model, vector_to_blob(vectors[i]), h))
+    db_conn.execute(
+        """
+        UPDATE libraries
+        SET user_id = ?, username = ?, is_main = 1
+        WHERE legacy_id = ?
+        """,
+        (main_user["user_id"], main_user["username"], main_user["library_id"]),
+    )
 
     db_conn.executemany(
         """
-        INSERT OR REPLACE INTO book_embeddings (book_id, embedding_model, vector, text_hash)
-        VALUES (?, ?, ?, ?)
+        INSERT OR IGNORE INTO libraries (legacy_id, user_id, username, is_main, scrape_complete)
+        VALUES (?, ?, ?, 0, 0)
         """,
-        rows,
+        [(f["library_id"], f["user_id"], f["username"]) for f in friends],
     )
     db_conn.commit()
 
 
-def upsert_rows(db_conn, table, rows, columns):
+def update_friend_info(db_conn, library_id, username, user_id):
+    db_conn.execute(
+        """
+        UPDATE libraries
+        SET username = ?,
+            user_id = ?
+        WHERE legacy_id = ?
+        """,
+        (username, user_id, library_id),
+    )
+    db_conn.commit()
+
+
+def load_existing_library_rows(db_conn, library_id) -> dict:
+    rows = db_conn.execute(
+        """
+        SELECT library_id, book_legacy_id, rating, date_read, date_added
+        FROM library_books
+        WHERE library_id = ?
+        """,
+        (library_id,),
+    ).fetchall()
+    return {
+        (int(row["library_id"]), int(row["book_legacy_id"])): {
+            "library_id": int(row["library_id"]),
+            "book_legacy_id": int(row["book_legacy_id"]),
+            "rating": int(row["rating"] or 0),
+            "date_read": row["date_read"] or "",
+            "date_added": row["date_added"] or "",
+        }
+        for row in rows
+    }
+
+
+def mark_library_complete(db_conn, library_id):
+    today = datetime.now().strftime("%Y-%m-%d")
+    db_conn.execute(
+        """
+        UPDATE libraries
+        SET scrape_complete = 1,
+            date_scraped = ?,
+            scrape_error = NULL
+        WHERE legacy_id = ?
+        """,
+        (today, library_id),
+    )
+    db_conn.commit()
+
+
+def mark_library_failed(db_conn, library_id, error):
+    db_conn.execute(
+        """
+        UPDATE libraries
+        SET scrape_complete = 0,
+            scrape_error = ?
+        WHERE legacy_id = ?
+        """,
+        (str(error)[:1000], library_id),
+    )
+    db_conn.commit()
+
+
+def upsert_library_books(db_conn, rows: list[dict]):
     if not rows:
         return
-    placeholders = ",".join("?" for _ in columns)
-    col_names = ",".join(columns)
-    db_conn.executemany(
-        f"INSERT OR REPLACE INTO {table} ({col_names}) VALUES ({placeholders})",
-        rows,
+    upsert_rows(
+        db_conn,
+        "library_books",
+        [
+            (
+                row["library_id"],
+                row["book_legacy_id"],
+                row["rating"],
+                row["date_read"],
+                row["date_added"],
+            )
+            for row in rows
+        ],
+        ["library_id", "book_legacy_id", "rating", "date_read", "date_added"],
     )
+
+
+def bootstrap_libraries(db_conn, library_ids: list[int]):
+    for lid in library_ids:
+        db_conn.execute(
+            "INSERT OR IGNORE INTO libraries (legacy_id, is_main, scrape_complete) VALUES (?, 0, 0)",
+            (lid,),
+        )
+        db_conn.execute(
+            "UPDATE libraries SET scrape_complete = 0 WHERE legacy_id = ?",
+            (lid,),
+        )
     db_conn.commit()
+
+
+def get_libraries_to_scrape(db_conn, force_seed: bool) -> list[int]:
+    if force_seed:
+        cursor = db_conn.execute("SELECT legacy_id FROM libraries")
+    else:
+        cursor = db_conn.execute(
+            """
+            SELECT legacy_id
+            FROM libraries
+            WHERE scrape_complete != 1
+            """
+        )
+    return [int(row["legacy_id"]) for row in cursor.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Prediction helpers
+# ---------------------------------------------------------------------------
 
 
 def set_similar_libraries(db_conn, library_ids):
@@ -370,3 +553,14 @@ def get_main_library_id(db_conn):
     if row is None:
         raise RuntimeError("No main library found. Run seeding first.")
     return row["legacy_id"]
+
+
+def prune_book_predictions(db_conn, keep_ids: list[int]):
+    """Delete predictions for any book not in keep_ids."""
+    if not keep_ids:
+        return
+    placeholders = ",".join("?" for _ in keep_ids)
+    db_conn.execute(
+        f"DELETE FROM book_predictions WHERE book_id NOT IN ({placeholders})",
+        keep_ids,
+    )

@@ -7,15 +7,18 @@ import re
 import time
 from contextlib import nullcontext
 from datetime import date
+from typing import Any
 
 import httpx
 from tqdm import tqdm
 
-from . import db
-from .utils import USER_AGENT, parse_id_from_slug, parse_slug
+from . import config, db
+from .utils import USER_AGENT, parse_date_str, parse_id_from_slug, parse_slug
 
-API_URL = "https://kxbwmqov6jgg3daaamb744ycu4.appsync-api.us-east-1.amazonaws.com/graphql"
-X_API_KEY = "da2-xpgsdydkbregjhpr6ejzqdhuwy"
+API_URL = config.get_api_url()
+X_API_KEY = config.get_api_key()
+
+## !! Replaced `description: description(stripped: true)` with `description`. Goodreads' stripping logic is bugged and returned dirty data. We will need to develop our own preprocessing logic before embedding
 
 BOOK_QUERY = """
 query getBookByLegacyId($legacyBookId: Int!, $pagination: PaginationInput!) {
@@ -24,7 +27,7 @@ query getBookByLegacyId($legacyBookId: Int!, $pagination: PaginationInput!) {
     legacyId
     title
     titleComplete
-    description: description(stripped: true)
+    description
     webUrl
     primaryContributorEdge {
       node { id legacyId name isGrAuthor webUrl followers { totalCount } works { totalCount } }
@@ -82,25 +85,27 @@ class InvalidLegacyIdError(Exception):
     pass
 
 
-_gql_sem: asyncio.Semaphore | None = None
-_cooldown_until: float = 0.0
-
-
 def make_after_token(page_number: int) -> str:
     raw = json.dumps({"next_page": page_number}, separators=(",", ":"))
     return base64.b64encode(raw.encode()).decode()
 
 
-async def gql(client: httpx.AsyncClient, headers: dict, operation_name: str, query: str, variables: dict) -> dict:
-    global _cooldown_until
-
+async def gql(
+    client: httpx.AsyncClient,
+    headers: dict,
+    operation_name: str,
+    query: str,
+    variables: dict,
+    sem: asyncio.Semaphore | None,
+    cooldown: list[float],
+) -> dict:
     for attempt in range(3):
         now = time.monotonic()
-        if _cooldown_until > now:
-            await asyncio.sleep(_cooldown_until - now)
+        if cooldown[0] > now:
+            await asyncio.sleep(cooldown[0] - now)
 
         try:
-            async with _gql_sem or nullcontext():
+            async with sem or nullcontext():
                 resp = await client.post(
                     API_URL,
                     json={"operationName": operation_name, "variables": variables, "query": query},
@@ -110,7 +115,7 @@ async def gql(client: httpx.AsyncClient, headers: dict, operation_name: str, que
 
             if resp.status_code in {403, 429}:
                 cooldown_delay = 30.0 * (attempt + 1)
-                _cooldown_until = max(_cooldown_until, time.monotonic() + cooldown_delay)
+                cooldown[0] = max(cooldown[0], time.monotonic() + cooldown_delay)
                 tqdm.write(
                     f"Rate limited (status {resp.status_code}) on {operation_name}, attempt {attempt + 1}/3 — backing off {cooldown_delay:.1f}s"
                 )
@@ -136,17 +141,370 @@ async def gql(client: httpx.AsyncClient, headers: dict, operation_name: str, que
 
 
 async def fetch_similar_books(
-    client: httpx.AsyncClient, headers: dict, book_kca_id: str, limit: int = 20
+    client: httpx.AsyncClient,
+    headers: dict,
+    book_kca_id: str | None,
+    sem: asyncio.Semaphore | None,
+    cooldown: list[float],
+    limit: int = 20,
 ) -> list[dict]:
     if not book_kca_id:
         return []
     try:
-        data = await gql(client, headers, "GetSimilarBooks", SIMILAR_QUERY, {"id": book_kca_id, "limit": limit})
+        data = await gql(
+            client, headers, "GetSimilarBooks", SIMILAR_QUERY, {"id": book_kca_id, "limit": limit}, sem, cooldown
+        )
         similar = data.get("getSimilarBooks") or {}
         edges = similar.get("edges") or []
         return [edge["node"] for edge in edges if edge and edge.get("node")]
     except Exception:
         return []
+
+
+async def _fetch_book_node(
+    client: httpx.AsyncClient,
+    headers: dict,
+    legacy_id: int,
+    sem: asyncio.Semaphore | None,
+    cooldown: list[float],
+    pagination_token: str | None = None,
+) -> dict | None:
+    pagination_variables: dict[str, int | str] = {"limit": 20}
+    if pagination_token:
+        pagination_variables["after"] = pagination_token
+
+    full_data = await gql(
+        client,
+        headers,
+        "getBookByLegacyId",
+        BOOK_QUERY,
+        {"legacyBookId": legacy_id, "pagination": pagination_variables},
+        sem,
+        cooldown,
+    )
+    return full_data.get("getBookByLegacyId")
+
+
+async def _resolve_canonical_edition(
+    client: httpx.AsyncClient,
+    headers: dict,
+    db_conn,
+    legacy_id: int,
+    best_book_legacy_id: int,
+    allowed_sources: list,
+    sem: asyncio.Semaphore | None,
+    cooldown: list[float],
+    current_page_editions: list[dict],
+    book_node: dict,
+    now: str,
+) -> bool:
+    db_conn.execute(
+        """
+        INSERT INTO crawl_queue (book_legacy_id, status, error_count, date_processed)
+        VALUES (?, 'mapped_to_canonical', 0, ?)
+        ON CONFLICT(book_legacy_id) DO UPDATE SET
+            status = 'mapped_to_canonical',
+            error_count = 0,
+            date_processed = excluded.date_processed
+        """,
+        (legacy_id, now),
+    )
+    db_conn.commit()
+
+    canonical_row = db_conn.execute("SELECT 1 FROM books WHERE legacy_id = ?", (best_book_legacy_id,)).fetchone()
+    if canonical_row:
+        db_conn.execute(
+            "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id) VALUES (?, ?, ?)",
+            (best_book_legacy_id, legacy_id, book_node.get("id")),
+        )
+
+        for edition in current_page_editions:
+            db_conn.execute(
+                """
+                INSERT OR REPLACE INTO book_editions (
+                    book_id, edition_legacy_id, edition_kca_id
+                ) VALUES (?, ?, ?)
+                """,
+                (best_book_legacy_id, edition.get("legacyId"), edition.get("id")),
+            )
+
+        db_conn.execute(
+            """
+            UPDATE crawl_queue
+            SET status = 'skipped_known_edition', date_processed = ?
+            WHERE book_legacy_id IN (SELECT edition_legacy_id FROM book_editions WHERE book_id = ?)
+              AND status = 'pending'
+            """,
+            (now, best_book_legacy_id),
+        )
+
+        db_conn.commit()
+        return True
+
+    result = await resolve_and_save_book(
+        client,
+        headers,
+        db_conn,
+        best_book_legacy_id,
+        allowed_sources,
+        sem,
+        cooldown,
+        previous_editions=current_page_editions,
+        pagination_token=make_after_token(2),
+    )
+    if result:
+        db_conn.execute(
+            "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id) VALUES (?, ?, ?)",
+            (best_book_legacy_id, legacy_id, book_node.get("id")),
+        )
+        db_conn.commit()
+    return result
+
+
+def _save_book_core(db_conn: Any, book_node: dict, work_node: dict, book_kca_id: str | None, now: str) -> None:
+    work_stats = work_node.get("stats") or {}
+    work_details = work_node.get("details") or {}
+    dist = work_stats.get("ratingsCountDist") or []
+    stars = [dist[i] if len(dist) > i else 0 for i in range(5)]
+
+    details = book_node.get("details") or {}
+    lang = details.get("language") or {}
+    language_name = lang.get("name")
+
+    db_conn.execute(
+        """
+        INSERT OR REPLACE INTO books (
+            legacy_id, kca_id, title, title_complete, description, web_url,
+            asin, isbn, isbn13, format, num_pages, language_name, publisher, publication_time,
+            original_publication_time, star_1, star_2, star_3, star_4, star_5,
+            date_fetched
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            book_node.get("legacyId"),
+            book_kca_id,
+            book_node.get("title"),
+            book_node.get("titleComplete"),
+            book_node.get("description"),
+            book_node.get("webUrl"),
+            details.get("asin"),
+            details.get("isbn"),
+            details.get("isbn13"),
+            details.get("format"),
+            details.get("numPages"),
+            language_name,
+            details.get("publisher"),
+            details.get("publicationTime"),
+            work_details.get("publicationTime"),
+            stars[0],
+            stars[1],
+            stars[2],
+            stars[3],
+            stars[4],
+            now,
+        ),
+    )
+
+
+def _save_contributor_node(db_conn: Any, book_legacy_id: int | None, edge: dict, is_primary: int) -> None:
+    if book_legacy_id is None or not edge or not edge.get("node"):
+        return
+    node = edge["node"]
+    followers = node.get("followers") or {}
+    works = node.get("works") or {}
+    db_conn.execute(
+        """
+        INSERT OR REPLACE INTO contributors (
+            legacy_id, kca_id, name, web_url, is_gr_author, works_count, followers_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            node.get("legacyId"),
+            node.get("id"),
+            node.get("name"),
+            node.get("webUrl"),
+            1 if node.get("isGrAuthor") else 0,
+            works.get("totalCount") or 0,
+            followers.get("totalCount") or 0,
+        ),
+    )
+    db_conn.execute(
+        """
+        INSERT OR REPLACE INTO book_contributors (book_id, contributor_id, role, is_primary)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            book_legacy_id,
+            node.get("legacyId"),
+            edge.get("role"),
+            is_primary,
+        ),
+    )
+
+
+def _save_contributors(db_conn: Any, book_node: dict) -> None:
+    book_legacy_id = book_node.get("legacyId")
+    primary_edge = book_node.get("primaryContributorEdge")
+    if primary_edge:
+        _save_contributor_node(db_conn, book_legacy_id, primary_edge, is_primary=1)
+
+    secondary_edges = book_node.get("secondaryContributorEdges") or []
+    for s_edge in secondary_edges:
+        _save_contributor_node(db_conn, book_legacy_id, s_edge, is_primary=0)
+
+
+def _save_series(db_conn: Any, book_node: dict) -> None:
+    book_series_list = book_node.get("bookSeries") or []
+    for bs in book_series_list:
+        series_node = bs.get("series")
+        if series_node:
+            series_title = series_node.get("title")
+            series_web_url = series_node.get("webUrl")
+            if series_web_url:
+                try:
+                    series_legacy_id = parse_id_from_slug(series_web_url)
+                    db_conn.execute(
+                        """
+                        INSERT OR IGNORE INTO series (legacy_id, kca_id, title, web_url)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (series_legacy_id, series_node.get("id"), series_title, series_web_url),
+                    )
+
+                    pos = bs.get("userPosition")
+                    pos_int = None
+                    if pos is not None:
+                        with contextlib.suppress(ValueError, TypeError):
+                            pos_int = int(float(pos))
+
+                    db_conn.execute(
+                        """
+                        INSERT OR REPLACE INTO book_series (book_id, series_id, position)
+                        VALUES (?, ?, ?)
+                        """,
+                        (book_node.get("legacyId"), series_legacy_id, pos_int),
+                    )
+                except Exception as e:
+                    tqdm.write(f"Failed parsing series {series_web_url}: {e}")
+
+
+def _save_genres(db_conn: Any, book_node: dict) -> None:
+    book_genres = book_node.get("bookGenres") or []
+    for bg in book_genres:
+        genre_node = bg.get("genre")
+        if genre_node:
+            genre_name = genre_node.get("name")
+            genre_web_url = genre_node.get("webUrl")
+            if genre_web_url:
+                try:
+                    genre_legacy_id = parse_slug(genre_web_url)
+                    db_conn.execute(
+                        """
+                        INSERT OR IGNORE INTO genres (legacy_id, kca_id, name, web_url)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (genre_legacy_id, genre_node.get("id"), genre_name, genre_web_url),
+                    )
+                    db_conn.execute(
+                        """
+                        INSERT OR REPLACE INTO book_genres (book_id, genre_id)
+                        VALUES (?, ?)
+                        """,
+                        (book_node.get("legacyId"), genre_legacy_id),
+                    )
+                except Exception as e:
+                    tqdm.write(f"Failed parsing genre {genre_web_url}: {e}")
+
+
+def _save_awards(db_conn: Any, book_node: dict, work_details: dict) -> None:
+    awards = work_details.get("awardsWon") or []
+    for award in awards:
+        award_web_url = award.get("webUrl")
+        if award_web_url:
+            try:
+                award_legacy_id = parse_id_from_slug(award_web_url)
+                db_conn.execute(
+                    """
+                    INSERT OR IGNORE INTO awards (legacy_id, name, web_url)
+                    VALUES (?, ?, ?)
+                    """,
+                    (award_legacy_id, award.get("name"), award_web_url),
+                )
+
+                awarded_at = award.get("awardedAt")
+                date_awarded = None
+                if awarded_at:
+                    parsed = parse_date_str(str(awarded_at))
+                    if parsed:
+                        date_awarded = parsed
+                    elif re.match(r"^\d{4}$", str(awarded_at)):
+                        date_awarded = f"{awarded_at}-01-01"
+                    else:
+                        date_awarded = str(awarded_at)
+
+                db_conn.execute(
+                    """
+                    INSERT OR REPLACE INTO book_awards (book_id, award_id, category, designation, date_awarded)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        book_node.get("legacyId"),
+                        award_legacy_id,
+                        award.get("category"),
+                        award.get("designation"),
+                        date_awarded,
+                    ),
+                )
+            except Exception as e:
+                tqdm.write(f"Failed parsing award {award_web_url}: {e}")
+
+
+def _save_editions(db_conn: Any, book_node: dict, all_editions: list[dict]) -> None:
+    for edition in all_editions:
+        db_conn.execute(
+            """
+            INSERT OR REPLACE INTO book_editions (
+                book_id, edition_legacy_id, edition_kca_id
+            ) VALUES (?, ?, ?)
+            """,
+            (book_node.get("legacyId"), edition.get("legacyId"), edition.get("id")),
+        )
+
+
+def _save_similar_books_and_enqueue(db_conn: Any, book_node: dict, similar_list: list[dict], now: str) -> None:
+    for sim in similar_list:
+        sim_work = sim.get("work") or {}
+        sim_stats = sim_work.get("stats") or {}
+        db_conn.execute(
+            """
+            INSERT OR REPLACE INTO similar_books (
+                book_id, similar_legacy_id, average_rating, ratings_count, date_fetched
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                book_node.get("legacyId"),
+                sim.get("legacyId"),
+                sim_stats.get("averageRating"),
+                sim_stats.get("ratingsCount"),
+                now,
+            ),
+        )
+
+        sim_legacy_id = sim.get("legacyId")
+        avg_rating = sim_stats.get("averageRating")
+        ratings_count = sim_stats.get("ratingsCount")
+        if sim_legacy_id and avg_rating is not None and ratings_count is not None:
+            priority = avg_rating - avg_rating / math.log10(ratings_count + 10)
+            db_conn.execute(
+                """
+                INSERT INTO crawl_queue (book_legacy_id, priority, status, discovered_via)
+                VALUES (?, ?, 'pending', 'similar')
+                ON CONFLICT(book_legacy_id) DO UPDATE SET
+                    priority = MAX(priority, excluded.priority)
+                WHERE status = 'pending'
+                """,
+                (sim_legacy_id, priority),
+            )
 
 
 async def resolve_and_save_book(
@@ -155,25 +513,22 @@ async def resolve_and_save_book(
     db_conn,
     legacy_id: int,
     allowed_sources: list,
+    sem: asyncio.Semaphore | None,
+    cooldown: list[float],
     previous_editions: list[dict] | None = None,
     pagination_token: str | None = None,
 ) -> bool:
     now = date.today().strftime("%Y-%m-%d")
 
     try:
-        pagination_variables: dict[str, int | str] = {"limit": 20}
-        if pagination_token:
-            pagination_variables["after"] = pagination_token
-
-        full_data = await gql(
+        book_node = await _fetch_book_node(
             client,
             headers,
-            "getBookByLegacyId",
-            BOOK_QUERY,
-            {"legacyBookId": legacy_id, "pagination": pagination_variables},
+            legacy_id,
+            sem,
+            cooldown,
+            pagination_token=pagination_token,
         )
-
-        book_node = full_data.get("getBookByLegacyId")
         if not book_node:
             db_conn.execute(
                 """
@@ -211,359 +566,40 @@ async def resolve_and_save_book(
             return False
 
         editions_conn = work_node.get("editions") or {}
-        total_editions = editions_conn.get("totalCount") or 0
         page1_edges = editions_conn.get("edges") or []
         current_page_editions = [edge["node"] for edge in page1_edges if edge and edge.get("node")]
 
         if legacy_id != best_book_legacy_id:
-            db_conn.execute(
-                """
-                INSERT INTO crawl_queue (book_legacy_id, status, error_count, date_processed)
-                VALUES (?, 'mapped_to_canonical', 0, ?)
-                ON CONFLICT(book_legacy_id) DO UPDATE SET
-                    status = 'mapped_to_canonical',
-                    error_count = 0,
-                    date_processed = excluded.date_processed
-                """,
-                (legacy_id, now),
-            )
-            db_conn.commit()
-
-            canonical_row = db_conn.execute(
-                "SELECT 1 FROM books WHERE legacy_id = ?", (best_book_legacy_id,)
-            ).fetchone()
-            if canonical_row:
-                db_conn.execute(
-                    "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id) VALUES (?, ?, ?)",
-                    (best_book_legacy_id, legacy_id, book_node.get("id")),
-                )
-
-                for edition in current_page_editions:
-                    db_conn.execute(
-                        """
-                        INSERT OR REPLACE INTO book_editions (
-                            book_id, edition_legacy_id, edition_kca_id
-                        ) VALUES (?, ?, ?)
-                        """,
-                        (best_book_legacy_id, edition.get("legacyId"), edition.get("id")),
-                    )
-
-                db_conn.execute(
-                    """
-                    UPDATE crawl_queue
-                    SET status = 'skipped_known_edition', date_processed = ?
-                    WHERE book_legacy_id IN (SELECT edition_legacy_id FROM book_editions WHERE book_id = ?)
-                      AND status = 'pending'
-                    """,
-                    (now, best_book_legacy_id),
-                )
-
-                db_conn.commit()
-                return True
-
-            result = await resolve_and_save_book(
+            return await _resolve_canonical_edition(
                 client,
                 headers,
                 db_conn,
+                legacy_id,
                 best_book_legacy_id,
                 allowed_sources,
-                previous_editions=current_page_editions,
-                pagination_token=make_after_token(2),
+                sem,
+                cooldown,
+                current_page_editions,
+                book_node,
+                now,
             )
-            if result:
-                db_conn.execute(
-                    "INSERT OR IGNORE INTO book_editions (book_id, edition_legacy_id, edition_kca_id) VALUES (?, ?, ?)",
-                    (best_book_legacy_id, legacy_id, book_node.get("id")),
-                )
-                db_conn.commit()
-            return result
 
         book_kca_id = book_node.get("id")
         all_editions = current_page_editions + (previous_editions or [])
 
         try:
-            similar_list = await fetch_similar_books(client, headers, book_kca_id)
+            similar_list = await fetch_similar_books(client, headers, book_kca_id, sem, cooldown)
         except Exception:
             similar_list = []
 
-        pending_before = (
-            db_conn.execute(
-                """
-            SELECT COUNT(*)
-            FROM crawl_queue
-            WHERE status='pending'
-            AND book_legacy_id IN ({})
-            """.format(",".join("?" * len(all_editions))),
-                [e["legacyId"] for e in all_editions],
-            ).fetchone()[0]
-            if all_editions
-            else 0
-        )
-
-        tqdm.write(
-            f"{book_node.get('title')[:50]!r} "
-            f"legacy_id={book_node.get('legacyId')} "
-            f"total={total_editions} "
-            f"all_editions={len(all_editions)} "
-            f"pending_skipped={pending_before}"
-        )
-
         with db_conn:
-            work_stats = work_node.get("stats") or {}
-            work_details = work_node.get("details") or {}
-            dist = work_stats.get("ratingsCountDist") or []
-            stars = [dist[i] if len(dist) > i else 0 for i in range(5)]
-
-            details = book_node.get("details") or {}
-            lang = details.get("language") or {}
-            language_name = lang.get("name")
-
-            db_conn.execute(
-                """
-                INSERT OR REPLACE INTO books (
-                    legacy_id, kca_id, title, title_complete, description, web_url,
-                    asin, isbn, isbn13, format, num_pages, language_name, publisher, publication_time,
-                    original_publication_time, star_1, star_2, star_3, star_4, star_5,
-                    date_fetched
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    book_node.get("legacyId"),
-                    book_kca_id,
-                    book_node.get("title"),
-                    book_node.get("titleComplete"),
-                    book_node.get("description"),
-                    book_node.get("webUrl"),
-                    details.get("asin"),
-                    details.get("isbn"),
-                    details.get("isbn13"),
-                    details.get("format"),
-                    details.get("numPages"),
-                    language_name,
-                    details.get("publisher"),
-                    details.get("publicationTime"),
-                    work_details.get("publicationTime"),
-                    stars[0],
-                    stars[1],
-                    stars[2],
-                    stars[3],
-                    stars[4],
-                    now,
-                ),
-            )
-
-            primary_edge = book_node.get("primaryContributorEdge")
-            if primary_edge and primary_edge.get("node"):
-                primary_node = primary_edge["node"]
-                followers = primary_node.get("followers") or {}
-                works = primary_node.get("works") or {}
-                db_conn.execute(
-                    """
-                    INSERT OR REPLACE INTO contributors (
-                        legacy_id, kca_id, name, web_url, is_gr_author, works_count, followers_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        primary_node.get("legacyId"),
-                        primary_node.get("id"),
-                        primary_node.get("name"),
-                        primary_node.get("webUrl"),
-                        1 if primary_node.get("isGrAuthor") else 0,
-                        works.get("totalCount") or 0,
-                        followers.get("totalCount") or 0,
-                    ),
-                )
-                db_conn.execute(
-                    """
-                    INSERT OR REPLACE INTO book_contributors (book_id, contributor_id, role, is_primary)
-                    VALUES (?, ?, ?, 1)
-                    """,
-                    (
-                        book_node.get("legacyId"),
-                        primary_node.get("legacyId"),
-                        primary_edge.get("role"),
-                    ),
-                )
-
-            secondary_edges = book_node.get("secondaryContributorEdges") or []
-            for s_edge in secondary_edges:
-                if s_edge and s_edge.get("node"):
-                    s_node = s_edge["node"]
-                    followers = s_node.get("followers") or {}
-                    works = s_node.get("works") or {}
-                    db_conn.execute(
-                        """
-                        INSERT OR REPLACE INTO contributors (
-                            legacy_id, kca_id, name, web_url, is_gr_author, works_count, followers_count
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            s_node.get("legacyId"),
-                            s_node.get("id"),
-                            s_node.get("name"),
-                            s_node.get("webUrl"),
-                            1 if s_node.get("isGrAuthor") else 0,
-                            works.get("totalCount") or 0,
-                            followers.get("totalCount") or 0,
-                        ),
-                    )
-                    db_conn.execute(
-                        """
-                        INSERT OR REPLACE INTO book_contributors (book_id, contributor_id, role, is_primary)
-                        VALUES (?, ?, ?, 0)
-                        """,
-                        (
-                            book_node.get("legacyId"),
-                            s_node.get("legacyId"),
-                            s_edge.get("role"),
-                        ),
-                    )
-
-            book_series_list = book_node.get("bookSeries") or []
-            for bs in book_series_list:
-                series_node = bs.get("series")
-                if series_node:
-                    series_title = series_node.get("title")
-                    series_web_url = series_node.get("webUrl")
-                    if series_web_url:
-                        try:
-                            series_legacy_id = parse_id_from_slug(series_web_url)
-                            db_conn.execute(
-                                """
-                                INSERT OR IGNORE INTO series (legacy_id, kca_id, title, web_url)
-                                VALUES (?, ?, ?, ?)
-                                """,
-                                (series_legacy_id, series_node.get("id"), series_title, series_web_url),
-                            )
-
-                            pos = bs.get("userPosition")
-                            pos_int = None
-                            if pos is not None:
-                                with contextlib.suppress(ValueError, TypeError):
-                                    pos_int = int(float(pos))
-
-                            db_conn.execute(
-                                """
-                                INSERT OR REPLACE INTO book_series (book_id, series_id, position)
-                                VALUES (?, ?, ?)
-                                """,
-                                (book_node.get("legacyId"), series_legacy_id, pos_int),
-                            )
-                        except Exception as e:
-                            tqdm.write(f"Failed parsing series {series_web_url}: {e}")
-
-            book_genres = book_node.get("bookGenres") or []
-            for bg in book_genres:
-                genre_node = bg.get("genre")
-                if genre_node:
-                    genre_name = genre_node.get("name")
-                    genre_web_url = genre_node.get("webUrl")
-                    if genre_web_url:
-                        try:
-                            genre_legacy_id = parse_slug(genre_web_url)
-                            db_conn.execute(
-                                """
-                                INSERT OR IGNORE INTO genres (legacy_id, kca_id, name, web_url)
-                                VALUES (?, ?, ?, ?)
-                                """,
-                                (genre_legacy_id, genre_node.get("id"), genre_name, genre_web_url),
-                            )
-                            db_conn.execute(
-                                """
-                                INSERT OR REPLACE INTO book_genres (book_id, genre_id)
-                                VALUES (?, ?)
-                                """,
-                                (book_node.get("legacyId"), genre_legacy_id),
-                            )
-                        except Exception as e:
-                            tqdm.write(f"Failed parsing genre {genre_web_url}: {e}")
-
-            awards = work_details.get("awardsWon") or []
-            for award in awards:
-                award_web_url = award.get("webUrl")
-                if award_web_url:
-                    try:
-                        award_legacy_id = parse_id_from_slug(award_web_url)
-                        db_conn.execute(
-                            """
-                            INSERT OR IGNORE INTO awards (legacy_id, name, web_url)
-                            VALUES (?, ?, ?)
-                            """,
-                            (award_legacy_id, award.get("name"), award_web_url),
-                        )
-
-                        awarded_at = award.get("awardedAt")
-                        date_awarded = None
-                        if awarded_at:
-                            try:
-                                from dateutil import parser as date_parser
-
-                                date_awarded = date_parser.parse(str(awarded_at)).strftime("%Y-%m-%d")
-                            except Exception:
-                                if re.match(r"^\d{4}$", str(awarded_at)):
-                                    date_awarded = f"{awarded_at}-01-01"
-                                else:
-                                    date_awarded = str(awarded_at)
-
-                        db_conn.execute(
-                            """
-                            INSERT OR REPLACE INTO book_awards (book_id, award_id, category, designation, date_awarded)
-                            VALUES (?, ?, ?, ?, ?)
-                            """,
-                            (
-                                book_node.get("legacyId"),
-                                award_legacy_id,
-                                award.get("category"),
-                                award.get("designation"),
-                                date_awarded,
-                            ),
-                        )
-                    except Exception as e:
-                        tqdm.write(f"Failed parsing award {award_web_url}: {e}")
-
-            for edition in all_editions:
-                db_conn.execute(
-                    """
-                    INSERT OR REPLACE INTO book_editions (
-                        book_id, edition_legacy_id, edition_kca_id
-                    ) VALUES (?, ?, ?)
-                    """,
-                    (book_node.get("legacyId"), edition.get("legacyId"), edition.get("id")),
-                )
-
-            for sim in similar_list:
-                sim_work = sim.get("work") or {}
-                sim_stats = sim_work.get("stats") or {}
-                db_conn.execute(
-                    """
-                    INSERT OR REPLACE INTO similar_books (
-                        book_id, similar_legacy_id, average_rating, ratings_count, date_fetched
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        book_node.get("legacyId"),
-                        sim.get("legacyId"),
-                        sim_stats.get("averageRating"),
-                        sim_stats.get("ratingsCount"),
-                        now,
-                    ),
-                )
-
-                sim_legacy_id = sim.get("legacyId")
-                avg_rating = sim_stats.get("averageRating")
-                ratings_count = sim_stats.get("ratingsCount")
-                if sim_legacy_id and avg_rating is not None and ratings_count is not None:
-                    priority = avg_rating - avg_rating / math.log10(ratings_count + 10)
-                    db_conn.execute(
-                        """
-                        INSERT INTO crawl_queue (book_legacy_id, priority, status, discovered_via)
-                        VALUES (?, ?, 'pending', 'similar')
-                        ON CONFLICT(book_legacy_id) DO UPDATE SET
-                            priority = MAX(priority, excluded.priority)
-                        WHERE status = 'pending'
-                        """,
-                        (sim_legacy_id, priority),
-                    )
+            _save_book_core(db_conn, book_node, work_node, book_kca_id, now)
+            _save_contributors(db_conn, book_node)
+            _save_series(db_conn, book_node)
+            _save_genres(db_conn, book_node)
+            _save_awards(db_conn, book_node, work_node.get("details") or {})
+            _save_editions(db_conn, book_node, all_editions)
+            _save_similar_books_and_enqueue(db_conn, book_node, similar_list, now)
 
             db_conn.execute(
                 """
@@ -643,18 +679,28 @@ def handle_force_crawl(db_conn):
         """
         UPDATE crawl_queue
         SET status = 'pending'
-        WHERE book_legacy_id IN (
-            SELECT legacy_id FROM books WHERE date_fetched < date('now', '-30 days')
-        )
-        AND status = 'done'
+        WHERE status = 'done'
+        AND EXISTS (
+            SELECT 1
+            FROM books
+            WHERE books.legacy_id = crawl_queue.book_legacy_id
+                AND books.date_fetched < date('now', '-1 days')
+        );
         """
     )
+    # db_conn.execute(
+    #     """
+    #     UPDATE crawl_queue
+    #     SET status = 'pending'
+    #     WHERE status != 'pending'
+    #     """
+    # )
     db_conn.commit()
 
 
 async def run_crawler(limit=None, force_crawl=False, db_path=None):
-    global _gql_sem
-    _gql_sem = asyncio.Semaphore(3)
+    sem = asyncio.Semaphore(3)
+    cooldown: list[float] = [0.0]
 
     db.init_db(db_path)
 
@@ -735,7 +781,7 @@ async def run_crawler(limit=None, force_crawl=False, db_path=None):
 
                 legacy_id = row["book_legacy_id"]
 
-                await resolve_and_save_book(client, headers, db_conn, legacy_id, allowed_sources)
+                await resolve_and_save_book(client, headers, db_conn, legacy_id, allowed_sources, sem, cooldown)
 
                 completed_now = db_conn.execute(
                     f"""

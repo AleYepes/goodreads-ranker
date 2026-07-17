@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import subprocess
 import time
 
@@ -6,6 +7,10 @@ import numpy as np
 from tqdm import tqdm
 
 from . import config, db
+
+# ---------------------------------------------------------------------------
+# Ollama lifecycle
+# ---------------------------------------------------------------------------
 
 
 @contextlib.contextmanager
@@ -57,46 +62,12 @@ def _ensure_ollama(embedding_model: str):
             proc.wait(timeout=10)
 
 
-def find_books_needing_embeddings(db_conn, all_inputs, embedding_model):
-    if not all_inputs:
-        return []
-
-    import hashlib
-
-    input_hashes = {legacy_id: hashlib.md5(text.encode("utf-8")).hexdigest() for legacy_id, text in all_inputs.items()}
-
-    cursor = db_conn.execute(
-        """
-        SELECT b.legacy_id,
-               e.vector,
-               e.text_hash
-        FROM books b
-        LEFT JOIN book_embeddings e ON e.book_id = b.legacy_id AND e.embedding_model = ?
-        ORDER BY b.legacy_id
-        """,
-        (embedding_model,),
-    )
-
-    queued = []
-    for row in cursor.fetchall():
-        legacy_id = int(row["legacy_id"])
-        if legacy_id not in all_inputs:
-            continue
-        if row["vector"] is None:
-            queued.append(legacy_id)
-            continue
-        if not db.is_valid_embedding_blob(row["vector"]):
-            queued.append(legacy_id)
-            continue
-
-        current_hash = input_hashes.get(legacy_id, "")
-        if not current_hash or row["text_hash"] != current_hash:
-            queued.append(legacy_id)
-
-    return queued
+# ---------------------------------------------------------------------------
+# Embedding generation
+# ---------------------------------------------------------------------------
 
 
-def generate_embeddings(batch_size=128, embedding_model=None, db_path=None):
+def generate_embeddings(batch_size=64, embedding_model=None, db_path=None):
     db.init_db(db_path)
 
     if not embedding_model:
@@ -108,18 +79,17 @@ def generate_embeddings(batch_size=128, embedding_model=None, db_path=None):
             print("No books found. Run crawler first.")
             return
 
-        missing_ids = find_books_needing_embeddings(db_conn, all_inputs, embedding_model)
+        missing_ids = db.find_stale_or_missing_embeddings(db_conn, all_inputs, embedding_model)
 
         if not missing_ids:
             print(f"Nothing to embed: all books have valid embeddings for model '{embedding_model}'.")
             return
 
-        import hashlib
-
         import ollama
 
         with _ensure_ollama(embedding_model):
-            for i in tqdm(range(0, len(missing_ids), batch_size)):
+            unit = "book" if batch_size == 1 else f"batch ({batch_size} books)"
+            for i in tqdm(range(0, len(missing_ids), batch_size), unit=unit, desc=embedding_model):
                 batch_ids = missing_ids[i : i + batch_size]
                 batch_strings = [all_inputs[bid] for bid in batch_ids]
 

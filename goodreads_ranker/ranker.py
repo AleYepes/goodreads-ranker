@@ -63,29 +63,25 @@ def get_or_create_prediction_hyperparams(db_conn, name, defaults):
         params = dict(defaults)
         db.save_prediction_hyperparams(db_conn, name, params)
         return params
-    params = normalize_model_params(params)
-    db.save_prediction_hyperparams(db_conn, name, params)
-    return params
+    return normalize_model_params(params)
 
 
 def load_valid_embeddings_for_books(db_conn, books_df, embedding_model=None):
-    import hashlib
-
     if not embedding_model:
         embedding_model = config.get_embedding_model()
 
     all_inputs = db.build_embedding_inputs(db_conn)
-    input_hashes = {legacy_id: hashlib.md5(text.encode("utf-8")).hexdigest() for legacy_id, text in all_inputs.items()}
+    stale_or_missing = set(db.find_stale_or_missing_embeddings(db_conn, all_inputs, embedding_model))
 
     rows = db_conn.execute(
         """
-        SELECT book_id AS legacy_id, vector, text_hash
+        SELECT book_id AS legacy_id, vector
         FROM book_embeddings
         WHERE embedding_model = ?
         """,
         (embedding_model,),
     ).fetchall()
-    embedding_rows = {int(row["legacy_id"]): row for row in rows}
+    vectors_by_id = {int(row["legacy_id"]): row["vector"] for row in rows}
 
     counts = {
         "missing": 0,
@@ -99,21 +95,20 @@ def load_valid_embeddings_for_books(db_conn, books_df, embedding_model=None):
 
     for legacy_id in books_df["legacy_id"]:
         bid = int(legacy_id)
-        row = embedding_rows.get(bid)
-        if not row or row["vector"] is None:
+        if bid in stale_or_missing:
+            valid_mask.append(False)
+            vector_blob = vectors_by_id.get(bid)
+            if vector_blob is None:
+                counts["missing"] += 1
+            elif not db.is_valid_embedding_blob(vector_blob):
+                counts["invalid"] += 1
+            else:
+                counts["unverified"] += 1
+            continue
+
+        vector_blob = vectors_by_id.get(bid)
+        if vector_blob is None:
             counts["missing"] += 1
-            valid_mask.append(False)
-            continue
-
-        vector_blob = row["vector"]
-        if not db.is_valid_embedding_blob(vector_blob):
-            counts["invalid"] += 1
-            valid_mask.append(False)
-            continue
-
-        current_hash = input_hashes.get(bid, "")
-        if not current_hash or row["text_hash"] != current_hash:
-            counts["unverified"] += 1
             valid_mask.append(False)
             continue
 
@@ -334,12 +329,9 @@ def get_similar_friend_ratings(
 
     current_book_ids = books_df["legacy_id"].to_numpy()
     current_book_id_set = set(current_book_ids.tolist())
-    friends_df = cast(pd.DataFrame, friends[friends["legacy_id"].isin(list(current_book_id_set))])
-    friends = cast(pd.DataFrame, friends_df.dropna(subset=["rating"]).copy())
-    friends = cast(
-        pd.DataFrame,
-        friends.groupby(["library_id", "legacy_id"], as_index=False)["rating"].mean(),
-    )
+    friends_df = friends[friends["legacy_id"].isin(list(current_book_id_set))]
+    friends = cast(Any, friends_df).dropna(subset=["rating"]).copy()
+    grouped_friends = cast(Any, friends).groupby(["library_id", "legacy_id"], as_index=False)["rating"].mean()
 
     my_books = books_df[["legacy_id", "my_refined"]].dropna().copy()
     my_legacy_id_set = set(my_books["legacy_id"].tolist())
@@ -360,8 +352,8 @@ def get_similar_friend_ratings(
     friend_scores = []
     calibrated_friend_rows = []
 
-    friend_groups = list(cast(Any, friends.groupby("library_id", sort=False)))
-    friend_group_count = len(cast(Any, friends["library_id"].dropna().unique()))
+    friend_groups = list(cast(Any, grouped_friends.groupby("library_id", sort=False)))
+    friend_group_count = len(cast(Any, grouped_friends["library_id"].dropna().unique()))
 
     for library_id, friend_df in tqdm(
         friend_groups,
@@ -425,9 +417,9 @@ def get_similar_friend_ratings(
             my_union.append(predicted_me)
             friend_union.append(real_friend)
 
-        my_union = np.concatenate(my_union)
-        friend_union = np.concatenate(friend_union)
-        synthetic_corr = safe_spearman(my_union, friend_union)
+        my_union_arr = np.concatenate(my_union)
+        friend_union_arr = np.concatenate(friend_union)
+        synthetic_corr = safe_spearman(my_union_arr, friend_union_arr)
 
         if not np.isnan(raw_corr) and not np.isnan(synthetic_corr):
             score = 0.5 * raw_corr + 0.5 * synthetic_corr
@@ -443,7 +435,7 @@ def get_similar_friend_ratings(
             {
                 "library_id": library_id,
                 "overlap_count": overlap_count,
-                "union_count": len(my_union),
+                "union_count": len(my_union_arr),
                 "friend_books": len(friend_df),
                 "slope": slope,
                 "intercept": intercept,
@@ -456,20 +448,19 @@ def get_similar_friend_ratings(
     if not friend_scores:
         return pd.Series(dtype=float), [], pd.DataFrame()
 
-    friend_scores = pd.DataFrame(friend_scores).sort_values("score", ascending=False).reset_index(drop=True)
-    if friend_scores.empty:
-        return pd.Series(dtype=float), [], friend_scores
+    friend_scores_df = pd.DataFrame(friend_scores).sort_values("score", ascending=False).reset_index(drop=True)
+    if friend_scores_df.empty:
+        return pd.Series(dtype=float), [], friend_scores_df
 
-    selected = friend_scores[friend_scores["score"] >= min_correlation].copy()
-    minimum_selected = min(min_similar_friends, len(friend_scores))
+    selected = friend_scores_df[friend_scores_df["score"] >= min_correlation].copy()
+    minimum_selected = min(min_similar_friends, len(friend_scores_df))
     if len(selected) < minimum_selected:
-        selected = friend_scores.head(minimum_selected).copy()
+        selected = friend_scores_df.head(minimum_selected).copy()
 
     similar_friends = selected["library_id"].tolist()
-    similar_friend_ratings = cast(pd.DataFrame, pd.concat(calibrated_friend_rows, ignore_index=True))
-    selected_sub = cast(pd.DataFrame, selected[["library_id", "score"]])
+    similar_friend_ratings = pd.concat(calibrated_friend_rows, ignore_index=True)
     similar_friend_ratings = similar_friend_ratings.merge(
-        selected_sub.rename(columns={"score": "friend_weight"}),
+        cast(pd.DataFrame, selected[["library_id", "score"]]).rename(columns={"score": "friend_weight"}),
         on="library_id",
         how="inner",
     )
@@ -477,7 +468,7 @@ def get_similar_friend_ratings(
         ~similar_friend_ratings["legacy_id"].isin(list(my_legacy_id_set))
     ].copy()
     if similar_friend_ratings.empty:
-        return pd.Series(dtype=float), similar_friends, friend_scores
+        return pd.Series(dtype=float), similar_friends, friend_scores_df
 
     similar_friend_ratings["weighted_rating"] = (
         similar_friend_ratings["calibrated_rating"] * similar_friend_ratings["friend_weight"]
@@ -494,7 +485,7 @@ def get_similar_friend_ratings(
     )
 
     rating_series = pd.Series(similar_friend_ratings["rating"])
-    return rating_series, similar_friends, friend_scores
+    return rating_series, similar_friends, friend_scores_df
 
 
 def build_adjacency_matrix(books_df, num_nodes, db_conn):
@@ -538,6 +529,49 @@ def build_adjacency_matrix(books_df, num_nodes, db_conn):
     return adj_matrix
 
 
+def _build_ensemble_predictions(
+    params: dict,
+    train_embeddings: np.ndarray,
+    y_train: np.ndarray,
+    predict_embeddings: np.ndarray,
+) -> np.ndarray:
+    """Fit KNN + BRR + SVR ensemble on train_embeddings/y_train and predict on predict_embeddings.
+
+    Returns blended predictions in the same scale as y_train.
+    """
+    knn = KNeighborsRegressor(
+        n_neighbors=min(int(params["knn_neighbors"]), len(train_embeddings)),
+        metric="cosine",
+        weights="distance",
+        n_jobs=-1,
+    )
+    knn.fit(train_embeddings, y_train)
+    knn_pred = knn.predict(predict_embeddings)
+
+    brr = BayesianRidge(
+        alpha_1=params["brr_alpha_1"],
+        alpha_2=params["brr_alpha_2"],
+        lambda_1=params["brr_lambda_1"],
+        lambda_2=params["brr_lambda_2"],
+        compute_score=True,
+    )
+    brr.fit(train_embeddings, y_train)
+    brr_mu, brr_std = cast(tuple[np.ndarray, np.ndarray], brr.predict(predict_embeddings, return_std=True))
+    brr_pred = brr_mu - (params["brr_uncertainty_penalty"] * brr_std)
+
+    svr = SVR(kernel="rbf", gamma="scale", C=params["svr_regularization"], epsilon=params["svr_epsilon"])
+    svr.fit(train_embeddings, y_train)
+    svr_pred = svr.predict(predict_embeddings)
+
+    knn_weight = params["knn_weight"]
+    brr_weight = params["brr_weight"]
+    remaining_weight = 1 - knn_weight
+    actual_brr_weight = brr_weight * remaining_weight
+    svr_weight = remaining_weight - actual_brr_weight
+
+    return (knn_weight * knn_pred) + (actual_brr_weight * brr_pred) + (svr_weight * svr_pred)
+
+
 def prep_optimization(
     books_df,
     precomputed_embeddings,
@@ -567,6 +601,18 @@ def prep_optimization(
         knn_weight,
         brr_weight,
     ):
+        params = {
+            "knn_neighbors": knn_neighbors,
+            "brr_alpha_1": brr_alpha_1,
+            "brr_alpha_2": brr_alpha_2,
+            "brr_lambda_1": brr_lambda_1,
+            "brr_lambda_2": brr_lambda_2,
+            "brr_uncertainty_penalty": brr_uncertainty_penalty,
+            "svr_regularization": svr_regularization,
+            "svr_epsilon": svr_epsilon,
+            "knn_weight": knn_weight,
+            "brr_weight": brr_weight,
+        }
         all_embeddings = precomputed_embeddings[num_propagations]
         train_embeddings = all_embeddings[training_mask]
         y = my_ratings_scaled
@@ -575,53 +621,23 @@ def prep_optimization(
         y_preds = []
         skf = KFold(n_splits=min(10, len(train_embeddings)), shuffle=True, random_state=42)
         for train_idx, test_idx in skf.split(train_embeddings):
-            train_fold_embeddings, test_fold_embeddings = (
-                train_embeddings[train_idx],
-                train_embeddings[test_idx],
-            )
+            train_fold_embeddings = train_embeddings[train_idx]
+            test_fold_embeddings = train_embeddings[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
 
-            knn = KNeighborsRegressor(
-                n_neighbors=min(knn_neighbors, len(train_fold_embeddings)),
-                metric="cosine",
-                weights="distance",
-                n_jobs=-1,
-            )
-            knn.fit(train_fold_embeddings, y_train)
-            knn_pred = knn.predict(test_fold_embeddings)
-
-            brr = BayesianRidge(
-                alpha_1=brr_alpha_1,
-                alpha_2=brr_alpha_2,
-                lambda_1=brr_lambda_1,
-                lambda_2=brr_lambda_2,
-                compute_score=True,
-            )
-            brr.fit(train_fold_embeddings, y_train)
-            brr_mu, brr_std = cast(tuple[np.ndarray, np.ndarray], brr.predict(test_fold_embeddings, return_std=True))
-            brr_pred = brr_mu - (brr_uncertainty_penalty * brr_std)
-
-            svr = SVR(kernel="rbf", gamma="scale", C=svr_regularization, epsilon=svr_epsilon)
-            svr.fit(train_fold_embeddings, y_train)
-            svr_pred = svr.predict(test_fold_embeddings)
-
-            remaining_weight = 1 - knn_weight
-            actual_brr_weight = brr_weight * remaining_weight
-            svr_weight = remaining_weight - actual_brr_weight
-            final_pred = (knn_weight * knn_pred) + (actual_brr_weight * brr_pred) + (svr_weight * svr_pred)
-
+            fold_pred = _build_ensemble_predictions(params, train_fold_embeddings, y_train, test_fold_embeddings)
             y_reals.append(y_test)
-            y_preds.append(final_pred)
+            y_preds.append(fold_pred)
 
-        y_reals = np.concatenate(y_reals)
-        y_preds = np.concatenate(y_preds)
+        y_reals_arr = np.concatenate(y_reals)
+        y_preds_arr = np.concatenate(y_preds)
 
-        mse = mean_squared_error(y_reals, y_preds)
-        ndcg = ndcg_score(np.vstack([y_reals]), np.vstack([y_preds]))
-        if np.std(y_preds) < 1e-9:
+        mse = mean_squared_error(y_reals_arr, y_preds_arr)
+        ndcg = ndcg_score(np.vstack([y_reals_arr]), np.vstack([y_preds_arr]))
+        if np.std(y_preds_arr) < 1e-9:
             spearman = 0
         else:
-            spearman = safe_spearman(y_reals, y_preds)
+            spearman = safe_spearman(y_reals_arr, y_preds_arr)
             if np.isnan(spearman):
                 spearman = 0.0
 
@@ -666,50 +682,8 @@ def run_optimized(best_params, books_df, precomputed_embeddings, training_col):
     my_ratings_scaled = scaler.fit_transform(my_ratings.reshape(-1, 1)).flatten()
 
     train_embeddings = all_embeddings[training_mask]
-    y_train = my_ratings_scaled
-
-    knn = KNeighborsRegressor(
-        n_neighbors=min(int(best_params["knn_neighbors"]), len(train_embeddings)),
-        metric="cosine",
-        weights="distance",
-        n_jobs=-1,
-    )
-    knn.fit(train_embeddings, y_train)
-    knn_pred = knn.predict(all_embeddings)
-
-    brr = BayesianRidge(
-        alpha_1=best_params["brr_alpha_1"],
-        alpha_2=best_params["brr_alpha_2"],
-        lambda_1=best_params["brr_lambda_1"],
-        lambda_2=best_params["brr_lambda_2"],
-        compute_score=True,
-    )
-    brr.fit(train_embeddings, y_train)
-    brr_mu, brr_std = cast(tuple[np.ndarray, np.ndarray], brr.predict(all_embeddings, return_std=True))
-    brr_pred = brr_mu - (best_params["brr_uncertainty_penalty"] * brr_std)
-
-    svr = SVR(
-        kernel="rbf",
-        gamma="scale",
-        C=best_params["svr_regularization"],
-        epsilon=best_params["svr_epsilon"],
-    )
-    svr.fit(train_embeddings, y_train)
-    svr_pred = svr.predict(all_embeddings)
-
-    knn_weight = best_params["knn_weight"]
-    brr_weight = best_params["brr_weight"]
-
-    remaining_weight = 1 - knn_weight
-    brr_weight *= remaining_weight
-    svr_weight = remaining_weight - brr_weight
-
-    knn_pred = scaler.inverse_transform(knn_pred.reshape(-1, 1)).flatten()
-    brr_pred = scaler.inverse_transform(brr_pred.reshape(-1, 1)).flatten()
-    svr_pred = scaler.inverse_transform(svr_pred.reshape(-1, 1)).flatten()
-    final_pred = (knn_weight * knn_pred) + (brr_weight * brr_pred) + (svr_weight * svr_pred)
-
-    return final_pred
+    final_pred_scaled = _build_ensemble_predictions(best_params, train_embeddings, my_ratings_scaled, all_embeddings)
+    return scaler.inverse_transform(final_pred_scaled.reshape(-1, 1)).flatten()
 
 
 def run_ranking(interactive=False, optimize=False, embedding_model=None, db_path=None):
@@ -737,7 +711,10 @@ def run_ranking(interactive=False, optimize=False, embedding_model=None, db_path
             (main_library_id,),
         )
         books_df = pd.DataFrame([dict(r) for r in cursor.fetchall()])
-        books_df["my_rating"] = cast(Any, pd.to_numeric(books_df["my_rating"], errors="coerce")).replace(0, np.nan)
+        books_df["my_rating"] = pd.Series(
+            pd.to_numeric(books_df["my_rating"], errors="coerce"),
+            index=books_df.index,
+        ).replace(0, np.nan)
 
         if books_df["my_rating"].notna().sum() == 0:
             raise RuntimeError("No self rating records found. Run seed first.")
@@ -780,11 +757,14 @@ def run_ranking(interactive=False, optimize=False, embedding_model=None, db_path
         )
         friend_ratings_dict = similar_friend_ratings.to_dict()
 
-        books_df["training_ratings"] = cast(Any, books_df["my_refined"]).fillna(
-            cast(Any, books_df["legacy_id"]).map(cast(Any, friend_ratings_dict))
-        )
-        embedded_books_df["training_ratings"] = cast(Any, embedded_books_df["my_refined"]).fillna(
-            cast(Any, embedded_books_df["legacy_id"]).map(cast(Any, friend_ratings_dict))
+        legacy_id_series = pd.Series(books_df["legacy_id"], index=books_df.index)
+        embedded_legacy_id_series = pd.Series(embedded_books_df["legacy_id"], index=embedded_books_df.index)
+        books_my_refined = cast(pd.Series, books_df["my_refined"])
+        embedded_my_refined = cast(pd.Series, embedded_books_df["my_refined"])
+
+        books_df["training_ratings"] = books_my_refined.fillna(legacy_id_series.map(friend_ratings_dict))
+        embedded_books_df["training_ratings"] = embedded_my_refined.fillna(
+            embedded_legacy_id_series.map(friend_ratings_dict)
         )
 
         db.set_similar_libraries(db_conn, similar_friends)
@@ -930,7 +910,4 @@ def run_ranking(interactive=False, optimize=False, embedding_model=None, db_path
                         "date_updated",
                     ],
                 )
-
-                placeholders = ",".join("?" for _ in predictions_data)
-                prune_ids = [x[0] for x in predictions_data]
-                db_conn.execute(f"DELETE FROM book_predictions WHERE book_id NOT IN ({placeholders})", prune_ids)
+                db.prune_book_predictions(db_conn, [x[0] for x in predictions_data])

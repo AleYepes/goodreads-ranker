@@ -1,59 +1,26 @@
 import asyncio
+import os
 import sys
 
 import fire
 
 from goodreads_ranker import config, db
-from goodreads_ranker.utils import as_bool, parse_optional_int
 
-command_helps = {
-    "init": {
-        "desc": "Interactively configure required environment variables in .env.",
-        "flags": [("--force-init", "Force update of existing environment variables.")],
-    },
-    "seed": {
-        "desc": "Scrape Goodreads library shelves to seed the database.",
-        "flags": [
-            ("--force-seed", "Force seeding even if shelves were already seeded."),
-            ("--library-ids", "Comma-separated list or path to a file of Goodreads user/library IDs to seed."),
-        ],
-    },
-    "crawl": {
-        "desc": "Crawl detailed metadata for all seeded books.",
-        "flags": [
-            ("--limit", "Limit the number of books to crawl."),
-            ("--force-crawl", "Force crawl even if details were already crawled."),
-        ],
-    },
-    "embed": {
-        "desc": "Generate Ollama vector embeddings for crawled books.",
-        "flags": [
-            ("--batch-size", "Batch size for generating embeddings (default: 128)."),
-            ("--embedding-model", "Ollama model name (overrides configured default)."),
-        ],
-    },
-    "rank": {
-        "desc": "Train ranking models and generate book recommendations.",
-        "flags": [
-            ("--interactive", "Train and evaluate models in interactive mode."),
-            ("--optimize", "Optimize ranker model hyperparameters."),
-            ("--embedding-model", "Ollama embedding model to pull from the database (overrides configured default)."),
-        ],
-    },
-}
 
-pipeline_flags = []
-seen_flags = set()
-for _, v in command_helps.items():
-    for flag, desc in v["flags"]:
-        if flag not in seen_flags:
-            seen_flags.add(flag)
-            pipeline_flags.append((flag, desc))
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
 
-command_helps["run_pipeline"] = {
-    "desc": "Run the complete pipeline from initialization to ranking.",
-    "flags": pipeline_flags,
-}
+
+def parse_optional_int(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    return int(value)
 
 
 class GoodreadsRankerCLI:
@@ -94,7 +61,7 @@ class GoodreadsRankerCLI:
         for var in vars_to_configure:
             key = var["key"]
             current = var["current"]
-            already_in_env = bool(current) and key in __import__("os").environ
+            already_in_env = bool(current) and key in os.environ
 
             if not force_init and already_in_env:
                 continue
@@ -129,7 +96,7 @@ class GoodreadsRankerCLI:
 
             if value:
                 set_key(dotenv_path, key, value)
-                __import__("os").environ[key] = value
+                os.environ[key] = value
 
         if anything_prompted:
             print("\n✓ Configuration saved to .env")
@@ -141,7 +108,6 @@ class GoodreadsRankerCLI:
             force_seed (bool): Force seeding even if shelves were already seeded.
             library_ids (str|list): Comma-separated list, python list, or path to a file of library IDs.
         """
-        import os
         import re
 
         from goodreads_ranker import seeder
@@ -184,7 +150,7 @@ class GoodreadsRankerCLI:
             )
         )
 
-    def embed(self, batch_size=128, embedding_model=None):
+    def embed(self, batch_size=1, embedding_model=None):
         """Generate Ollama embeddings for all books that are missing or outdated.
 
         Args:
@@ -217,21 +183,34 @@ class GoodreadsRankerCLI:
 
     def run_pipeline(
         self,
-        **kwargs,
+        force_init=False,
+        force_seed=False,
+        library_ids=None,
+        limit=None,
+        force_crawl=False,
+        batch_size=128,
+        embedding_model=None,
+        interactive=False,
+        optimize=False,
     ):
-        """Run the complete pipeline dynamically passing any valid configuration flags."""
-        import inspect
+        """Run the complete pipeline from initialization to ranking.
 
-        def call_with_valid_kwargs(method, **passed_kwargs):
-            sig = inspect.signature(method)
-            filtered = {k: v for k, v in passed_kwargs.items() if k in sig.parameters}
-            return method(**filtered)
-
-        call_with_valid_kwargs(self.init, **kwargs)
-        call_with_valid_kwargs(self.seed, **kwargs)
-        call_with_valid_kwargs(self.crawl, **kwargs)
-        call_with_valid_kwargs(self.embed, **kwargs)
-        call_with_valid_kwargs(self.rank, **kwargs)
+        Args:
+            force_init (bool): Force review and update of existing environment variables.
+            force_seed (bool): Force seeding even if shelves were already seeded.
+            library_ids (str|list): Comma-separated list, python list, or path to a file of library IDs.
+            limit (int): Limit the number of books to crawl.
+            force_crawl (bool): Force crawling even if details have already been crawled.
+            batch_size (int): Batch size for generating embeddings.
+            embedding_model (str): Ollama embedding model name.
+            interactive (bool): Run the ranking model in interactive mode.
+            optimize (bool): Optimize model hyperparameters.
+        """
+        self.init(force_init=force_init)
+        self.seed(force_seed=force_seed, library_ids=library_ids)
+        self.crawl(limit=limit, force_crawl=force_crawl)
+        self.embed(batch_size=batch_size, embedding_model=embedding_model)
+        self.rank(interactive=interactive, optimize=optimize, embedding_model=embedding_model)
 
         print("\n✓ Pipeline run finished successfully!")
 
@@ -279,52 +258,7 @@ def _prompt_model(current: str, force_init: bool) -> str:
     return value.strip() or current
 
 
-def print_help(command=None):
-    """Outputs standardized, beautifully aligned CLI help screens."""
-    if command is None:
-        print("Goodreads Ranker CLI - Crawl, embed, and rank your Goodreads books.\n")
-        print("Usage:")
-        print("  python main.py <command> [<args>]\n")
-        print("Available commands:")
-        for cmd, info in command_helps.items():
-            print(f"  {cmd:<22}{info['desc']}")
-            for flag, flag_desc in info["flags"]:
-                print(f"    {flag:<20}{flag_desc}")
-            print()
-        print("Additional options:")
-        print("  -h, --help            Show optional command flags.")
-    else:
-        info = command_helps.get(command)
-        if info:
-            title = command.replace("_", " ").title()
-            print(f"Goodreads Ranker CLI - {title}\n")
-            print("Usage:")
-            print(f"  python main.py {command} [<args>]\n")
-            print("Description:")
-            print(f"  {info['desc']}\n")
-            if info["flags"]:
-                print("Available options:")
-                for flag, flag_desc in info["flags"]:
-                    print(f"  {flag:<22}{flag_desc}")
-            else:
-                print("This command does not accept any additional options.")
-
-
 def main():
-    is_help = "-h" in sys.argv or "--help" in sys.argv or len(sys.argv) == 1
-
-    if is_help:
-        subcommand = None
-        for arg in sys.argv[1:]:
-            if arg in command_helps:
-                subcommand = arg
-                break
-
-        print_help(subcommand)
-        sys.exit(0)
-
-    import os
-
     os.environ["PAGER"] = f'"{sys.executable}" -c "import sys; sys.stdout.write(sys.stdin.read())"'
 
     fire.Fire(GoodreadsRankerCLI)

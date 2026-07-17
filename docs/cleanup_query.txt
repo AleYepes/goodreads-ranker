@@ -5,3 +5,21 @@ Let's review [main.py](file;file:///Users/alex/Documents/goodreads-ranker/main.p
 - needless comments that can be directly inferred from the code itself and so be removed. 
 
 We want to refine/clean-up/simplify
+
+
+
+
+
+Role: You are an expert Python software architect specializing in clean code, KISS (Keep It Simple, Stupid) principles, and decoupling.
+
+Goal: Simplify, clean up, and decouple the codebase. Identify refactoring targets that reduce cognitive load and maintenance overhead.
+
+Task: Review [main.py](file;file:///Users/alex/Documents/goodreads-ranker/main.py) and all the scripts it consumes from `goodreads_ranker/` to prepare a refactoring plan.
+
+Please analyze the files specifically for:
+1. Dead Code & Vestiges: Unused helper functions, redundant imports, obsolete migration/backfill logic, or commented-out code.
+2. Tight Coupling: Instances where concerns are inadequately separated, where unidirectional flow is violated (db.py and utils.py should be the only shared packages, but maybe these should be reconsidered in favor of a cleaner architecture)`, where modules share too much state, or where modules take on too much responsibility.
+3. Over-engineering & Complexity: Unnecessary abstractions, over-designed class hierarchies where simple functions would suffice, or redundant utility functions.
+4. Robustness & Standards: Missing error handling, hardcoded configurations/credentials, inconsistent type hinting, or other code smells.
+
+Interview me relentlessly about every aspect of this plan until we reach a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one. For each question, provide your recommended answer. Ask one question at a time, waiting for feedback before continuing to the next question. If a question can be answered by exploring the codebase, explore the codebase instead.
