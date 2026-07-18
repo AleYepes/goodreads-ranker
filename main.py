@@ -4,7 +4,7 @@ import sys
 
 import fire
 
-from goodreads_ranker import config, db
+from goodreads_ranker.core import config, db
 
 
 def as_bool(value):
@@ -110,7 +110,7 @@ class GoodreadsRankerCLI:
         """
         import re
 
-        from goodreads_ranker import seeder
+        from goodreads_ranker.ingestion import seeder
 
         print("\nSeeding database")
         db.init_db()
@@ -131,6 +131,13 @@ class GoodreadsRankerCLI:
 
         asyncio.run(seeder.scrape_libraries(library_ids=library_ids, force_seed=as_bool(force_seed)))
 
+    def rate(self):
+        """Run interactive terminal Elo ratings calibration."""
+        from goodreads_ranker.ml import elo_calibration
+
+        print("\nRunning interactive rating calibration")
+        elo_calibration.run_calibration()
+
     def crawl(self, limit=None, force_crawl=False):
         """Crawl full book details (metadata, genres, descriptions) for all seeded books.
 
@@ -138,7 +145,7 @@ class GoodreadsRankerCLI:
             limit (int): Limit the number of books to crawl.
             force_crawl (bool): Force crawling even if details have already been crawled.
         """
-        from goodreads_ranker import crawler
+        from goodreads_ranker.ingestion import crawler
 
         print("\nCrawling book details")
         db.init_db()
@@ -157,28 +164,40 @@ class GoodreadsRankerCLI:
             batch_size (int): Batch size for generating embeddings.
             embedding_model (str): Ollama embedding model name (overrides configured model).
         """
-        from goodreads_ranker import embedder
+        from goodreads_ranker.ml import embedder
 
         print("\nGenerating embeddings")
         db.init_db()
         embedder.generate_embeddings(batch_size=int(batch_size), embedding_model=embedding_model or None)
 
-    def rank(self, interactive=False, optimize=False, embedding_model=None):
-        """Run the ranking model and write predictions to the database.
+    def friend_similarity(self, embedding_model=None):
+        """Calculate Spearman correlation and calibrated ratings for all friends.
 
         Args:
-            interactive (bool): Run the ranking model in interactive mode.
-            optimize (bool): Optimize model hyperparameters.
             embedding_model (str): Ollama embedding model name (overrides configured model).
         """
-        from goodreads_ranker import ranker
+        from goodreads_ranker.ml import friend_similarity
+
+        print("\nCalibrating friend similarities and book ratings")
+        db.init_db()
+        friend_similarity.run_friend_similarity(embedding_model=embedding_model or None)
+
+    def predict(self, optimize=False, embedding_model=None, min_friend_similarity=0.3):
+        """Run the ensemble prediction model and write predictions to the database.
+
+        Args:
+            optimize (bool): Optimize model hyperparameters.
+            embedding_model (str): Ollama embedding model name (overrides configured model).
+            min_friend_similarity (float): Minimum friend taste correlation threshold.
+        """
+        from goodreads_ranker.ml import predictor
 
         print("\nRunning models and predictions")
         db.init_db()
-        ranker.run_ranking(
-            interactive=as_bool(interactive),
+        predictor.run_prediction(
             optimize=as_bool(optimize),
             embedding_model=embedding_model or None,
+            min_friend_similarity=float(min_friend_similarity),
         )
 
     def run_pipeline(
@@ -190,8 +209,8 @@ class GoodreadsRankerCLI:
         force_crawl=False,
         batch_size=128,
         embedding_model=None,
-        interactive=False,
         optimize=False,
+        min_friend_similarity=0.3,
     ):
         """Run the complete pipeline from initialization to ranking.
 
@@ -203,15 +222,16 @@ class GoodreadsRankerCLI:
             force_crawl (bool): Force crawling even if details have already been crawled.
             batch_size (int): Batch size for generating embeddings.
             embedding_model (str): Ollama embedding model name.
-            interactive (bool): Run the ranking model in interactive mode.
             optimize (bool): Optimize model hyperparameters.
+            min_friend_similarity (float): Minimum friend taste correlation threshold.
         """
         self.init(force_init=force_init)
         self.seed(force_seed=force_seed, library_ids=library_ids)
+        self.rate()
         self.crawl(limit=limit, force_crawl=force_crawl)
         self.embed(batch_size=batch_size, embedding_model=embedding_model)
-        self.rank(interactive=interactive, optimize=optimize, embedding_model=embedding_model)
-
+        self.friend_similarity(embedding_model=embedding_model)
+        self.predict(optimize=optimize, embedding_model=embedding_model, min_friend_similarity=min_friend_similarity)
         print("\n✓ Pipeline run finished successfully!")
 
 

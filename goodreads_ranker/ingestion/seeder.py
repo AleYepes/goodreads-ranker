@@ -10,8 +10,8 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 from tqdm import tqdm
 
-from . import config, db
-from .utils import USER_AGENT, clean_text, parse_date_str, parse_id_from_slug
+from goodreads_ranker.core import config, db
+from goodreads_ranker.core.utils import USER_AGENT, clean_text, parse_date_str, parse_id_from_slug
 
 SIGNIN_URL = "https://www.goodreads.com/ap/signin?language=en_US&openid.assoc_handle=amzn_goodreads_web_na&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.mode=checkid_setup&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.goodreads.com%2Fap-handler%2Fsign-in"
 
@@ -190,7 +190,6 @@ async def fetch_friends(page, user_id: int, email: str | None = None, password: 
         else:
             break
 
-    # print(f"Found {len(friends)} friend(s) with books.")
     return friends
 
 
@@ -225,12 +224,12 @@ async def extract_friend_row(row, library_id):
     rating = 0
 
     if rating_container:
-        static_stars = await rating_container.query_selector(".staticStars")  # for read-only friend's ratings
+        static_stars = await rating_container.query_selector(".staticStars")
         if static_stars:
             rating_text = await static_stars.get_attribute("title") or ""
             rating = RATING_MAP.get(rating_text, 0)
         else:
-            stars_el = await rating_container.query_selector(".stars")  # for editable personal ratings
+            stars_el = await rating_container.query_selector(".stars")
             if stars_el:
                 data_rating = await stars_el.get_attribute("data-rating")
                 if data_rating and data_rating.isdigit():
@@ -339,6 +338,7 @@ async def scrape_libraries(db_path=None, library_ids=None, force_seed=False):
     email = config.get_goodreads_email()
     password = config.get_goodreads_password()
 
+    # Sequential setup phase: single connection is safe here (no concurrency yet).
     with db.get_connection(db_path) as db_conn:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
@@ -364,41 +364,56 @@ async def scrape_libraries(db_path=None, library_ids=None, force_seed=False):
                 db.upsert_libraries(db_conn, main_user, friends)
 
             to_scrape = db.get_libraries_to_scrape(db_conn, force_seed)
-
-            if not to_scrape:
-                print("No new friends or incomplete libraries to scrape. Use --force_seed to re-scrape.")
-                await browser.close()
-                return
-
-            worker_count = min(CONCURRENCY, len(to_scrape))
-
-            worker_pages = [setup_page]
-            for _ in range(worker_count - 1):
-                worker_pages.append(await context.new_page())
-
-            queue = asyncio.Queue()
-            for library_id in to_scrape:
-                queue.put_nowait(library_id)
-
-            pbar = tqdm(total=len(to_scrape), desc="Scraping friend libraries", unit="list")
-
-            async def library_worker(page):
-                while True:
-                    try:
-                        library_id = queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        return
-                    try:
-                        await process_library(db_conn, page, library_id, email, password, force_seed=force_seed)
-                    except Exception as e:
-                        tqdm.write(f"Failed library {library_id}: {e}")
-                        db.mark_library_failed(db_conn, library_id, e)
-                        with contextlib.suppress(Exception):
-                            await page.goto("about:blank")
-                    finally:
-                        pbar.update(1)
-
-            await asyncio.gather(*(library_worker(wp) for wp in worker_pages))
-            pbar.close()
-
             await browser.close()
+
+    # db_conn is closed here — concurrent phase begins below.
+
+    if not to_scrape:
+        print("No new friends or incomplete libraries to scrape. Use --force_seed to re-scrape.")
+        return
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+
+        if STORAGE_STATE_PATH.exists():
+            context = await browser.new_context(
+                user_agent=USER_AGENT,
+                storage_state=str(STORAGE_STATE_PATH),
+            )
+        else:
+            context = await browser.new_context(user_agent=USER_AGENT)
+        await context.route("**/*", _block_heavy_resources)
+
+        worker_count = min(CONCURRENCY, len(to_scrape))
+        worker_pages = [await context.new_page() for _ in range(worker_count)]
+
+        queue: asyncio.Queue[int] = asyncio.Queue()
+        for library_id in to_scrape:
+            queue.put_nowait(library_id)
+
+        pbar = tqdm(total=len(to_scrape), desc="Scraping friend libraries", unit="list")
+
+        async def library_worker(page):
+            while True:
+                try:
+                    library_id = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    # Each library gets its own short-lived connection so concurrent
+                    # workers cannot interleave writes or commits on a shared connection.
+                    with db.get_connection(db_path) as worker_conn:
+                        await process_library(worker_conn, page, library_id, email, password, force_seed=force_seed)
+                except Exception as e:
+                    tqdm.write(f"Failed library {library_id}: {e}")
+                    with db.get_connection(db_path) as worker_conn:
+                        db.mark_library_failed(worker_conn, library_id, e)
+                    with contextlib.suppress(Exception):
+                        await page.goto("about:blank")
+                finally:
+                    pbar.update(1)
+
+        await asyncio.gather(*(library_worker(wp) for wp in worker_pages))
+        pbar.close()
+
+        await browser.close()

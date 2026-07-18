@@ -1,16 +1,35 @@
 import contextlib
 import hashlib
+import re
 import subprocess
 import time
 
 import numpy as np
 from tqdm import tqdm
 
-from . import config, db
+from goodreads_ranker.core import config, db
 
-# ---------------------------------------------------------------------------
-# Ollama lifecycle
-# ---------------------------------------------------------------------------
+
+def format_string_for_embedding(items: list, kind: str | None = None) -> str:
+    if not isinstance(items, list) or len(items) == 0:
+        return ""
+
+    n = len(items)
+    res = items[0] if n == 1 else f"{', '.join(items[:-1])}{',' if n > 2 else ''} and {items[-1]}"
+
+    prefix = f"{kind.capitalize()}{'s' if n > 1 else ''}: " if kind else ""
+    return f"{prefix}{res}"
+
+
+def join_embedding_parts(title: str, authors: str, genres: str, desc: str) -> str:
+    text = f"Book: {title}\n"
+    if authors:
+        text += f"Written by: {authors}\n"
+    if genres:
+        text += f"{genres}\n"
+    if desc:
+        text += f"{desc}"
+    return text
 
 
 @contextlib.contextmanager
@@ -62,9 +81,26 @@ def _ensure_ollama(embedding_model: str):
             proc.wait(timeout=10)
 
 
-# ---------------------------------------------------------------------------
-# Embedding generation
-# ---------------------------------------------------------------------------
+def find_stale_or_missing_embeddings(existing_embeddings: dict[int, dict], all_inputs: dict[int, str]) -> list[int]:
+    input_hashes = {legacy_id: hashlib.md5(text.encode("utf-8")).hexdigest() for legacy_id, text in all_inputs.items()}
+
+    queued = []
+    for legacy_id, _ in all_inputs.items():
+        existing = existing_embeddings.get(legacy_id)
+        if existing is None:
+            queued.append(legacy_id)
+            continue
+        if existing.get("vector") is None:
+            queued.append(legacy_id)
+            continue
+        if not db.is_valid_embedding_blob(existing.get("vector")):
+            queued.append(legacy_id)
+            continue
+        current_hash = input_hashes.get(legacy_id, "")
+        if not current_hash or existing.get("text_hash") != current_hash:
+            queued.append(legacy_id)
+
+    return queued
 
 
 def generate_embeddings(batch_size=64, embedding_model=None, db_path=None):
@@ -74,12 +110,29 @@ def generate_embeddings(batch_size=64, embedding_model=None, db_path=None):
         embedding_model = config.get_embedding_model()
 
     with db.get_connection(db_path) as db_conn:
-        all_inputs = db.build_embedding_inputs(db_conn)
-        if not all_inputs:
+        metadata_list = db.get_book_metadata_for_embedding(db_conn)
+        if not metadata_list:
             print("No books found. Run crawler first.")
             return
 
-        missing_ids = db.find_stale_or_missing_embeddings(db_conn, all_inputs, embedding_model)
+        all_inputs = {}
+        for r in metadata_list:
+            legacy_id = r["legacy_id"]
+            title = r["title"]
+            author_name = r["author_name"]
+            authors_post = author_name.strip() if author_name and author_name.strip() else ""
+            genres_post = format_string_for_embedding(r["genres"], kind="genre")
+
+            desc_raw = r["description"] or ""
+            desc_clean = re.sub(r"\s+", " ", desc_raw).strip()
+            desc_list = [desc_clean] if desc_clean else []
+            desc_post = format_string_for_embedding(desc_list, kind="description")
+
+            embedding_input = join_embedding_parts(title, authors_post, genres_post, desc_post)
+            all_inputs[legacy_id] = embedding_input
+
+        existing_embeddings = db.get_existing_embeddings(db_conn, embedding_model)
+        missing_ids = find_stale_or_missing_embeddings(existing_embeddings, all_inputs)
 
         if not missing_ids:
             print(f"Nothing to embed: all books have valid embeddings for model '{embedding_model}'.")
