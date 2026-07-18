@@ -104,7 +104,7 @@ def run_calibration(db_path=None):
             db_rows.append(
                 (
                     int(row["legacy_id"]),
-                    float(row["original_rating"])
+                    int(row["original_rating"])
                     if row["original_rating"] is not None and pd.notna(row["original_rating"])
                     else None,
                     float(row["elo_score"]),

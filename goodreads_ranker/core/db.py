@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS books (
 -- 3. BOOK ELO RATINGS
 CREATE TABLE IF NOT EXISTS book_elo_ratings (
     book_id          INTEGER PRIMARY KEY REFERENCES books(legacy_id) ON DELETE CASCADE,
-    original_rating  REAL,
+    original_rating  INTEGER,
     elo_score        REAL DEFAULT 1200.0,
     matches_played   INTEGER DEFAULT 0
 );
