@@ -269,8 +269,8 @@ def print_recommendations(stats):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('path', help='Path to CSV file or SQLite .db/.sqlite file')
-    parser.add_argument('--table', help='Table name (for SQLite input)')
+    parser.add_argument('path', nargs='?', default='data/goodreads.db', help='Path to CSV file or SQLite .db/.sqlite file (default: data/goodreads.db)')
+    parser.add_argument('--table', default='books', help='Table name (for SQLite input, default: books)')
     parser.add_argument('--column', default='description', help='Column to analyze (default: description)')
     parser.add_argument('--query', help='Custom SQL query for SQLite input (overrides --table)')
     parser.add_argument('--sample', type=int, default=3, help='Example rows to show per issue type')

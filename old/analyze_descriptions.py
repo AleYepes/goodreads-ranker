@@ -1,18 +1,7 @@
-#!/usr/bin/env python3
-"""
-Analyze the health of book descriptions in data/goodreads.db.
-
-Run from the repository root:
-
-    python analyze_descriptions.py
-"""
-
-from collections import Counter
-import html
 import re
 import sqlite3
 import unicodedata
-
+from collections import Counter
 
 DB_PATH = "data/goodreads.db"
 
@@ -113,10 +102,16 @@ def main():
 
     print("Description statistics")
     print("----------------------")
-    print(f"Mean chars : {sum(lengths)/total:.1f}")
-    print(f"Max chars  : {max(lengths):,}")
-    print(f"Mean bytes : {sum(byte_lengths)/total:.1f}")
-    print(f"Max bytes  : {max(byte_lengths):,}")
+    if total > 0:
+        print(f"Mean chars : {sum(lengths)/total:.1f}")
+        print(f"Max chars  : {max(lengths):,}")
+        print(f"Mean bytes : {sum(byte_lengths)/total:.1f}")
+        print(f"Max bytes  : {max(byte_lengths):,}")
+    else:
+        print("Mean chars : N/A")
+        print("Max chars  : N/A")
+        print("Mean bytes : N/A")
+        print("Max bytes  : N/A")
 
     print()
     print("Potential issues")

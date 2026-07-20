@@ -8,6 +8,8 @@ tqdm
 networkx
 scikit-learn
 pandas
+ftfy
+beautifulsoup4
 numpy
 torch
 nbstripout
