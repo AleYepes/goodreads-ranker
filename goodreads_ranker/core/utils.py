@@ -126,3 +126,22 @@ def assemble_embedding_matrix(legacy_ids: list[int], vectors_by_id: dict[int, by
         np.vstack(valid_vectors).astype(np.float32, copy=False) if valid_vectors else np.empty((0, 0), dtype=np.float32)
     )
     return np.array(valid_mask, dtype=bool), matrix
+
+
+def clean_description_text(text: str | None) -> str:
+    if not text:
+        return ""
+
+    import warnings
+
+    import ftfy
+    from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
+        text = ftfy.fix_text(text, normalization="NFKC")
+        text = BeautifulSoup(text, "html.parser").get_text(separator=" ")
+        text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+        text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+
+    return re.sub(r"\s+", " ", text).strip()

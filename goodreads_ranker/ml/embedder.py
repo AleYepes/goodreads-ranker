@@ -1,13 +1,12 @@
 import contextlib
 import hashlib
-import re
 import subprocess
 import time
 
 import numpy as np
 from tqdm import tqdm
 
-from goodreads_ranker.core import config, db
+from goodreads_ranker.core import config, db, utils
 
 
 def format_string_for_embedding(items: list, kind: str | None = None) -> str:
@@ -123,8 +122,7 @@ def generate_embeddings(batch_size=64, embedding_model=None, db_path=None):
             authors_post = author_name.strip() if author_name and author_name.strip() else ""
             genres_post = format_string_for_embedding(r["genres"], kind="genre")
 
-            desc_raw = r["description"] or ""
-            desc_clean = re.sub(r"\s+", " ", desc_raw).strip()
+            desc_clean = utils.clean_description_text(r["description"])
             desc_list = [desc_clean] if desc_clean else []
             desc_post = format_string_for_embedding(desc_list, kind="description")
 

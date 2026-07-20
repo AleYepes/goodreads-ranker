@@ -48,9 +48,7 @@ def find_and_remove_epubs(root_dir: str, dry_run: bool = False) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Delete .epub files from directories that also contain a .mobi file."
-    )
+    parser = argparse.ArgumentParser(description="Delete .epub files from directories that also contain a .mobi file.")
     parser.add_argument("directory", help="Root directory to scan.")
     parser.add_argument(
         "--dry-run",

@@ -44,3 +44,9 @@ typeCheckingMode = "basic"
 reportMissingTypeStubs = false
 venvPath = "."
 venv = "venv"
+
+[project]
+dependencies = [
+    "beautifulsoup4",
+    "ftfy",
+]

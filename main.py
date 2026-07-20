@@ -131,12 +131,13 @@ class GoodreadsRankerCLI:
 
         asyncio.run(seeder.scrape_libraries(library_ids=library_ids, force_seed=as_bool(force_seed)))
 
-    def rate(self):
+    def rate(self, interactive=False):
         """Run interactive terminal Elo ratings calibration."""
-        from goodreads_ranker.ml import elo_calibration
+        if interactive:
+            from goodreads_ranker.ml import elo_calibration
 
-        print("\nRunning interactive rating calibration")
-        elo_calibration.run_calibration()
+            print("\nRunning interactive rating calibration")
+            elo_calibration.run_calibration()
 
     def crawl(self, limit=None, force_crawl=False):
         """Crawl full book details (metadata, genres, descriptions) for all seeded books.
@@ -205,9 +206,10 @@ class GoodreadsRankerCLI:
         force_init=False,
         force_seed=False,
         library_ids=None,
+        interactive=False,
         limit=None,
         force_crawl=False,
-        batch_size=128,
+        batch_size=1,
         embedding_model=None,
         optimize=False,
         min_friend_similarity=0.3,
@@ -227,7 +229,7 @@ class GoodreadsRankerCLI:
         """
         self.init(force_init=force_init)
         self.seed(force_seed=force_seed, library_ids=library_ids)
-        self.rate()
+        self.rate(interactive=interactive)
         self.crawl(limit=limit, force_crawl=force_crawl)
         self.embed(batch_size=batch_size, embedding_model=embedding_model)
         self.friend_similarity(embedding_model=embedding_model)

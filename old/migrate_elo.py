@@ -6,6 +6,7 @@ _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 
 import sys
+
 sys.path.insert(0, str(_ROOT))
 
 from goodreads_ranker.core.db import get_connection
