@@ -29,7 +29,10 @@ STORAGE_STATE_PATH = DATA_DIR / "storage_state.json"
 CONCURRENCY = 3
 
 NAV_RETRY_ATTEMPTS = 3
-NAV_RETRY_BASE_DELAY = 2.0
+NAV_RETRY_BASE_DELAY = 1.0
+
+LOGIN_SUBMIT_RETRIES = 3
+LOGIN_SUBMIT_TIMEOUT = 60_000  # ms — gives Amazon more room than the default 30s
 
 JITTER_MIN = 0.5
 JITTER_MAX = 2.0
@@ -88,17 +91,38 @@ async def login_to_goodreads(page, email, password):
     if not email or not password:
         raise RuntimeError("GOODREADS_EMAIL and GOODREADS_PASSWORD must be set to scrape private review lists.")
 
-    if await page.locator("button.authPortalSignInButton").count() > 0:
-        async with page.expect_navigation(wait_until="domcontentloaded"):
-            await page.locator("button.authPortalSignInButton").click()
-    elif await page.locator('input[type="email"]').count() == 0:
-        await goto_with_retry(page, SIGNIN_URL)
+    for attempt in range(1, LOGIN_SUBMIT_RETRIES + 1):
+        try:
+            if attempt > 1:
+                await goto_with_retry(page, SIGNIN_URL)
 
-    await page.wait_for_selector('input[type="email"]', timeout=30000)
-    await page.fill('input[type="email"]', email)
-    await page.fill('input[type="password"]', password)
-    await page.click('input[type="submit"]')
-    await page.wait_for_load_state("domcontentloaded")
+            if await page.locator("button.authPortalSignInButton").count() > 0:
+                async with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                    await page.locator("button.authPortalSignInButton").click()
+            elif await page.locator('input[type="email"]').count() == 0:
+                await goto_with_retry(page, SIGNIN_URL)
+
+            await page.wait_for_selector('input[type="email"]', timeout=30000)
+            await page.fill('input[type="email"]', email)
+            await page.fill('input[type="password"]', password)
+
+            async with page.expect_navigation(wait_until="domcontentloaded", timeout=LOGIN_SUBMIT_TIMEOUT):
+                await page.click('input[type="submit"]', no_wait_after=True)
+            break
+
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if attempt < LOGIN_SUBMIT_RETRIES:
+                delay = NAV_RETRY_BASE_DELAY * attempt
+                tqdm.write(
+                    f"Login attempt {attempt}/{LOGIN_SUBMIT_RETRIES} failed or timed out: {e}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+            else:
+                raise RuntimeError(
+                    f"Login failed after {LOGIN_SUBMIT_RETRIES} attempts. Last error: {e}"
+                ) from e
+
     await wait_for_post_login(page)
 
     await save_storage_state(page.context)
