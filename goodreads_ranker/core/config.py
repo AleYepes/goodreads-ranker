@@ -4,7 +4,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_EMBEDDING_MODEL = "leoipulsar/harrier-0.6b:latest"
+# DEFAULT_EMBEDDING_MODEL = "leoipulsar/harrier-0.6b:latest"
+DEFAULT_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 
 
 def get_goodreads_email() -> str | None:

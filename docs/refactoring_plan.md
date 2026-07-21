@@ -33,6 +33,33 @@ goodreads_ranker/
     └── predictor.py         (GNN/ensemble prediction — the `predict` command, replaces ranker.py)
 main.py                      (CLI entrypoint, repo root)
 ```
+```
+goodreads_ranker/
+├── assets/
+├── data/
+├── docs/
+├── notebooks/
+├── old/
+├── goodreads_ranker/
+│   ├── __init__.py
+│   ├── core/
+│   │   ├── db.py
+│   │   ├── config.py
+│   │   └── utils.py
+│   ├── ingestion/
+│   │   ├── api_client.py
+│   │   ├── crawler.py
+│   │   └── seeder.py
+│   └── ml/
+│       ├── elo_calibration.py
+│       ├── friend_similarity.py
+│       ├── embedder.py
+│       └── predictor.py
+├── .env
+├── main.py
+├── pyproject.toml
+└── ...
+```
 
 **Import boundary rule (strict):** `ingestion/` and `ml/` modules may import from `core/` only — never from each other, and never from a sibling module in the other package. `core/` modules may never import from `ingestion/` or `ml/`. `main.py` sits outside the package and may import anything. This is achievable cleanly given the current call graph — no module today needs a cross-boundary import once the DB-mediated handoffs described below are in place.
 

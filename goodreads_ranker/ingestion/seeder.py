@@ -119,9 +119,7 @@ async def login_to_goodreads(page, email, password):
                 )
                 await asyncio.sleep(delay)
             else:
-                raise RuntimeError(
-                    f"Login failed after {LOGIN_SUBMIT_RETRIES} attempts. Last error: {e}"
-                ) from e
+                raise RuntimeError(f"Login failed after {LOGIN_SUBMIT_RETRIES} attempts. Last error: {e}") from e
 
     await wait_for_post_login(page)
 
