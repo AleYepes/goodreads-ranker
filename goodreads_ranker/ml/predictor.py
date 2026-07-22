@@ -20,34 +20,6 @@ from goodreads_ranker.core import config, db, utils
 
 torch.sparse.check_sparse_tensor_invariants.disable()
 
-DEFAULT_FRIEND_PARAMS = {
-    "num_propagations": 0,
-    "knn_neighbors": 18,
-    "brr_alpha_1": 0.0007083523294476891,
-    "brr_alpha_2": 0.0005052291699790206,
-    "brr_lambda_1": 6.723461212511323e-06,
-    "brr_lambda_2": 0.00065032051532833,
-    "brr_uncertainty_penalty": 1.124317064784675,
-    "svr_regularization": 0.045512095772648135,
-    "svr_epsilon": 0.45635064943633097,
-    "knn_weight": 0.6072006217417109,
-    "brr_weight": 0.7469140779723126,
-}
-
-DEFAULT_SOLO_PARAMS = {
-    "num_propagations": 1,
-    "knn_neighbors": 39,
-    "brr_alpha_1": 0.0007917501343982147,
-    "brr_alpha_2": 0.0003673094481243756,
-    "brr_lambda_1": 0.0009261898325379562,
-    "brr_lambda_2": 0.0004845024834776367,
-    "brr_uncertainty_penalty": 1.4875061034371395,
-    "svr_regularization": 2.0283092484268437,
-    "svr_epsilon": 0.2673464313322004,
-    "knn_weight": 0.11589067396260068,
-    "brr_weight": 0.1852941582795484,
-}
-
 
 def safe_spearman(x, y):
     x = np.asarray(x, dtype=float)
@@ -65,15 +37,6 @@ def normalize_model_params(params):
     params["num_propagations"] = int(params["num_propagations"])
     params["knn_neighbors"] = int(params["knn_neighbors"])
     return params
-
-
-def get_or_create_prediction_hyperparams(db_conn, name, defaults):
-    params = db.get_prediction_hyperparams(db_conn, name)
-    if params is None:
-        params = dict(defaults)
-        db.save_prediction_hyperparams(db_conn, name, params)
-        return params
-    return normalize_model_params(params)
 
 
 def build_adjacency_matrix(books_df, num_nodes, db_conn):
@@ -154,7 +117,7 @@ def prep_optimization(
     training_col,
     mrl_dimensions,
     max_propagations,
-    budget=300,
+    budget=100,
     desc="Optimizing model",
 ):
     training_mask = ~books_df[training_col].isna()
@@ -262,7 +225,50 @@ def run_optimized(best_params, books_df, precomputed_embeddings, training_col):
     return scaler.inverse_transform(final_pred_scaled.reshape(-1, 1)).flatten()
 
 
-def run_prediction(optimize=False, embedding_model=None, min_friend_similarity=0.3, db_path=None):
+def _get_or_optimize_hyperparams(
+    db_conn,
+    name,
+    embedding_model,
+    training_col,
+    embedded_books_df,
+    precomputed_embeddings,
+    mrl_dimensions,
+    max_propagations,
+    train_set_size,
+    force_optimize,
+    optimization_budget,
+):
+    existing = None if force_optimize else db.get_prediction_hyperparams(db_conn, name, embedding_model)
+    if existing is not None:
+        return normalize_model_params(existing)
+
+    desc = "Optimizing friend-taste model" if name == "friend_params" else "Optimizing solo-taste model"
+    params = prep_optimization(
+        embedded_books_df,
+        precomputed_embeddings,
+        training_col,
+        mrl_dimensions,
+        max_propagations,
+        budget=optimization_budget,
+        desc=desc,
+    )
+    params = normalize_model_params(params)
+    db.save_prediction_hyperparams(db_conn, name, embedding_model, params, int(train_set_size))
+    return params
+
+
+def run_prediction(
+    optimize=None,
+    force_optimize=False,
+    embedding_model=None,
+    min_friend_similarity=0.3,
+    optimization_budget=100,
+    db_path=None,
+):
+    # Support backward compatibility if someone passes optimize instead of force_optimize
+    if optimize is not None:
+        force_optimize = optimize
+
     db.init_db(db_path)
     with db.get_connection(db_path) as db_conn:
         try:
@@ -307,6 +313,7 @@ def run_prediction(optimize=False, embedding_model=None, min_friend_similarity=0
         # Get friend calibrated ratings
         friend_calibrated = db.get_friend_calibrated_ratings(db_conn, min_friend_similarity)
 
+        friend_ratings_dict = {}
         if friend_calibrated:
             fc_df = pd.DataFrame(friend_calibrated)
             fc_df["weighted_val"] = fc_df["calibrated_rating"] * fc_df["similarity_score"]
@@ -318,10 +325,8 @@ def run_prediction(optimize=False, embedding_model=None, min_friend_similarity=0
                     weighted_sum=("weighted_val", "sum"), total_weight=("similarity_score", "sum")
                 )
                 friend_ratings_dict = (grouped["weighted_sum"] / grouped["total_weight"]).to_dict()
-            else:
-                friend_ratings_dict = {}
-        else:
-            friend_ratings_dict = {}
+
+        has_friend_data = bool(friend_ratings_dict)
 
         legacy_id_series = pd.Series(books_df["legacy_id"], index=books_df.index)
         embedded_legacy_id_series = pd.Series(embedded_books_df["legacy_id"], index=embedded_books_df.index)
@@ -339,13 +344,14 @@ def run_prediction(optimize=False, embedding_model=None, min_friend_similarity=0
 
         train_size = (~pd.isna(embedded_books_df["training_ratings"])).sum()
         solo_train_size = (~pd.isna(embedded_books_df["my_refined"])).sum()
-        if train_size < 2 or solo_train_size < 2:
+        if (has_friend_data and train_size < 2) or solo_train_size < 2:
             raise RuntimeError(
                 "Not enough rated books with valid embeddings to train ranking models "
                 f"(training={train_size}, personal={solo_train_size})."
             )
+
         mrl_dimensions = 32
-        while mrl_dimensions * 2 < train_size:
+        while mrl_dimensions * 2 < max(train_size, solo_train_size):
             mrl_dimensions *= 2
 
         embeddings_tensor = torch.tensor(embedded_embeddings, dtype=torch.float32, device=device)
@@ -362,45 +368,48 @@ def run_prediction(optimize=False, embedding_model=None, min_friend_similarity=0
 
         del propagated, adj_matrix, embeddings_tensor
 
-        if optimize:
-            friend_params = prep_optimization(
-                embedded_books_df,
-                precomputed_embeddings,
-                "training_ratings",
-                mrl_dimensions,
-                max_propagations,
-                budget=200,
-                desc="Optimizing friend-taste model",
-            )
-            solo_params = prep_optimization(
-                embedded_books_df,
-                precomputed_embeddings,
-                "my_refined",
-                mrl_dimensions,
-                max_propagations,
-                budget=200,
-                desc="Optimizing solo-taste model",
-            )
-            friend_params = normalize_model_params(friend_params)
-            solo_params = normalize_model_params(solo_params)
-            db.save_prediction_hyperparams(db_conn, "friend_params", friend_params)
-            db.save_prediction_hyperparams(db_conn, "solo_params", solo_params)
-        else:
-            print("Using stored/default hyperparameters...")
-            friend_params = get_or_create_prediction_hyperparams(db_conn, "friend_params", DEFAULT_FRIEND_PARAMS)
-            solo_params = get_or_create_prediction_hyperparams(db_conn, "solo_params", DEFAULT_SOLO_PARAMS)
-
-        friend_final_pred_embedded = run_optimized(
-            friend_params, embedded_books_df, precomputed_embeddings, "training_ratings"
+        # Solo model (always run)
+        solo_params = _get_or_optimize_hyperparams(
+            db_conn,
+            "solo_params",
+            embedding_model,
+            "my_refined",
+            embedded_books_df,
+            precomputed_embeddings,
+            mrl_dimensions,
+            max_propagations,
+            solo_train_size,
+            force_optimize,
+            optimization_budget,
         )
         solo_final_pred_embedded = run_optimized(solo_params, embedded_books_df, precomputed_embeddings, "my_refined")
 
-        friend_final_pred = np.full(len(books_df), np.nan)
         solo_final_pred = np.full(len(books_df), np.nan)
         embedded_positions = np.where(has_embedding)[0]
-        friend_final_pred[embedded_positions] = friend_final_pred_embedded
         solo_final_pred[embedded_positions] = solo_final_pred_embedded
 
+        # Friend model (conditional)
+        friend_final_pred = np.full(len(books_df), np.nan)
+        if has_friend_data:
+            friend_params = _get_or_optimize_hyperparams(
+                db_conn,
+                "friend_params",
+                embedding_model,
+                "training_ratings",
+                embedded_books_df,
+                precomputed_embeddings,
+                mrl_dimensions,
+                max_propagations,
+                train_size,
+                force_optimize,
+                optimization_budget,
+            )
+            friend_final_pred_embedded = run_optimized(
+                friend_params, embedded_books_df, precomputed_embeddings, "training_ratings"
+            )
+            friend_final_pred[embedded_positions] = friend_final_pred_embedded
+
+        # Metadata processing & rating count adjustments
         star_cols = ["star_1", "star_2", "star_3", "star_4", "star_5"]
         books_df["rating_count"] = books_df[star_cols].sum(axis=1)
 
@@ -427,15 +436,27 @@ def run_prediction(optimize=False, embedding_model=None, min_friend_similarity=0
         valid_mask = ~np.isnan(solo_final_pred)
         solo_pred = np.full(len(books_df), np.nan)
         friend_pred = np.full(len(books_df), np.nan)
+
         if valid_mask.any():
             solo_pred[valid_mask] = scaler.fit_transform(solo_final_pred[valid_mask].reshape(-1, 1)).flatten()
-            friend_pred[valid_mask] = scaler.fit_transform(friend_final_pred[valid_mask].reshape(-1, 1)).flatten()
+
+        if has_friend_data:
+            friend_valid_mask = ~np.isnan(friend_final_pred)
+            if friend_valid_mask.any():
+                friend_pred[friend_valid_mask] = scaler.fit_transform(
+                    friend_final_pred[friend_valid_mask].reshape(-1, 1)
+                ).flatten()
+
         count_adjusted_scaled = scaler.fit_transform(np.asarray(count_adjusted).reshape(-1, 1)).flatten()
 
         books_df["solo_pred_rating"] = solo_pred
-        books_df["friend_pred_rating"] = friend_pred
+        books_df["friend_pred_rating"] = friend_pred if has_friend_data else None
         books_df["count_adjusted_rating"] = count_adjusted_scaled
-        books_df["final_rating"] = count_adjusted_scaled * friend_pred * solo_pred
+
+        if has_friend_data:
+            books_df["final_rating"] = count_adjusted_scaled * friend_pred * solo_pred
+        else:
+            books_df["final_rating"] = count_adjusted_scaled * solo_pred
 
         now_str = datetime.now().strftime("%Y-%m-%d")
         predictions_data = []
@@ -443,7 +464,6 @@ def run_prediction(optimize=False, embedding_model=None, min_friend_similarity=0
         for row in books_df.to_dict(orient="records"):
             required = [
                 row["solo_pred_rating"],
-                row["friend_pred_rating"],
                 row["final_rating"],
             ]
             if any(pd.isna(value) for value in required):
@@ -452,7 +472,9 @@ def run_prediction(optimize=False, embedding_model=None, min_friend_similarity=0
                 (
                     int(row["legacy_id"]),
                     float(row["solo_pred_rating"]),
-                    float(row["friend_pred_rating"]),
+                    float(row["friend_pred_rating"])
+                    if row["friend_pred_rating"] is not None and pd.notna(row["friend_pred_rating"])
+                    else None,
                     float(row["count_adjusted_rating"]),
                     float(row["final_rating"]),
                     now_str,
@@ -460,6 +482,6 @@ def run_prediction(optimize=False, embedding_model=None, min_friend_similarity=0
             )
 
         if predictions_data:
-            db.save_book_predictions(db_conn, predictions_data)
-            db.prune_book_predictions(db_conn, [x[0] for x in predictions_data])
+            db.save_book_predictions(db_conn, predictions_data, embedding_model)
+            db.prune_book_predictions(db_conn, [x[0] for x in predictions_data], embedding_model)
             print("✓ Ranking predictions complete and saved.")

@@ -350,6 +350,10 @@ async def run_crawler(limit=None, force_crawl=False, db_path=None):
         )
         pending_count = db.count_crawl_queue(db_conn, ["pending"], allowed_sources)
 
+        if pending_count == 0:
+            print("Nothing to crawl: all books have already been crawled. Use --force_crawl to re-crawl.")
+            return
+
         pbar = tqdm(
             total=completed_count + pending_count,
             initial=completed_count,

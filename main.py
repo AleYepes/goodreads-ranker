@@ -183,22 +183,24 @@ class GoodreadsRankerCLI:
         db.init_db()
         friend_similarity.run_friend_similarity(embedding_model=embedding_model or None)
 
-    def predict(self, optimize=False, embedding_model=None, min_friend_similarity=0.3):
+    def predict(self, force_optimize=False, embedding_model=None, min_friend_similarity=0.4, optimization_budget=100):
         """Run the ensemble prediction model and write predictions to the database.
 
         Args:
-            optimize (bool): Optimize model hyperparameters.
+            force_optimize (bool): Force re-optimization of hyperparameters.
             embedding_model (str): Ollama embedding model name (overrides configured model).
             min_friend_similarity (float): Minimum friend taste correlation threshold.
+            optimization_budget (int): Budget (number of trials) for hyperparameter optimization.
         """
         from goodreads_ranker.ml import predictor
 
         print("\nRunning models and predictions")
         db.init_db()
         predictor.run_prediction(
-            optimize=as_bool(optimize),
+            force_optimize=as_bool(force_optimize),
             embedding_model=embedding_model or None,
             min_friend_similarity=float(min_friend_similarity),
+            optimization_budget=int(optimization_budget),
         )
 
     def run_pipeline(
@@ -211,8 +213,9 @@ class GoodreadsRankerCLI:
         force_crawl=False,
         batch_size=1,
         embedding_model=None,
-        optimize=False,
-        min_friend_similarity=0.3,
+        force_optimize=False,
+        min_friend_similarity=0.4,
+        optimization_budget=100,
     ):
         """Run the complete pipeline from initialization to ranking.
 
@@ -224,8 +227,9 @@ class GoodreadsRankerCLI:
             force_crawl (bool): Force crawling even if details have already been crawled.
             batch_size (int): Batch size for generating embeddings.
             embedding_model (str): Ollama embedding model name.
-            optimize (bool): Optimize model hyperparameters.
+            force_optimize (bool): Force re-optimization of hyperparameters.
             min_friend_similarity (float): Minimum friend taste correlation threshold.
+            optimization_budget (int): Budget (number of trials) for hyperparameter optimization.
         """
         self.init(force_init=force_init)
         self.seed(force_seed=force_seed, library_ids=library_ids)
@@ -233,7 +237,12 @@ class GoodreadsRankerCLI:
         self.crawl(limit=limit, force_crawl=force_crawl)
         self.embed(batch_size=batch_size, embedding_model=embedding_model)
         self.friend_similarity(embedding_model=embedding_model)
-        self.predict(optimize=optimize, embedding_model=embedding_model, min_friend_similarity=min_friend_similarity)
+        self.predict(
+            force_optimize=force_optimize,
+            embedding_model=embedding_model,
+            min_friend_similarity=min_friend_similarity,
+            optimization_budget=optimization_budget,
+        )
         print("\n✓ Pipeline run finished successfully!")
 
 

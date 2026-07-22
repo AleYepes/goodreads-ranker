@@ -8,6 +8,12 @@ from pathlib import Path
 DB_PATH = Path("data/goodreads.db")
 
 SCHEMA = """
+-- 0. EMBEDDING MODELS (lookup table)
+CREATE TABLE IF NOT EXISTS embedding_models (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+
 -- 1. READER LIBRARIES
 CREATE TABLE IF NOT EXISTS libraries (
     legacy_id          INTEGER PRIMARY KEY,
@@ -55,28 +61,33 @@ CREATE TABLE IF NOT EXISTS book_elo_ratings (
 
 -- 4. BOOK EMBEDDINGS
 CREATE TABLE IF NOT EXISTS book_embeddings (
-    book_id          INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
-    embedding_model  TEXT,
-    vector           BLOB NOT NULL,
-    text_hash        TEXT NOT NULL,
-    PRIMARY KEY (book_id, embedding_model)
+    book_id             INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
+    embedding_model_id  INTEGER NOT NULL REFERENCES embedding_models(id),
+    vector              BLOB NOT NULL,
+    text_hash           TEXT NOT NULL,
+    PRIMARY KEY (book_id, embedding_model_id)
 );
 
 -- 5. BOOK PREDICTIONS
 CREATE TABLE IF NOT EXISTS book_predictions (
-    book_id                INTEGER PRIMARY KEY REFERENCES books(legacy_id) ON DELETE CASCADE,
+    book_id                INTEGER REFERENCES books(legacy_id) ON DELETE CASCADE,
+    embedding_model_id     INTEGER NOT NULL REFERENCES embedding_models(id),
     solo_pred_rating       REAL,
     friend_pred_rating     REAL,
     count_adjusted_rating  REAL,
     final_rating           REAL,
-    date_updated           TEXT
+    date_updated           TEXT,
+    PRIMARY KEY (book_id, embedding_model_id)
 );
 
 -- 6. PREDICTION HYPERPARAMS
 CREATE TABLE IF NOT EXISTS prediction_hyperparams (
-    name        TEXT PRIMARY KEY,
-    params_json TEXT NOT NULL,
-    date_updated TEXT NOT NULL
+    name                TEXT NOT NULL,
+    embedding_model_id  INTEGER NOT NULL REFERENCES embedding_models(id),
+    params_json         TEXT NOT NULL,
+    training_set_size   INTEGER,
+    date_updated        TEXT NOT NULL,
+    PRIMARY KEY (name, embedding_model_id)
 );
 
 -- 7. LIBRARY BOOKS
@@ -208,7 +219,10 @@ def get_connection(db_path=None):
 
 
 def init_db(db_path=None):
+    from goodreads_ranker.core import migrations
+
     with get_connection(db_path) as db_conn:
+        migrations.migrate_embedding_model_schema(db_conn)
         db_conn.executescript(SCHEMA)
         db_conn.execute("DROP VIEW IF EXISTS best_book_lookup")
         db_conn.execute(
@@ -224,9 +238,7 @@ def init_db(db_path=None):
         db_conn.commit()
 
 
-# ---------------------------------------------------------------------------
 # Generic persistence helpers
-# ---------------------------------------------------------------------------
 
 
 def upsert_rows(db_conn, table, rows, columns):
@@ -241,9 +253,7 @@ def upsert_rows(db_conn, table, rows, columns):
     db_conn.commit()
 
 
-# ---------------------------------------------------------------------------
 # SQL Centralization - Ingestion crawler & seeder operations
-# ---------------------------------------------------------------------------
 
 
 def save_book_core(db_conn, book: dict):
@@ -643,25 +653,25 @@ def get_friend_library_book_ratings(db_conn) -> list[dict]:
     return [dict(r) for r in cursor.fetchall()]
 
 
-def get_embeddings_by_model(db_conn, model: str) -> dict[int, bytes]:
-    cursor = db_conn.execute(
-        """
-        SELECT book_id, vector
-        FROM book_embeddings
-        WHERE embedding_model = ?
-        """,
-        (model,),
-    )
-    return {int(row["book_id"]): row["vector"] for row in cursor.fetchall()}
+def get_or_create_embedding_model_id(db_conn, name: str) -> int:
+    row = db_conn.execute("SELECT id FROM embedding_models WHERE name = ?", (name,)).fetchone()
+    if row is not None:
+        return int(row["id"])
+    cursor = db_conn.execute("INSERT INTO embedding_models (name) VALUES (?)", (name,))
+    db_conn.commit()
+    return int(cursor.lastrowid)
 
 
-def save_book_predictions(db_conn, rows):
+def save_book_predictions(db_conn, rows, embedding_model: str):
+    model_id = get_or_create_embedding_model_id(db_conn, embedding_model)
+    full_rows = [(r[0], model_id, r[1], r[2], r[3], r[4], r[5]) for r in rows]
     upsert_rows(
         db_conn,
         "book_predictions",
-        rows,
+        full_rows,
         [
             "book_id",
+            "embedding_model_id",
             "solo_pred_rating",
             "friend_pred_rating",
             "count_adjusted_rating",
@@ -671,19 +681,24 @@ def save_book_predictions(db_conn, rows):
     )
 
 
-def prune_book_predictions(db_conn, keep_ids: list[int]):
+def prune_book_predictions(db_conn, keep_ids: list[int], embedding_model: str):
     if not keep_ids:
         return
+    model_id = get_or_create_embedding_model_id(db_conn, embedding_model)
     placeholders = ",".join("?" for _ in keep_ids)
     db_conn.execute(
-        f"DELETE FROM book_predictions WHERE book_id NOT IN ({placeholders})",
-        keep_ids,
+        f"DELETE FROM book_predictions WHERE embedding_model_id = ? AND book_id NOT IN ({placeholders})",
+        [model_id, *keep_ids],
     )
     db_conn.commit()
 
 
-def get_prediction_hyperparams(db_conn, name):
-    row = db_conn.execute("SELECT params_json FROM prediction_hyperparams WHERE name = ?", (name,)).fetchone()
+def get_prediction_hyperparams(db_conn, name, embedding_model):
+    model_id = get_or_create_embedding_model_id(db_conn, embedding_model)
+    row = db_conn.execute(
+        "SELECT params_json FROM prediction_hyperparams WHERE name = ? AND embedding_model_id = ?",
+        (name, model_id),
+    ).fetchone()
     if not row:
         return None
     try:
@@ -692,13 +707,21 @@ def get_prediction_hyperparams(db_conn, name):
         return None
 
 
-def save_prediction_hyperparams(db_conn, name, params):
+def save_prediction_hyperparams(db_conn, name, embedding_model, params, training_set_size):
+    model_id = get_or_create_embedding_model_id(db_conn, embedding_model)
     db_conn.execute(
         """
-        INSERT OR REPLACE INTO prediction_hyperparams (name, params_json, date_updated)
-        VALUES (?, ?, ?)
+        INSERT OR REPLACE INTO prediction_hyperparams
+            (name, embedding_model_id, params_json, training_set_size, date_updated)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (name, json.dumps(params, sort_keys=True), datetime.now().strftime("%Y-%m-%d")),
+        (
+            name,
+            model_id,
+            json.dumps(params, sort_keys=True),
+            int(training_set_size),
+            datetime.now().strftime("%Y-%m-%d"),
+        ),
     )
     db_conn.commit()
 
@@ -743,33 +766,37 @@ def get_book_metadata_for_embedding(db_conn) -> list[dict]:
 
 
 def get_existing_embeddings(db_conn, model) -> dict[int, dict]:
+    model_id = get_or_create_embedding_model_id(db_conn, model)
     cursor = db_conn.execute(
-        """
-        SELECT book_id, vector, text_hash
-        FROM book_embeddings
-        WHERE embedding_model = ?
-        """,
-        (model,),
+        "SELECT book_id, vector, text_hash FROM book_embeddings WHERE embedding_model_id = ?",
+        (model_id,),
     )
     return {int(row["book_id"]): {"vector": row["vector"], "text_hash": row["text_hash"]} for row in cursor.fetchall()}
 
 
 def save_embeddings(db_conn, legacy_ids, vectors, model, text_hashes):
+    model_id = get_or_create_embedding_model_id(db_conn, model)
     rows = []
     for i, bid in enumerate(legacy_ids):
         bid_int = int(bid)
         h = text_hashes.get(bid_int) if isinstance(text_hashes, dict) else text_hashes[i]
         vector_blob = vectors[i].astype("float32").tobytes()
-        rows.append((bid_int, model, vector_blob, h))
+        rows.append((bid_int, model_id, vector_blob, h))
 
     db_conn.executemany(
-        """
-        INSERT OR REPLACE INTO book_embeddings (book_id, embedding_model, vector, text_hash)
-        VALUES (?, ?, ?, ?)
-        """,
+        "INSERT OR REPLACE INTO book_embeddings (book_id, embedding_model_id, vector, text_hash) VALUES (?, ?, ?, ?)",
         rows,
     )
     db_conn.commit()
+
+
+def get_embeddings_by_model(db_conn, model: str) -> dict[int, bytes]:
+    model_id = get_or_create_embedding_model_id(db_conn, model)
+    cursor = db_conn.execute(
+        "SELECT book_id, vector FROM book_embeddings WHERE embedding_model_id = ?",
+        (model_id,),
+    )
+    return {int(row["book_id"]): row["vector"] for row in cursor.fetchall()}
 
 
 def is_valid_embedding_blob(blob):
@@ -783,9 +810,7 @@ def is_valid_embedding_blob(blob):
     return bool(vector.size and np.any(vector != 0))
 
 
-# ---------------------------------------------------------------------------
 # Seeder-specific DB operations
-# ---------------------------------------------------------------------------
 
 
 def upsert_libraries(db_conn, main_user: dict, friends: list[dict]):
