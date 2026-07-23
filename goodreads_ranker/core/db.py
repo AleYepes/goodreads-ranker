@@ -726,25 +726,128 @@ def save_prediction_hyperparams(db_conn, name, embedding_model, params, training
     db_conn.commit()
 
 
-def get_book_metadata_for_embedding(db_conn) -> list[dict]:
-    cursor = db_conn.execute(
-        """
-        SELECT b.legacy_id, b.title, c.name AS author_name, b.description
-        FROM books b
-        LEFT JOIN book_contributors bc ON bc.book_id = b.legacy_id AND bc.is_primary = 1
-        LEFT JOIN contributors c ON c.legacy_id = bc.contributor_id
-        ORDER BY b.legacy_id
-        """
+def get_candidate_book_legacy_ids(db_conn) -> set[int]:
+    """Retrieve candidate book IDs to embed based on:
+    1. 100% of rated books (rating > 0) in any library (user or friend).
+    2. Top 50% globally across all library books using log10 count-adjusted rating.
+    3. Similar books linked to books in the top 50% evaluated per library.
+    """
+    query = """
+    WITH book_scores AS (
+        SELECT 
+            legacy_id,
+            (star_1 + star_2 + star_3 + star_4 + star_5) AS ratings_count,
+            CASE 
+                WHEN (star_1 + star_2 + star_3 + star_4 + star_5) > 0 THEN
+                    CAST(star_1*1 + star_2*2 + star_3*3 + star_4*4 + star_5*5 AS REAL) / (star_1 + star_2 + star_3 + star_4 + star_5)
+                ELSE 0.0
+            END AS avg_rating
+        FROM books
+    ),
+    book_adjusted AS (
+        SELECT 
+            legacy_id,
+            CASE 
+                WHEN ratings_count > 0 THEN
+                    avg_rating - (avg_rating / LOG10(ratings_count + 10))
+                ELSE 0.0
+            END AS adjusted_score
+        FROM book_scores
+    ),
+    library_ranked AS (
+        SELECT 
+            lb.library_id,
+            lb.book_legacy_id,
+            lb.rating,
+            ba.adjusted_score,
+            ROW_NUMBER() OVER (
+                PARTITION BY lb.library_id 
+                ORDER BY lb.rating DESC, ba.adjusted_score DESC
+            ) AS lib_rank,
+            COUNT(*) OVER (PARTITION BY lb.library_id) AS lib_total,
+            ROW_NUMBER() OVER (
+                ORDER BY lb.rating DESC, ba.adjusted_score DESC
+            ) AS global_rank,
+            COUNT(*) OVER () AS global_total
+        FROM library_books lb
+        JOIN book_adjusted ba ON lb.book_legacy_id = ba.legacy_id
+    ),
+    -- Rule 1: 100% of rated books (rating > 0) in any library
+    rated_books AS (
+        SELECT DISTINCT book_legacy_id FROM library_books WHERE rating > 0
+    ),
+    -- Rule 2: Top 50% count-adjusted rated books globally across all library_books
+    global_top_50 AS (
+        SELECT DISTINCT book_legacy_id 
+        FROM library_ranked 
+        WHERE global_rank <= (global_total * 0.5)
+    ),
+    -- Rule 3: Similar books linked to per-library top 50% books
+    per_lib_top_50 AS (
+        SELECT DISTINCT book_legacy_id 
+        FROM library_ranked 
+        WHERE lib_rank <= (lib_total * 0.5)
+    ),
+    similar_candidates AS (
+        SELECT DISTINCT sb.similar_legacy_id AS book_legacy_id
+        FROM similar_books sb
+        WHERE sb.book_id IN (SELECT book_legacy_id FROM per_lib_top_50)
     )
-    rows = [dict(r) for r in cursor.fetchall()]
+    SELECT book_legacy_id FROM rated_books
+    UNION
+    SELECT book_legacy_id FROM global_top_50
+    UNION
+    SELECT book_legacy_id FROM similar_candidates
+    """
+    cursor = db_conn.execute(query)
+    return {int(row["book_legacy_id"]) for row in cursor.fetchall()}
 
-    cursor_genres = db_conn.execute(
-        """
-        SELECT bg.book_id, g.name
-        FROM book_genres bg
-        JOIN genres g ON bg.genre_id = g.legacy_id
-        """
-    )
+
+def get_book_metadata_for_embedding(db_conn, candidate_ids: set[int] | None = None) -> list[dict]:
+    if candidate_ids is not None:
+        candidate_json = json.dumps(list(candidate_ids))
+        cursor = db_conn.execute(
+            """
+            SELECT b.legacy_id, b.title, c.name AS author_name, b.description
+            FROM books b
+            LEFT JOIN book_contributors bc ON bc.book_id = b.legacy_id AND bc.is_primary = 1
+            LEFT JOIN contributors c ON c.legacy_id = bc.contributor_id
+            WHERE b.legacy_id IN (SELECT value FROM json_each(?))
+            ORDER BY b.legacy_id
+            """,
+            (candidate_json,),
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+
+        cursor_genres = db_conn.execute(
+            """
+            SELECT bg.book_id, g.name
+            FROM book_genres bg
+            JOIN genres g ON bg.genre_id = g.legacy_id
+            WHERE bg.book_id IN (SELECT value FROM json_each(?))
+            """,
+            (candidate_json,),
+        )
+    else:
+        cursor = db_conn.execute(
+            """
+            SELECT b.legacy_id, b.title, c.name AS author_name, b.description
+            FROM books b
+            LEFT JOIN book_contributors bc ON bc.book_id = b.legacy_id AND bc.is_primary = 1
+            LEFT JOIN contributors c ON c.legacy_id = bc.contributor_id
+            ORDER BY b.legacy_id
+            """
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+
+        cursor_genres = db_conn.execute(
+            """
+            SELECT bg.book_id, g.name
+            FROM book_genres bg
+            JOIN genres g ON bg.genre_id = g.legacy_id
+            """
+        )
+
     genres_by_book: dict[int, list[str]] = {}
     for r in cursor_genres.fetchall():
         bid = int(r["book_id"])

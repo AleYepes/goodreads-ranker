@@ -133,15 +133,20 @@ def clean_description_text(text: str | None) -> str:
         return ""
 
     import warnings
-
     import ftfy
     from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
         text = ftfy.fix_text(text, normalization="NFKC")
-        text = BeautifulSoup(text, "html.parser").get_text(separator=" ")
+        soup = BeautifulSoup(text, "html.parser")
+        for br in soup.find_all("br"):
+            br.replace_with("\n")
+        for p in soup.find_all("p"):
+            p.insert_before("\n")
+        text = soup.get_text()
         text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-        text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n\s*\n+", "\n\n", text)
 
-    return re.sub(r"\s+", " ", text).strip()
+    return text.strip()

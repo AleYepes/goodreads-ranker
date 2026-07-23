@@ -422,14 +422,12 @@ def run_prediction(
         )
         books_df["avg_rating"] = np.where(books_df["rating_count"] > 0, total_stars / books_df["rating_count"], np.nan)
 
-        global_avg_rating = books_df["avg_rating"].mean()
-        m = books_df["rating_count"].quantile(0.10)
-
         v = books_df["rating_count"].astype(float)
-        book_avg = books_df["avg_rating"].fillna(global_avg_rating).astype(float)
-        denom = v + m
+        book_avg = books_df["avg_rating"].fillna(0.0).astype(float)
         count_adjusted = np.where(
-            denom > 0, (v / denom) * book_avg + (m / denom) * global_avg_rating, global_avg_rating
+            v > 0,
+            book_avg - (book_avg / np.log10(v + 10)),
+            0.0,
         )
 
         scaler = MinMaxScaler()

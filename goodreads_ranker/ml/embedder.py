@@ -102,16 +102,17 @@ def find_stale_or_missing_embeddings(existing_embeddings: dict[int, dict], all_i
     return queued
 
 
-def generate_embeddings(batch_size=64, embedding_model=None, db_path=None):
+def generate_embeddings(batch_size=1, embedding_model=None, db_path=None):
     db.init_db(db_path)
 
     if not embedding_model:
         embedding_model = config.get_embedding_model()
 
     with db.get_connection(db_path) as db_conn:
-        metadata_list = db.get_book_metadata_for_embedding(db_conn)
+        candidate_ids = db.get_candidate_book_legacy_ids(db_conn)
+        metadata_list = db.get_book_metadata_for_embedding(db_conn, candidate_ids=candidate_ids)
         if not metadata_list:
-            print("No books found. Run crawler first.")
+            print("No books found matching candidate criteria. Run crawler/seeder first.")
             return
 
         all_inputs = {}
@@ -123,17 +124,15 @@ def generate_embeddings(batch_size=64, embedding_model=None, db_path=None):
             genres_post = format_string_for_embedding(r["genres"], kind="genre")
 
             desc_clean = utils.clean_description_text(r["description"])
-            desc_list = [desc_clean] if desc_clean else []
-            desc_post = format_string_for_embedding(desc_list, kind="description")
 
-            embedding_input = join_embedding_parts(title, authors_post, genres_post, desc_post)
+            embedding_input = join_embedding_parts(title, authors_post, genres_post, desc_clean)
             all_inputs[legacy_id] = embedding_input
 
         existing_embeddings = db.get_existing_embeddings(db_conn, embedding_model)
         missing_ids = find_stale_or_missing_embeddings(existing_embeddings, all_inputs)
 
         if not missing_ids:
-            print(f"Nothing to embed: all books have valid embeddings for model '{embedding_model}'.")
+            print(f"Nothing to embed: all candidate books have valid embeddings for model '{embedding_model}'.")
             return
 
         import ollama
